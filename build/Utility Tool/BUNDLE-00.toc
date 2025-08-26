@@ -1,3 +1,0 @@
-([('Utility Tool',
-   '/Users/ankhitsharma/Documents/GitHubProjects/UtilityTool/dist/Utility Tool',
-   'EXECUTABLE')],)
