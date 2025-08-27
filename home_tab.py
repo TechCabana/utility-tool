@@ -1,151 +1,84 @@
-import os, json
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QFormLayout, QLineEdit, QPushButton, 
-    QHBoxLayout, QFileDialog, QMessageBox, QComboBox, QCheckBox
-)
+from PySide6 import QtWidgets, QtCore
+from presets_manager import load_presets, save_presets
 
-CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".utilitytool")
-SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
-PRESETS_PATH = os.path.join(CONFIG_DIR, "presets.json")
-
-DEFAULT_SETTINGS = {
-    "theme": "dark",
-    "default_output": "",
-    "default_format": "JPEG",
-    "default_quality": 85,
-    "preserve_exif": False,
-    "remember_last": True
-}
-
-def ensure_config():
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    if not os.path.exists(SETTINGS_PATH):
-        with open(SETTINGS_PATH, "w") as f: json.dump(DEFAULT_SETTINGS, f, indent=2)
-    if not os.path.exists(PRESETS_PATH):
-        with open(PRESETS_PATH, "w") as f: json.dump({"presets": {}}, f, indent=2)
-
-class HomeTab(QWidget):
+class HomeTab(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        ensure_config()
-        self.settings = self._load_json(SETTINGS_PATH)
-        self.presets = self._load_json(PRESETS_PATH)
+        self.data = load_presets()
 
-        root = QVBoxLayout()
-        title = QLabel("🏠 Home — Global Settings & Presets")
-        title.setStyleSheet("font-size:16px; font-weight:bold;")
-        root.addWidget(title)
+        layout = QtWidgets.QVBoxLayout(self)
 
-        form = QFormLayout()
-        self.theme = QComboBox(); self.theme.addItems(["dark", "light", "system"])
-        self.theme.setCurrentText(self.settings.get("theme", "dark"))
+        title = QtWidgets.QLabel("Home • Global Settings & Presets")
+        title.setStyleSheet("font-weight:700; font-size:18px;")
+        layout.addWidget(title)
 
-        self.default_output = QLineEdit(self.settings.get("default_output", ""))
-        self.default_format = QComboBox(); self.default_format.addItems(["JPEG","PNG","WEBP","TIFF","BMP"])
-        self.default_format.setCurrentText(self.settings.get("default_format", "JPEG"))
+        splitter = QtWidgets.QSplitter()
+        splitter.setOrientation(QtCore.Qt.Horizontal)
 
-        self.default_quality = QLineEdit(str(self.settings.get("default_quality", 85)))
-        self.preserve_exif = QCheckBox(); self.preserve_exif.setChecked(self.settings.get("preserve_exif", False))
-        self.remember_last = QCheckBox(); self.remember_last.setChecked(self.settings.get("remember_last", True))
+        # Image presets
+        self.img_list = QtWidgets.QListWidget()
+        self.img_list.addItems([p["name"] for p in self.data.get("image", [])])
+        img_box = QtWidgets.QGroupBox("Image Presets")
+        v1 = QtWidgets.QVBoxLayout(img_box)
+        v1.addWidget(self.img_list)
+        hb1 = QtWidgets.QHBoxLayout()
+        b_add_i = QtWidgets.QPushButton("Add")
+        b_del_i = QtWidgets.QPushButton("Delete")
+        b_rename_i = QtWidgets.QPushButton("Rename")
+        hb1.addWidget(b_add_i); hb1.addWidget(b_del_i); hb1.addWidget(b_rename_i)
+        v1.addLayout(hb1)
 
-        form.addRow("Theme:", self.theme)
-        form.addRow("Default Output Folder:", self.default_output)
-        form.addRow("Default Format:", self.default_format)
-        form.addRow("Default Quality (1–100):", self.default_quality)
-        form.addRow("Preserve EXIF:", self.preserve_exif)
-        form.addRow("Remember last settings:", self.remember_last)
-        root.addLayout(form)
+        # File presets
+        self.file_list = QtWidgets.QListWidget()
+        self.file_list.addItems([p["name"] for p in self.data.get("file", [])])
+        file_box = QtWidgets.QGroupBox("File Rename Presets")
+        v2 = QtWidgets.QVBoxLayout(file_box)
+        v2.addWidget(self.file_list)
+        hb2 = QtWidgets.QHBoxLayout()
+        b_add_f = QtWidgets.QPushButton("Add")
+        b_del_f = QtWidgets.QPushButton("Delete")
+        b_rename_f = QtWidgets.QPushButton("Rename")
+        hb2.addWidget(b_add_f); hb2.addWidget(b_del_f); hb2.addWidget(b_rename_f)
+        v2.addLayout(hb2)
 
-        browse_row = QHBoxLayout()
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._pick_output)
-        browse_row.addWidget(browse_btn)
-        root.addLayout(browse_row)
+        splitter.addWidget(img_box)
+        splitter.addWidget(file_box)
+        layout.addWidget(splitter)
 
-        # Presets: Save current format/quality under a name
-        root.addWidget(QLabel("Presets (format + quality):"))
-        p_row = QHBoxLayout()
-        self.preset_name = QLineEdit(); self.preset_name.setPlaceholderText("Preset name (e.g., JPEG-85-Web)")
-        save_btn = QPushButton("Save Preset"); save_btn.clicked.connect(self._save_preset)
-        load_btn = QPushButton("Load Preset"); load_btn.clicked.connect(self._load_preset)
-        export_btn = QPushButton("Export Presets"); export_btn.clicked.connect(self._export_presets)
-        import_btn = QPushButton("Import Presets"); import_btn.clicked.connect(self._import_presets)
-        p_row.addWidget(self.preset_name); p_row.addWidget(save_btn); p_row.addWidget(load_btn); p_row.addWidget(export_btn); p_row.addWidget(import_btn)
-        root.addLayout(p_row)
+        # Actions
+        b_add_i.clicked.connect(lambda: self.add_preset(kind="image"))
+        b_del_i.clicked.connect(lambda: self.delete_preset(kind="image"))
+        b_rename_i.clicked.connect(lambda: self.rename_preset(kind="image"))
+        b_add_f.clicked.connect(lambda: self.add_preset(kind="file"))
+        b_del_f.clicked.connect(lambda: self.delete_preset(kind="file"))
+        b_rename_f.clicked.connect(lambda: self.rename_preset(kind="file"))
 
-        actions = QHBoxLayout()
-        save_settings = QPushButton("Save Settings"); save_settings.clicked.connect(self._save_settings)
-        reset = QPushButton("Reset to Defaults"); reset.clicked.connect(self._reset_defaults)
-        actions.addWidget(save_settings); actions.addWidget(reset)
-        root.addLayout(actions)
-
-        self.setLayout(root)
-
-    # Helpers
-    def _load_json(self, path):
-        with open(path, "r") as f:
-            return json.load(f)
-
-    def _write_json(self, path, data):
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-
-    def _pick_output(self):
-        path = QFileDialog.getExistingDirectory(self, "Choose default output folder")
-        if path:
-            self.default_output.setText(path)
-
-    def _save_settings(self):
-        try:
-            data = {
-                "theme": self.theme.currentText(),
-                "default_output": self.default_output.text(),
-                "default_format": self.default_format.currentText(),
-                "default_quality": int(self.default_quality.text() or "85"),
-                "preserve_exif": self.preserve_exif.isChecked(),
-                "remember_last": self.remember_last.isChecked()
-            }
-            self._write_json(SETTINGS_PATH, data)
-            QMessageBox.information(self, "Saved", "Settings saved.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-
-    def _reset_defaults(self):
-        self._write_json(SETTINGS_PATH, DEFAULT_SETTINGS)
-        QMessageBox.information(self, "Reset", "Defaults restored. Reopen Home tab to reload.")
-
-    def _save_preset(self):
-        name = self.preset_name.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Name required", "Enter a preset name.")
+    def add_preset(self, kind: str):
+        name, ok = QtWidgets.QInputDialog.getText(self, "New Preset", "Preset name:")
+        if not ok or not name.strip():
             return
-        self.presets["presets"][name] = {
-            "default_format": self.default_format.currentText(),
-            "default_quality": int(self.default_quality.text() or "85")
-        }
-        self._write_json(PRESETS_PATH, self.presets)
-        QMessageBox.information(self, "Preset", f"Preset '{name}' saved.")
+        p = {"name": name.strip()}
+        # minimal defaults; users can overwrite via tools tabs when saving back
+        self.data.setdefault(kind, []).append(p)
+        save_presets(self.data)
+        (self.img_list if kind=="image" else self.file_list).addItem(name)
 
-    def _load_preset(self):
-        name = self.preset_name.text().strip()
-        p = self.presets["presets"].get(name)
-        if not p:
-            QMessageBox.warning(self, "Not found", f"No preset named '{name}'.")
+    def delete_preset(self, kind: str):
+        lw = self.img_list if kind=="image" else self.file_list
+        row = lw.currentRow()
+        if row < 0: return
+        lw.takeItem(row)
+        del self.data[kind][row]
+        save_presets(self.data)
+
+    def rename_preset(self, kind: str):
+        lw = self.img_list if kind=="image" else self.file_list
+        row = lw.currentRow()
+        if row < 0: return
+        old = self.data[kind][row].get("name","")
+        name, ok = QtWidgets.QInputDialog.getText(self, "Rename Preset", "New name:", text=old)
+        if not ok or not name.strip():
             return
-        self.default_format.setCurrentText(p.get("default_format", "JPEG"))
-        self.default_quality.setText(str(p.get("default_quality", 85)))
-        QMessageBox.information(self, "Preset", f"Preset '{name}' loaded into fields.")
-
-    def _export_presets(self):
-        out, _ = QFileDialog.getSaveFileName(self, "Export presets", "presets.json", "JSON (*.json)")
-        if out:
-            self._write_json(out, self.presets)
-            QMessageBox.information(self, "Exported", f"Presets exported to {out}")
-
-    def _import_presets(self):
-        src, _ = QFileDialog.getOpenFileName(self, "Import presets", "", "JSON (*.json)")
-        if src:
-            with open(src, "r") as f:
-                self.presets = json.load(f)
-            self._write_json(PRESETS_PATH, self.presets)
-            QMessageBox.information(self, "Imported", "Presets imported.")
+        self.data[kind][row]["name"] = name.strip()
+        lw.item(row).setText(name.strip())
+        save_presets(self.data)

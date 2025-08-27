@@ -1,175 +1,263 @@
 import os, time
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QPushButton, QFileDialog, QListWidget, QProgressBar,
-    QComboBox, QHBoxLayout, QSlider, QCheckBox, QMessageBox
-)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from image_utils import convert_resize_compress, estimate_compressed_size, STANDARD_SIZES, target_dims_from_preset
+from typing import List
+from PySide6 import QtWidgets, QtCore
+from image_utils import open_image, resize_if_needed, estimate_output_size, save_with_format, STANDARD_SIZES_MM
 
-# Worker thread so the UI stays responsive
-class Worker(QThread):
-    progress = pyqtSignal(int, str)      # overall %, filename
-    perfile = pyqtSignal(int, str)       # per-file %, filename
-    started_file = pyqtSignal(str)
-    finished = pyqtSignal()
+class FileRow(QtWidgets.QWidget):
+    """Row with filename + per-file progress bar."""
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(4,2,4,2)
+        self.label = QtWidgets.QLabel(os.path.basename(path))
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setValue(0)
+        lay.addWidget(self.label, 2)
+        lay.addWidget(self.bar, 1)
 
-    def __init__(self, files, fmt, size_tuple, keep_aspect, quality, outdir=None):
+class Worker(QtCore.QObject):
+    progress = QtCore.Signal(int, int)         # (index, percent)
+    file_done = QtCore.Signal(int, int)        # (index, bytes_out)
+    all_done = QtCore.Signal(float)            # total seconds
+    error = QtCore.Signal(int, str)            # (index, message)
+
+    def __init__(self, files: List[str], out_dir: str, fmt: str, size_key: str, quality: int, prefix: str, suffix: str, keep_exif: bool):
         super().__init__()
         self.files = files
+        self.out_dir = out_dir
         self.fmt = fmt
-        self.size = size_tuple
-        self.keep_aspect = keep_aspect
+        self.size_key = size_key
         self.quality = quality
-        self.outdir = outdir
+        self.prefix = prefix
+        self.suffix = suffix
+        self.keep_exif = keep_exif
+        self._abort = False
 
+    @QtCore.Slot()
     def run(self):
-        total = len(self.files)
+        t0 = time.time()
         for i, path in enumerate(self.files):
-            self.started_file.emit(path)
-            # Simple staged per-file progress simulation
-            for step in (10, 30, 60, 90):
-                self.perfile.emit(step, path)
-                time.sleep(0.06)
-            # Process conversion/resizing/compression
-            out_path = None
-            if self.outdir:
-                base = os.path.splitext(os.path.basename(path))[0]
-                out_path = os.path.join(self.outdir, f"{base}_out.{self.fmt.lower()}")
-            convert_resize_compress(
-                path, out_fmt=self.fmt, out_path=out_path,
-                size=self.size, keep_aspect=self.keep_aspect, quality=self.quality
-            )
-            self.perfile.emit(100, path)
-            pct = int(((i + 1) / total) * 100)
-            self.progress.emit(pct, path)
-        self.finished.emit()
+            if self._abort: break
+            try:
+                img = open_image(path)
+                img = resize_if_needed(img, self.size_key)
+                # Build output name
+                base, ext = os.path.splitext(os.path.basename(path))
+                out_ext = (self.fmt if self.fmt!="ORIGINAL" else ext.replace(".", "")) or "jpg"
+                out_name = f"{self.prefix}{base}{self.suffix}.{out_ext.lower()}"
+                out_path = os.path.join(self.out_dir, out_name)
 
-class ImageToolsTab(QWidget):
+                # Estimate size (emit 10%)
+                est = estimate_output_size(img, self.fmt, self.quality, self.keep_exif)
+                self.progress.emit(i, 10)
+
+                # Save actual file (emit 100%)
+                save_with_format(img, out_path, self.fmt, self.quality, self.keep_exif)
+                self.progress.emit(i, 100)
+                self.file_done.emit(i, os.path.getsize(out_path))
+            except Exception as e:
+                self.error.emit(i, str(e))
+        self.all_done.emit(time.time()-t0)
+
+    def abort(self):
+        self._abort = True
+
+class ImageToolsTab(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.output_dir = None
-        self.t0 = None
+        v = QtWidgets.QVBoxLayout(self)
 
-        root = QVBoxLayout()
-        head = QLabel("🖼 Image Tools — Convert • Resize • Compress")
-        head.setStyleSheet("font-size:16px; font-weight:bold;")
-        root.addWidget(head)
+        title = QtWidgets.QLabel("Image Tools — Convert • Resize • Compress")
+        title.setStyleSheet("font-weight:700; font-size:18px;")
+        v.addWidget(title)
 
-        # File list (drag & drop supported by Qt at OS level when picking files — simplest path: use Add Images button)
-        self.listw = QListWidget()
-        self.listw.setSelectionMode(self.listw.ExtendedSelection)
-        root.addWidget(self.listw)
+        # file list (drag & drop)
+        self.list_area = QtWidgets.QListWidget()
+        self.list_area.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.list_area.setAcceptDrops(True)
+        self.list_area.dragEnterEvent = self._drag_enter
+        self.list_area.dragMoveEvent = self._drag_enter
+        self.list_area.dropEvent = self._drop
+        v.addWidget(self.list_area, 1)
 
-        row = QHBoxLayout()
-        add_btn = QPushButton("Add Images"); add_btn.clicked.connect(self.add_files)
-        clear_btn = QPushButton("Clear"); clear_btn.clicked.connect(self.listw.clear)
-        row.addWidget(add_btn); row.addWidget(clear_btn)
-        root.addLayout(row)
+        # controls
+        form = QtWidgets.QFormLayout()
+        self.format_box = QtWidgets.QComboBox()
+        self.format_box.addItems(["ORIGINAL","JPEG","PNG","WEBP","TIFF"])
+        form.addRow("Output format:", self.format_box)
 
-        # Format + size preset
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Format:"))
-        self.fmt = QComboBox(); self.fmt.addItems(["JPEG", "PNG", "WEBP", "TIFF", "BMP"])
-        row2.addWidget(self.fmt)
+        self.size_box = QtWidgets.QComboBox()
+        self.size_box.addItems(list(STANDARD_SIZES_MM.keys()))
+        form.addRow("Target size:", self.size_box)
 
-        row2.addWidget(QLabel("Size Preset:"))
-        self.sizepreset = QComboBox(); self.sizepreset.addItem("None")
-        for k in STANDARD_SIZES.keys():
-            self.sizepreset.addItem(k)
-        row2.addWidget(self.sizepreset)
+        self.quality = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.quality.setRange(10, 100)
+        self.quality.setValue(85)
+        form.addRow("Quality:", self.quality)
 
-        self.keep_aspect = QCheckBox("Keep Aspect"); self.keep_aspect.setChecked(True)
-        row2.addWidget(self.keep_aspect)
-        root.addLayout(row2)
+        self.prefix = QtWidgets.QLineEdit()
+        self.suffix = QtWidgets.QLineEdit()
+        form.addRow("Prefix:", self.prefix)
+        form.addRow("Suffix:", self.suffix)
 
-        # Compression
-        comp_row = QHBoxLayout()
-        comp_row.addWidget(QLabel("Quality:"))
-        self.quality = QSlider(Qt.Horizontal); self.quality.setRange(1, 100); self.quality.setValue(85)
-        comp_row.addWidget(self.quality)
+        self.keep_exif = QtWidgets.QCheckBox("Keep EXIF (when available)")
+        self.keep_exif.setChecked(True)
+        form.addRow("", self.keep_exif)
 
-        self.est_label = QLabel("Estimated size: —")
-        comp_row.addWidget(self.est_label)
-        root.addLayout(comp_row)
+        v.addLayout(form)
 
-        est_btn = QPushButton("Estimate Selected")
-        est_btn.setToolTip("Estimates compressed size for the first selected file (or top file if none selected).")
-        est_btn.clicked.connect(self.estimate_selected)
-        root.addWidget(est_btn)
+        path_row = QtWidgets.QHBoxLayout()
+        self.out_dir = QtWidgets.QLineEdit()
+        choose = QtWidgets.QPushButton("Choose Output Folder")
+        choose.clicked.connect(self._choose_out)
+        path_row.addWidget(QtWidgets.QLabel("Output folder:"))
+        path_row.addWidget(self.out_dir, 1)
+        path_row.addWidget(choose)
+        v.addLayout(path_row)
 
-        # Output folder
-        out_row = QHBoxLayout()
-        pick_out = QPushButton("Choose Output Folder…"); pick_out.clicked.connect(self.choose_output)
-        out_row.addWidget(pick_out)
-        root.addLayout(out_row)
+        # preview size for selected file
+        self.preview_btn = QtWidgets.QPushButton("Preview Selected → Estimated Output Size")
+        self.preview_btn.clicked.connect(self.preview_selected)
+        self.preview_label = QtWidgets.QLabel("Estimated: —")
+        v.addWidget(self.preview_btn)
+        v.addWidget(self.preview_label)
 
-        # Progress
-        self.perfile_bar = QProgressBar(); self.perfile_bar.setFormat("Current file: %p%")
-        self.global_bar = QProgressBar(); self.global_bar.setFormat("Overall: %p%")
-        self.eta_label = QLabel("ETA: —")
-        root.addWidget(self.perfile_bar); root.addWidget(self.global_bar); root.addWidget(self.eta_label)
+        # action buttons
+        hb = QtWidgets.QHBoxLayout()
+        self.run_btn = QtWidgets.QPushButton("Process")
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.clear_btn = QtWidgets.QPushButton("Clear List")
+        hb.addWidget(self.run_btn); hb.addWidget(self.stop_btn); hb.addWidget(self.clear_btn)
+        v.addLayout(hb)
 
-        start = QPushButton("Start"); start.clicked.connect(self.start_process)
-        root.addWidget(start)
+        # per-file rows container
+        self.rows: list[FileRow] = []
 
-        self.setLayout(root)
+        # overall progress + ETA
+        self.overall = QtWidgets.QProgressBar()
+        self.status = QtWidgets.QLabel("Idle.")
+        v.addWidget(self.overall)
+        v.addWidget(self.status)
 
-    def add_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select Images", "", "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)")
-        for f in files:
-            self.listw.addItem(f)
+        # connections
+        self.run_btn.clicked.connect(self.start)
+        self.stop_btn.clicked.connect(self.stop)
+        self.clear_btn.clicked.connect(self.list_area.clear)
 
-    def choose_output(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        self.thread = None
+        self.worker = None
+
+    # drag&drop handlers
+    def _drag_enter(self, e): 
+        if e.mimeData().hasUrls(): e.acceptProposedAction()
+    def _drop(self, e):
+        for url in e.mimeData().urls():
+            p = url.toLocalFile()
+            if os.path.isfile(p) and p.lower().split(".")[-1] in ("jpg","jpeg","png","webp","tif","tiff"):
+                self._add_file(p)
+
+    def _add_file(self, path: str):
+        item = QtWidgets.QListWidgetItem(os.path.basename(path))
+        item.setData(QtCore.Qt.UserRole, path)
+        self.list_area.addItem(item)
+
+    def _choose_out(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if d:
-            self.output_dir = d
+            self.out_dir.setText(d)
 
-    def estimate_selected(self):
-        if self.listw.count() == 0:
-            QMessageBox.information(self, "No files", "Add images first.")
+    def preview_selected(self):
+        item = self.list_area.currentItem()
+        if not item:
+            QtWidgets.QMessageBox.information(self, "Preview", "Select one image first.")
             return
-        items = self.listw.selectedItems()
-        path = items[0].text() if items else self.listw.item(0).text()
-        est, ratio = estimate_compressed_size(path, fmt=self.fmt.currentText(), quality=self.quality.value())
-        if est is None:
-            self.est_label.setText("Estimated size: —")
-        else:
-            kb = max(1, round(est / 1024))
-            self.est_label.setText(f"Estimated size: {kb} KB (≈{ratio:.2f}× of original)")
+        path = item.data(QtCore.Qt.UserRole)
+        try:
+            img = open_image(path)
+            img = resize_if_needed(img, self.size_box.currentText())
+            est = estimate_output_size(img, self.format_box.currentText(), self.quality.value(), self.keep_exif.isChecked())
+            self.preview_label.setText(f"Estimated: {est/1024:.1f} KB")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Preview failed", str(e))
 
-    def start_process(self):
-        files = [self.listw.item(i).text() for i in range(self.listw.count())]
+    def start(self):
+        files = [self.list_area.item(i).data(QtCore.Qt.UserRole) for i in range(self.list_area.count())]
         if not files:
-            QMessageBox.warning(self, "No files", "Please add images."); return
-        size = None
-        if self.sizepreset.currentText() != "None":
-            size = target_dims_from_preset(self.sizepreset.currentText())
-        self.t0 = time.time()
-        self.worker = Worker(
-            files, self.fmt.currentText(), size, self.keep_aspect.isChecked(),
-            self.quality.value(), outdir=self.output_dir
-        )
-        self.worker.perfile.connect(self.on_perfile)
+            QtWidgets.QMessageBox.warning(self, "No files", "Add images first.")
+            return
+        out_dir = self.out_dir.text() or os.path.dirname(files[0])
+        fmt = self.format_box.currentText()
+        size_key = self.size_box.currentText()
+        quality = self.quality.value()
+        prefix = self.prefix.text()
+        suffix = self.suffix.text()
+        keep_exif = self.keep_exif.isChecked()
+
+        # prepare per-file rows under the list (replace list with row widgets)
+        self._inflate_rows(files)
+
+        self.overall.setValue(0)
+        self.status.setText("Starting…")
+
+        self.thread = QtCore.QThread(self)
+        self.worker = Worker(files, out_dir, fmt, size_key, quality, prefix, suffix, keep_exif)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.on_progress)
-        self.worker.started_file.connect(self.on_started_file)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.start()
+        self.worker.file_done.connect(self.on_file_done)
+        self.worker.all_done.connect(self.on_all_done)
+        self.worker.error.connect(self.on_error)
+        self.thread.start()
 
-    def on_started_file(self, path):
-        self.perfile_bar.setValue(0)
+        self._start_time = time.time()
+        self._count = len(files)
+        self._done = 0
 
-    def on_perfile(self, pct, _):
-        self.perfile_bar.setValue(pct)
+    def stop(self):
+        if self.worker:
+            self.worker.abort()
+        self.status.setText("Stopping…")
 
-    def on_progress(self, pct, _):
-        self.global_bar.setValue(pct)
-        elapsed = time.time() - self.t0
-        if pct > 0:
-            total_est = elapsed / (pct / 100.0)
-            eta = max(0, int(total_est - elapsed))
-            self.eta_label.setText(f"ETA: {eta}s")
+    def on_progress(self, index: int, percent: int):
+        if 0 <= index < len(self.rows):
+            self.rows[index].bar.setValue(percent)
+        # overall as average of bars
+        total = sum(r.bar.value() for r in self.rows)
+        overall = int(total / max(1, len(self.rows)))
+        self.overall.setValue(overall)
+        elapsed = time.time() - self._start_time
+        # rough ETA using completed count
+        completed = sum(1 for r in self.rows if r.bar.value() >= 100)
+        remaining = self._count - completed
+        eta = (elapsed / max(1, completed)) * remaining if completed else 0
+        self.status.setText(f"Overall {overall}% • ETA ~ {eta:.1f}s")
 
-    def on_finished(self):
-        self.perfile_bar.setValue(100)
-        self.eta_label.setText("ETA: 0s — Done")
-        QMessageBox.information(self, "Done", "All images processed.")
+    def on_file_done(self, index: int, bytes_out: int):
+        self._done += 1
+        if 0 <= index < len(self.rows):
+            self.rows[index].label.setText(f"{self.rows[index].label.text()}  —  {bytes_out/1024:.1f} KB")
+            self.rows[index].bar.setValue(100)
+
+    def on_error(self, index: int, msg: str):
+        if 0 <= index < len(self.rows):
+            self.rows[index].label.setText(self.rows[index].label.text() + f"  —  ERROR: {msg}")
+            self.rows[index].bar.setStyleSheet("QProgressBar::chunk { background:#d9534f; }")
+
+    def on_all_done(self, seconds: float):
+        self.status.setText(f"Completed in {seconds:.2f}s")
+        if self.thread:
+            self.thread.quit(); self.thread.wait()
+            self.thread = None; self.worker = None
+
+    def _inflate_rows(self, files: list[str]):
+        # replace the simple list display with embedded rows showing per-file progress
+        self.rows.clear()
+        self.list_area.clear()
+        for f in files:
+            row = FileRow(f)
+            self.rows.append(row)
+            item = QtWidgets.QListWidgetItem()
+            item.setSizeHint(row.sizeHint())
+            self.list_area.addItem(item)
+            self.list_area.setItemWidget(item, row)

@@ -1,57 +1,27 @@
-import os, re
-from datetime import datetime
+import os, re, datetime
+from typing import Tuple
 
-def format_with_tokens(stem, path, number=None, pad=2, date_source="now"):
-    # {date} token
-    if "{date}" in stem:
-        dt = datetime.now() if date_source == "now" else datetime.fromtimestamp(os.path.getmtime(path))
-        stem = stem.replace("{date}", dt.strftime("%Y%m%d"))
-    # {num} token
-    if "{num}" in stem and number is not None:
-        stem = stem.replace("{num}", str(number).zfill(pad))
-    return stem
-
-def preview_new_name(path, prefix="", suffix="", number=None, pad=2,
-                     date_source="now", regex_find=None, regex_replace=None, case="none"):
-    folder, filename = os.path.split(path)
-    stem, ext = os.path.splitext(filename)
-
-    # regex find/replace on stem
-    if regex_find:
-        try:
-            stem = re.sub(regex_find, regex_replace or "", stem)
-        except re.error:
-            pass
+def build_new_name(original_path: str,
+                   pattern: str,
+                   prefix: str,
+                   suffix: str,
+                   idx: int,
+                   start: int,
+                   pad: int) -> Tuple[str, str]:
+    """Return (new_basename, new_fullpath) without touching disk."""
+    dirname, basename = os.path.split(original_path)
+    name, ext = os.path.splitext(basename)
+    ext_no_dot = ext[1:] if ext.startswith(".") else ext
 
     # tokens
-    stem = format_with_tokens(stem, path, number=number, pad=pad, date_source=date_source)
+    num_val = start + idx
+    def date_repl(m):
+        fmt = m.group(1) or "%Y-%m-%d"
+        return datetime.datetime.now().strftime(fmt)
 
-    # apply prefix/suffix
-    stem = f"{prefix}{stem}{suffix}"
+    # {date:%Y%m%d}
+    pat = re.sub(r"\{date:(.+?)\}", lambda m: date_repl(m), pattern)
+    pat = pat.replace("{name}", name).replace("{ext}", ext_no_dot).replace("{num}", str(num_val).zfill(pad))
 
-    # case transform
-    case = (case or "none").lower()
-    if case == "lower": stem = stem.lower()
-    elif case == "upper": stem = stem.upper()
-    elif case == "title": stem = stem.title()
-
-    return os.path.join(folder, f"{stem}{ext}")
-
-def batch_preview(paths, prefix="", suffix="", start=1, pad=2, date_source="now",
-                  regex_find=None, regex_replace=None, case="none", numbering=False):
-    previews = []
-    counter = start
-    for p in paths:
-        number = counter if numbering else None
-        previews.append(preview_new_name(
-            p, prefix=prefix, suffix=suffix, number=number, pad=pad,
-            date_source=date_source, regex_find=regex_find, regex_replace=regex_replace, case=case
-        ))
-        if numbering:
-            counter += 1
-    return previews
-
-def apply_renames(paths, previews):
-    for src, dst in zip(paths, previews):
-        if src != dst:
-            os.rename(src, dst)
+    new_name = f"{prefix}{pat}{suffix}{ext}"
+    return new_name, os.path.join(dirname, new_name)

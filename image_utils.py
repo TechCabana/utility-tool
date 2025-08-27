@@ -1,96 +1,77 @@
-from PIL import Image
-from io import BytesIO
-import os
+import io, math, os
+from typing import Tuple, Optional
+from PIL import Image, ImageOps, ExifTags
 
-# Standard, practical sizes. Pixels are computed at 300 DPI when mm/in given.
-STANDARD_SIZES = {
-    # Passport / ID photos
-    "Passport – India (51×51 mm)": {"mm": (51, 51), "dpi": 300},
-    "Passport – Netherlands (35×45 mm)": {"mm": (35, 45), "dpi": 300},
-    "Passport – ICAO (35×45 mm)": {"mm": (35, 45), "dpi": 300},
+# Map EXIF orientation tag
+EXIF_ORIENTATION_TAG = None
+for k, v in ExifTags.TAGS.items():
+    if v == "Orientation":
+        EXIF_ORIENTATION_TAG = k
+        break
 
-    # Common prints
-    "Photo 4×6 in": {"in": (4, 6), "dpi": 300},
-    "Photo 5×7 in": {"in": (5, 7), "dpi": 300},
+# mm to pixels at given DPI (default 300 for print)
+def mm_to_px(w_mm: float, h_mm: float, dpi: int = 300) -> Tuple[int, int]:
+    return int(round(w_mm/25.4*dpi)), int(round(h_mm/25.4*dpi))
 
+# Catalog of standard sizes (mm)
+STANDARD_SIZES_MM = {
+    "Original": None,
     # Paper
-    "A4 (210×297 mm)": {"mm": (210, 297), "dpi": 300},
-    "A5 (148×210 mm)": {"mm": (148, 210), "dpi": 300},
-
-    # Social
-    "Instagram Post (1080×1080 px)": {"px": (1080, 1080)},
-    "YouTube Thumbnail (1280×720 px)": {"px": (1280, 720)},
+    "A0 (841x1189 mm)": (841, 1189),
+    "A1 (594x841 mm)": (594, 841),
+    "A2 (420x594 mm)": (420, 594),
+    "A3 (297x420 mm)": (297, 420),
+    "A4 (210x297 mm)": (210, 297),
+    "A5 (148x210 mm)": (148, 210),
+    "A6 (105x148 mm)": (105, 148),
+    # Photo
+    "4x6 in (102x152 mm)": (102, 152),
+    "5x7 in (127x178 mm)": (127, 178),
+    "8x10 in (203x254 mm)": (203, 254),
+    "Square 1:1 (100x100 mm)": (100, 100),
+    # Passport / ID
+    "Passport (India 35x45 mm)": (35, 45),
+    "Passport (Netherlands 35x45 mm)": (35, 45),
+    "Passport (US 51x51 mm)": (51, 51),
 }
 
-def mm_to_px(mm_w, mm_h, dpi=300):
-    inch_w = mm_w / 25.4
-    inch_h = mm_h / 25.4
-    return int(round(inch_w * dpi)), int(round(inch_h * dpi))
-
-def inches_to_px(in_w, in_h, dpi=300):
-    return int(round(in_w * dpi)), int(round(in_h * dpi))
-
-def target_dims_from_preset(preset_key):
-    item = STANDARD_SIZES.get(preset_key)
-    if not item:
-        return None
-    if "px" in item:
-        return item["px"]
-    if "mm" in item:
-        w, h = item["mm"]
-        dpi = item.get("dpi", 300)
-        return mm_to_px(w, h, dpi)
-    if "in" in item:
-        w, h = item["in"]
-        dpi = item.get("dpi", 300)
-        return inches_to_px(w, h, dpi)
-    return None
-
-def estimate_compressed_size(image_path, fmt="JPEG", quality=85, subsampling="keep"):
-    """
-    Return (estimated_bytes, ratio_vs_original).
-    Uses an in-memory save to approximate final size.
-    """
+def open_image(path: str) -> Image.Image:
+    img = Image.open(path)
+    # auto-orient by EXIF
     try:
-        img = Image.open(image_path)
-        save_kwargs = {}
-        if fmt.upper() == "JPEG":
-            # JPEG doesn't support alpha; convert to RGB
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            save_kwargs["quality"] = int(quality)
-            save_kwargs["optimize"] = True
-            if subsampling != "keep":
-                save_kwargs["subsampling"] = subsampling  # 0,1,2 acceptable for PIL
-        bio = BytesIO()
-        img.save(bio, fmt.upper(), **save_kwargs)
-        est_bytes = bio.getvalue()
-        orig = os.path.getsize(image_path)
-        ratio = (len(est_bytes) / orig) if orig else 1.0
-        return len(est_bytes), ratio
+        img = ImageOps.exif_transpose(img)
     except Exception:
-        return None, None
+        pass
+    return img
 
-def convert_resize_compress(image_path, out_fmt="JPEG", out_path=None, size=None, keep_aspect=True, quality=85):
-    """
-    Convert with optional resize and compression. Returns output path.
-    - size: (w, h) px if provided
-    - keep_aspect True => thumbnail; False => exact resize
-    """
-    img = Image.open(image_path)
-    if size:
-        w, h = size
-        if keep_aspect:
-            img.thumbnail((w, h))
-        else:
-            img = img.resize((w, h))
-    if out_fmt.upper() == "JPEG" and img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
-    if out_path is None:
-        base, _ = os.path.splitext(image_path)
-        out_path = f"{base}_out.{out_fmt.lower()}"
-    save_kwargs = {}
-    if out_fmt.upper() == "JPEG":
-        save_kwargs.update(dict(quality=int(quality), optimize=True))
-    img.save(out_path, out_fmt.upper(), **save_kwargs)
-    return out_path
+def resize_if_needed(img: Image.Image, size_key: str, dpi: int = 300) -> Image.Image:
+    spec = STANDARD_SIZES_MM.get(size_key)
+    if not spec:
+        return img.copy()
+    w_px, h_px = mm_to_px(*spec, dpi=dpi)
+    return img.copy().resize((w_px, h_px), Image.LANCZOS)
+
+def save_with_format(img: Image.Image, out_path: str, fmt: str, quality: int, keep_exif: bool):
+    params = {}
+    fmt_upper = fmt.upper()
+    if fmt_upper == "ORIGINAL":
+        fmt_upper = None  # let Pillow infer from extension
+    if fmt_upper in ("JPEG", "JPG"):
+        params.update(dict(quality=quality, optimize=True, progressive=True, subsampling="keep"))
+    elif fmt_upper == "PNG":
+        params.update(dict(optimize=True))
+    elif fmt_upper == "WEBP":
+        params.update(dict(quality=quality, method=6))
+    elif fmt_upper == "TIFF":
+        params.update(dict(compression="tiff_lzw"))
+
+    # EXIF handling
+    if keep_exif and "exif" in img.info:
+        params["exif"] = img.info["exif"]
+
+    img.save(out_path, fmt_upper if fmt_upper else None, **params)
+
+def estimate_output_size(img: Image.Image, fmt: str, quality: int, keep_exif: bool) -> int:
+    buf = io.BytesIO()
+    save_with_format(img, buf, fmt, quality, keep_exif)
+    return buf.tell()  # bytes
