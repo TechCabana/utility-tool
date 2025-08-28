@@ -1,5 +1,6 @@
+# utils/file_utils.py
 import os, re, datetime
-from typing import Tuple
+from typing import Tuple, List
 
 def apply_regex(stem: str, find: str, replace: str) -> str:
     if not find:
@@ -31,7 +32,11 @@ def build_new_name(path: str, pattern: str, prefix: str, suffix: str, idx: int, 
     new_name = f"{new_stem}{ext}"
     return new_name, os.path.join(folder, new_name)
 
-def apply_renames(src_paths: list, dest_paths: list) -> None:
+def apply_renames(src_paths: List[str], dest_paths: List[str]) -> None:
     for s, d in zip(src_paths, dest_paths):
-        os.makedirs(os.path.dirname(d), exist_ok=True)
-        os.rename(s, d)
+        os.makedirs(os.path.dirname(d) or ".", exist_ok=True)
+        # use replace to overwrite if needed
+        if os.path.exists(d):
+            os.replace(s, d)
+        else:
+            os.rename(s, d)

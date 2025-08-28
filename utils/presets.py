@@ -1,4 +1,7 @@
-import os, sys, json
+# utils/presets.py
+import os
+import sys
+import json
 from typing import Dict, Any, List
 
 APP_NAME = "UtilityTool"

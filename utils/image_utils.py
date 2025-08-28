@@ -1,7 +1,9 @@
+# utils/image_utils.py
 from PIL import Image, ImageOps
 import io, os
 from typing import Tuple, Optional
 
+# Standard sizes: mm (or px:widthxheight)
 STANDARD_SIZES_MM = {
     "Original": None,
     "Passport – India (35×45 mm)": (35, 45),
@@ -28,7 +30,7 @@ def spec_to_pixels(key: str, dpi: int = 300) -> Optional[Tuple[int,int]]:
     w_mm, h_mm = spec
     return mm_to_px(w_mm, h_mm, dpi=dpi)
 
-def open_image(path: str) -> Image.Image:
+def open_image(path: str):
     img = Image.open(path)
     try:
         img = ImageOps.exif_transpose(img)
@@ -42,8 +44,7 @@ def estimate_compressed_size(path: str, fmt: str, quality: int, keep_exif: bool)
     fmt_uc = fmt.upper() if fmt else "JPEG"
     params = {}
     if fmt_uc in ("JPEG","JPG"):
-        if img.mode in ("RGBA","P"):
-            img = img.convert("RGB")
+        if img.mode in ("RGBA","P"): img = img.convert("RGB")
         params.update(dict(quality=int(quality), optimize=True))
     if fmt_uc == "WEBP":
         params.update(dict(quality=int(quality)))
@@ -55,6 +56,7 @@ def estimate_compressed_size(path: str, fmt: str, quality: int, keep_exif: bool)
 def convert_and_save(path: str, out_path: str, fmt: str, size_px: Optional[Tuple[int,int]], quality: int, keep_exif: bool) -> int:
     img = open_image(path)
     if size_px:
+        # thumbnail preserves aspect ratio and fits into size_px
         img.thumbnail(size_px, Image.LANCZOS)
     fmt_uc = fmt.upper() if fmt else None
     save_kwargs = {}
@@ -67,5 +69,7 @@ def convert_and_save(path: str, out_path: str, fmt: str, size_px: Optional[Tuple
     if keep_exif and "exif" in img.info:
         save_kwargs["exif"] = img.info["exif"]
     fmt_to_use = None if (fmt_uc in (None, "", "ORIGINAL")) else fmt_uc
+    # ensure out directory exists
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     img.save(out_path, fmt_to_use, **save_kwargs)
     return os.path.getsize(out_path)

@@ -1,113 +1,123 @@
 from PySide6 import QtWidgets, QtCore
-from utils.presets import load_all, add_image_preset, add_file_preset, delete_preset, save_all
+
 
 class HomeTab(QtWidgets.QWidget):
-    """
-    Simplified home tab. Main responsibility: open Preset Manager dialog.
-    Users save/load presets from here. No global default folder or theme options.
-    """
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.data = load_all()
+    def __init__(self):
+        super().__init__()
 
         layout = QtWidgets.QVBoxLayout(self)
-        title = QtWidgets.QLabel("Home — Presets")
-        title.setStyleSheet("font-weight:700; font-size:16px;")
-        layout.addWidget(title)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        welcome = QtWidgets.QLabel("Welcome to the Utility Tool - Your Swiss Army Knife for Files & Images")
+        welcome.setStyleSheet("font-size: 20px; font-weight: bold; color: #64dd17;")
+        welcome.setAlignment(QtCore.Qt.AlignCenter)
 
-        desc = QtWidgets.QLabel("Manage presets for Image Tools and File Tools.")
-        layout.addWidget(desc)
-
-        btn_manage = QtWidgets.QPushButton("Open Presets Manager")
-        btn_manage.clicked.connect(self.open_manager)
-        layout.addWidget(btn_manage)
-
-        # Quick actions: save current settings from each tab will be triggered from tabs directly
+        description = QtWidgets.QLabel(
+            "Use the tabs above to manage files, process images, and save your presets.\n"
+            "Presets can be applied to both File Tools and Image Tools."
+        )
+        description.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(welcome)
+        layout.addWidget(description)
         layout.addStretch()
 
-    def open_manager(self):
-        dlg = PresetsDialog(self)
-        dlg.exec()
+        self.setLayout(layout)
+        
+        # Header
+        header = QtWidgets.QLabel("Preset Manager")
+        header.setObjectName("H1")
+        layout.addWidget(header)
 
+        # Row: two cards side-by-side (save + list)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(12)
+        layout.addLayout(row)
 
-class PresetsDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Presets Manager")
-        self.resize(700, 420)
-        self.data = load_all()
+        # Save preset card
+        save_card = QtWidgets.QFrame()
+        save_card.setObjectName("Card")
+        save_l = QtWidgets.QVBoxLayout(save_card)
+        save_l.setSpacing(8)
 
-        v = QtWidgets.QVBoxLayout(self)
-        tabs = QtWidgets.QTabWidget()
-        v.addWidget(tabs)
+        sub = QtWidgets.QLabel("Save New Preset")
+        sub.setObjectName("H2")
+        save_l.addWidget(sub)
 
-        # Image presets tab
-        img_tab = QtWidgets.QWidget()
-        img_layout = QtWidgets.QVBoxLayout(img_tab)
-        self.img_list = QtWidgets.QListWidget()
-        self.img_list.addItems([p.get("name","Unnamed") for p in self.data.get("image", [])])
-        img_layout.addWidget(self.img_list)
-        hb_i = QtWidgets.QHBoxLayout()
-        self.img_add = QtWidgets.QPushButton("Add (from current Image tab)")
-        self.img_delete = QtWidgets.QPushButton("Delete")
-        hb_i.addWidget(self.img_add); hb_i.addWidget(self.img_delete)
-        img_layout.addLayout(hb_i)
+        self.kind = QtWidgets.QComboBox()
+        self.kind.addItems(["Image Tools", "File Tools"])
+        self.name_edit = QtWidgets.QLineEdit()
+        self.name_edit.setPlaceholderText("Preset name…")
 
-        # File presets tab
-        file_tab = QtWidgets.QWidget()
-        file_layout = QtWidgets.QVBoxLayout(file_tab)
-        self.file_list = QtWidgets.QListWidget()
-        self.file_list.addItems([p.get("name","Unnamed") for p in self.data.get("file", [])])
-        file_layout.addWidget(self.file_list)
-        hb_f = QtWidgets.QHBoxLayout()
-        self.file_add = QtWidgets.QPushButton("Add (from current File tab)")
-        self.file_delete = QtWidgets.QPushButton("Delete")
-        hb_f.addWidget(self.file_add); hb_f.addWidget(self.file_delete)
-        file_layout.addLayout(hb_f)
+        save_l.addWidget(QtWidgets.QLabel("Preset Type"))
+        save_l.addWidget(self.kind)
+        save_l.addWidget(QtWidgets.QLabel("Name"))
+        save_l.addWidget(self.name_edit)
 
-        tabs.addTab(img_tab, "Image Presets")
-        tabs.addTab(file_tab, "File Presets")
+        btns = QtWidgets.QHBoxLayout()
+        save_btn = QtWidgets.QPushButton("Save Preset")
+        save_btn.setObjectName("Primary")
+        clear_btn = QtWidgets.QPushButton("Clear")
+        clear_btn.setObjectName("Secondary")
+        btns.addWidget(save_btn)
+        btns.addWidget(clear_btn)
+        save_l.addLayout(btns)
 
-        # connections
-        self.img_delete.clicked.connect(lambda: self.delete_selected("image"))
-        self.file_delete.clicked.connect(lambda: self.delete_selected("file"))
+        row.addWidget(save_card, 1)
 
-        # Note: Add buttons are placeholders; actual 'save current tab state' will be invoked from the tabs themselves.
-        self.img_add.clicked.connect(self.add_placeholder_image_preset)
-        self.file_add.clicked.connect(self.add_placeholder_file_preset)
+        # Saved presets card
+        list_card = QtWidgets.QFrame()
+        list_card.setObjectName("Card")
+        list_l = QtWidgets.QVBoxLayout(list_card)
+        list_l.setSpacing(8)
 
-        close = QtWidgets.QPushButton("Close")
-        close.clicked.connect(self.accept)
-        v.addWidget(close)
+        sub2 = QtWidgets.QLabel("Saved Presets")
+        sub2.setObjectName("H2")
+        list_l.addWidget(sub2)
 
-    def delete_selected(self, kind: str):
-        lw = self.img_list if kind=="image" else self.file_list
-        idx = lw.currentRow()
-        if idx < 0:
-            QtWidgets.QMessageBox.information(self, "Select", "Please choose a preset to delete.")
+        self.listw = QtWidgets.QListWidget()
+        self.listw.addItems(["Example Image Preset", "Example File Preset"])
+        list_l.addWidget(self.listw)
+
+        act = QtWidgets.QHBoxLayout()
+        apply_btn = QtWidgets.QPushButton("Apply")
+        apply_btn.setObjectName("Primary")
+        delete_btn = QtWidgets.QPushButton("Delete")
+        delete_btn.setObjectName("Secondary")
+        act.addWidget(apply_btn)
+        act.addWidget(delete_btn)
+        list_l.addLayout(act)
+
+        row.addWidget(list_card, 1)
+
+        # Glue
+        layout.addStretch(1)
+
+        # Wire placeholder actions
+        clear_btn.clicked.connect(lambda: self.name_edit.clear())
+        save_btn.clicked.connect(self._save_placeholder)
+        delete_btn.clicked.connect(self._delete_placeholder)
+        apply_btn.clicked.connect(self._apply_placeholder)
+
+    # Placeholder slots — replace with real preset logic later
+    def _save_placeholder(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            QtWidgets.QMessageBox.information(self, "Preset", "Enter a preset name.")
             return
-        delete_preset(kind, idx)
-        data = load_all()
-        lw.clear()
-        if kind=="image":
-            lw.addItems([p.get("name","Unnamed") for p in data.get("image", [])])
-        else:
-            lw.addItems([p.get("name","Unnamed") for p in data.get("file", [])])
+        self.listw.addItem(f"{name}")
+        self.name_edit.clear()
+        QtWidgets.QMessageBox.information(self, "Preset", "Preset saved (placeholder).")
 
-    def add_placeholder_image_preset(self):
-        # simple interactive name add — real save should be done from ImageToolsTab -> call presets.add_image_preset
-        name, ok = QtWidgets.QInputDialog.getText(self, "Add Image Preset", "Preset name:")
-        if not ok or not name.strip():
+    def _delete_placeholder(self):
+        row = self.listw.currentRow()
+        if row < 0:
+            QtWidgets.QMessageBox.information(self, "Preset", "Select a preset to delete.")
             return
-        # placeholder minimal preset
-        p = {"name": name.strip(), "format":"JPEG", "quality":85, "size_key":"Original", "prefix":"", "suffix":"", "keep_exif":True}
-        add_image_preset(p)
-        self.img_list.addItem(p["name"])
+        self.listw.takeItem(row)
 
-    def add_placeholder_file_preset(self):
-        name, ok = QtWidgets.QInputDialog.getText(self, "Add File Preset", "Preset name:")
-        if not ok or not name.strip():
+    def _apply_placeholder(self):
+        item = self.listw.currentItem()
+        if not item:
+            QtWidgets.QMessageBox.information(self, "Preset", "Select a preset to apply.")
             return
-        p = {"name": name.strip(), "pattern":"{name}", "prefix":"","suffix":"","start":1,"pad":3,"regex_find":"","regex_replace":"","case":"none","date_source":"now"}
-        add_file_preset(p)
-        self.file_list.addItem(p["name"])
+        QtWidgets.QMessageBox.information(self, "Preset", f"Applied '{item.text()}' (placeholder).")
