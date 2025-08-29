@@ -2,6 +2,7 @@
 import os, time
 from typing import List, Optional
 from PySide6 import QtWidgets, QtCore
+from PySide6.QtCore import Qt
 from utils.image_utils import spec_to_pixels, estimate_compressed_size, convert_and_save
 from utils.presets import add_image_preset, load_all
 
@@ -68,19 +69,27 @@ class ImageTab(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.presets = load_all()
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(10)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setSpacing(10)
+
+        # Header
         header = QtWidgets.QLabel("Image Tools")
         header.setObjectName("H1")
-        layout.addWidget(header)
+        v.addWidget(header)
 
+        # Instruction label (centered in the available space)
+        self.drop_label = QtWidgets.QLabel("Drag and drop your files to begin")
+        self.drop_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.drop_label.setStyleSheet("color: gray; font-size: 14px; padding: 40px;")
+        v.addWidget(self.drop_label)
+    
         # file list
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.listw.setAcceptDrops(True)
         self.listw.dragEnterEvent = self._drag_enter
         self.listw.dropEvent = self._drop
-        layout.addWidget(self.listw, 1)
+        v.addWidget(self.listw, 1)
 
         # controls
         form = QtWidgets.QFormLayout()
@@ -101,7 +110,7 @@ class ImageTab(QtWidgets.QWidget):
         form.addRow("Prefix:", self.prefix)
         form.addRow("Suffix:", self.suffix)
         form.addRow("", self.keep_exif)
-        layout.addLayout(form)
+        v.addLayout(form)
 
         # output folder
         out_h = QtWidgets.QHBoxLayout()
@@ -109,7 +118,7 @@ class ImageTab(QtWidgets.QWidget):
         choose = QtWidgets.QPushButton("Choose Output Folder")
         choose.clicked.connect(self._choose_out)
         out_h.addWidget(self.out_edit, 1); out_h.addWidget(choose)
-        layout.addLayout(out_h)
+        v.addLayout(out_h)
 
         # preview & estimate
         est_h = QtWidgets.QHBoxLayout()
@@ -117,7 +126,7 @@ class ImageTab(QtWidgets.QWidget):
         self.preview_btn.clicked.connect(self.preview_selected)
         self.preview_label = QtWidgets.QLabel("Estimated: —")
         est_h.addWidget(self.preview_btn); est_h.addWidget(self.preview_label)
-        layout.addLayout(est_h)
+        v.addLayout(est_h)
 
         # action buttons
         act = QtWidgets.QHBoxLayout()
@@ -126,11 +135,11 @@ class ImageTab(QtWidgets.QWidget):
         self.clear_btn = QtWidgets.QPushButton("Clear")
         self.save_preset_btn = QtWidgets.QPushButton("Save Preset")
         act.addWidget(self.start_btn); act.addWidget(self.stop_btn); act.addWidget(self.clear_btn); act.addWidget(self.save_preset_btn)
-        layout.addLayout(act)
+        v.addLayout(act)
 
         self.overall = QtWidgets.QProgressBar()
         self.status = QtWidgets.QLabel("Idle")
-        layout.addWidget(self.overall); layout.addWidget(self.status)
+        v.addWidget(self.overall); v.addWidget(self.status)
 
         self.start_btn.clicked.connect(self.start)
         self.stop_btn.clicked.connect(self.stop)

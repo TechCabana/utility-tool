@@ -2,8 +2,10 @@
 import os, time
 from typing import List
 from PySide6 import QtWidgets, QtCore
+from PySide6.QtCore import Qt
 from utils.file_utils import build_new_name, apply_renames
 from utils.presets import add_file_preset, load_all
+
 
 class FileWorker(QtCore.QObject):
     progress = QtCore.Signal(int, int)  # idx, percent
@@ -11,7 +13,8 @@ class FileWorker(QtCore.QObject):
     error = QtCore.Signal(int, str)
     finished = QtCore.Signal(float)
 
-    def __init__(self, src_paths: List[str], dest_base: str, pattern: str, prefix: str, suffix: str, start: int, pad: int, regex_find: str, regex_replace: str, case: str, date_source: str):
+    def __init__(self, src_paths: List[str], dest_base: str, pattern: str, prefix: str, suffix: str,
+                 start: int, pad: int, regex_find: str, regex_replace: str, case: str, date_source: str):
         super().__init__()
         self.src_paths = src_paths
         self.dest_base = dest_base
@@ -34,65 +37,99 @@ class FileWorker(QtCore.QObject):
                 break
             try:
                 new_name, new_path = build_new_name(
-                    p, self.pattern, self.prefix, self.suffix, i, self.start, self.pad, self.date_source, self.regex_find, self.regex_replace, self.case
+                    p, self.pattern, self.prefix, self.suffix,
+                    i, self.start, self.pad, self.date_source,
+                    self.regex_find, self.regex_replace, self.case
                 )
                 if self.dest_base:
                     os.makedirs(self.dest_base, exist_ok=True)
                     final_path = os.path.join(self.dest_base, os.path.basename(new_name))
                 else:
                     final_path = os.path.join(os.path.dirname(p), new_name)
-                # emit small progress
+
                 self.progress.emit(i, 20)
-                # perform rename/move (replace if exists)
                 try:
                     if os.path.exists(final_path):
                         os.replace(p, final_path)
                     else:
                         os.rename(p, final_path)
-                except Exception as e:
-                    # if rename across devices, try copy+remove
-                    try:
-                        import shutil
-                        shutil.move(p, final_path)
-                    except Exception as ex:
-                        raise ex
+                except Exception:
+                    import shutil
+                    shutil.move(p, final_path)
+
                 self.progress.emit(i, 100)
                 self.done.emit(i, final_path)
+
             except Exception as e:
                 self.error.emit(i, str(e))
+
         self.finished.emit(time.time() - t0)
 
     def abort(self):
         self._abort = True
 
+
 class FileTab(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.presets = load_all()
+        self.setAcceptDrops(True)  # entire tab accepts drops
+
         v = QtWidgets.QVBoxLayout(self)
-        header = QtWidgets.QLabel("File Tools — Batch Rename")
+        v.setSpacing(10)
+
+        # Header
+        header = QtWidgets.QLabel("File Tools")
         header.setObjectName("H1")
         v.addWidget(header)
 
+        # File list (drop zone)
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.listw.setStyleSheet("""
+            QListWidget {
+                border: 2px dashed gray;
+                border-radius: 8px;
+                background: transparent;
+                color: white;
+            }
+            QListWidget::item {
+                padding: 4px;
+            }
+        """)
         v.addWidget(self.listw, 1)
 
+        # Overlay placeholder
+        self.placeholder = QtWidgets.QLabel("Drag and drop your files to begin", self.listw)
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setStyleSheet("color: gray; font-size: 14px;")
+        self.placeholder.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.placeholder.resize(self.listw.size())
+        self.listw.resizeEvent = lambda e: (
+            self.placeholder.resize(self.listw.size()),
+            QtWidgets.QListWidget.resizeEvent(self.listw, e)
+        )
+
+        # Buttons
         hb = QtWidgets.QHBoxLayout()
         add = QtWidgets.QPushButton("Add Files")
         add.clicked.connect(self.add_files)
         clear = QtWidgets.QPushButton("Clear")
-        clear.clicked.connect(self.listw.clear)
-        hb.addWidget(add); hb.addWidget(clear)
+        clear.clicked.connect(self.clear_files)
+        hb.addWidget(add)
+        hb.addWidget(clear)
         v.addLayout(hb)
 
+        # Destination chooser
         dest_h = QtWidgets.QHBoxLayout()
         self.dest_edit = QtWidgets.QLineEdit()
         dest_btn = QtWidgets.QPushButton("Choose Destination Folder")
         dest_btn.clicked.connect(self.choose_dest)
-        dest_h.addWidget(self.dest_edit); dest_h.addWidget(dest_btn)
+        dest_h.addWidget(self.dest_edit)
+        dest_h.addWidget(dest_btn)
         v.addLayout(dest_h)
 
+        # Form
         form = QtWidgets.QFormLayout()
         self.prefix = QtWidgets.QLineEdit()
         self.suffix = QtWidgets.QLineEdit()
@@ -101,11 +138,11 @@ class FileTab(QtWidgets.QWidget):
         self.pad = QtWidgets.QSpinBox(); self.pad.setRange(1, 10); self.pad.setValue(3)
         self.regex_find = QtWidgets.QLineEdit()
         self.regex_replace = QtWidgets.QLineEdit()
-        self.case = QtWidgets.QComboBox(); self.case.addItems(["none","lower","upper","title"])
-        self.date_source = QtWidgets.QComboBox(); self.date_source.addItems(["now","file_modified"])
+        self.case = QtWidgets.QComboBox(); self.case.addItems(["none", "lower", "upper", "title"])
+        self.date_source = QtWidgets.QComboBox(); self.date_source.addItems(["now", "file_modified"])
         form.addRow("Prefix:", self.prefix)
         form.addRow("Suffix:", self.suffix)
-        form.addRow("Pattern (use {name} {ext} {date:%Y%m%d} {num}):", self.pattern)
+        form.addRow("Pattern:", self.pattern)
         form.addRow("Number start:", self.start)
         form.addRow("Number pad:", self.pad)
         form.addRow("Regex find:", self.regex_find)
@@ -114,44 +151,63 @@ class FileTab(QtWidgets.QWidget):
         form.addRow("Date source:", self.date_source)
         v.addLayout(form)
 
+        # Preview
         v.addWidget(QtWidgets.QLabel("Preview:"))
         self.preview = QtWidgets.QTextEdit(); self.preview.setReadOnly(True)
         v.addWidget(self.preview, 1)
 
+        # Run buttons
         run_h = QtWidgets.QHBoxLayout()
         self.preview_btn = QtWidgets.QPushButton("Generate Preview")
         self.apply_btn = QtWidgets.QPushButton("Apply Rename")
         self.save_preset_btn = QtWidgets.QPushButton("Save Preset")
         self.progress = QtWidgets.QProgressBar()
-        run_h.addWidget(self.preview_btn); run_h.addWidget(self.apply_btn); run_h.addWidget(self.save_preset_btn); run_h.addWidget(self.progress)
+        run_h.addWidget(self.preview_btn)
+        run_h.addWidget(self.apply_btn)
+        run_h.addWidget(self.save_preset_btn)
+        run_h.addWidget(self.progress)
         v.addLayout(run_h)
 
-        # signals
+        # Signals
         self.preview_btn.clicked.connect(self.update_preview)
         self.apply_btn.clicked.connect(self.apply)
         self.save_preset_btn.clicked.connect(self.save_current_preset)
         for w in (self.prefix, self.suffix, self.pattern, self.regex_find, self.regex_replace):
             if hasattr(w, "textChanged"):
                 w.textChanged.connect(self.update_preview)
-        self.start.valueChanged.connect(self.update_preview); self.pad.valueChanged.connect(self.update_preview)
-        self.case.currentIndexChanged.connect(self.update_preview); self.date_source.currentIndexChanged.connect(self.update_preview)
+        self.start.valueChanged.connect(self.update_preview)
+        self.pad.valueChanged.connect(self.update_preview)
+        self.case.currentIndexChanged.connect(self.update_preview)
+        self.date_source.currentIndexChanged.connect(self.update_preview)
 
-        # threading
+        # Threading
         self.thread = None
         self.worker = None
         self._start_time = 0.0
 
+    # ------------------------------
+    # File management
+    # ------------------------------
     def add_files(self):
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Select Files")
         if files:
             self.listw.addItems(files)
+            self.placeholder.setVisible(self.listw.count() == 0)
             self.update_preview()
+
+    def clear_files(self):
+        self.listw.clear()
+        self.placeholder.setVisible(True)
+        self.update_preview()
 
     def choose_dest(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Destination Folder")
         if d:
             self.dest_edit.setText(d)
 
+    # ------------------------------
+    # Preview
+    # ------------------------------
     def _compute_preview(self) -> List[str]:
         paths = [self.listw.item(i).text() for i in range(self.listw.count())]
         lines = []
@@ -178,13 +234,15 @@ class FileTab(QtWidgets.QWidget):
         lines = self._compute_preview()
         self.preview.setPlainText("\n".join(lines))
 
+    # ------------------------------
+    # Apply rename
+    # ------------------------------
     def apply(self):
         paths = [self.listw.item(i).text() for i in range(self.listw.count())]
         if not paths:
             QtWidgets.QMessageBox.information(self, "No files", "Add files first.")
             return
 
-        # start worker thread
         dest_base = self.dest_edit.text()
         self.thread = QtCore.QThread(self)
         self.worker = FileWorker(
@@ -210,17 +268,13 @@ class FileTab(QtWidgets.QWidget):
         self._start_time = time.time()
 
     def on_progress(self, idx: int, percent: int):
-        # set progress bar to percent overall (average by items)
         total = self.listw.count()
-        # compute overall progress roughly
         overall = int(((idx + percent/100.0) / max(1, total)) * 100)
         self.progress.setValue(overall)
 
     def on_done(self, idx: int, final_path: str):
-        # update list item text
         if 0 <= idx < self.listw.count():
             self.listw.item(idx).setText(final_path)
-        # update preview & progress
         count = self.listw.count()
         done = sum(1 for i in range(count) if os.path.exists(self.listw.item(i).text()))
         self.progress.setValue(int((done / max(1, count)) * 100))
@@ -231,10 +285,15 @@ class FileTab(QtWidgets.QWidget):
     def on_finished(self, seconds: float):
         QtWidgets.QMessageBox.information(self, "Done", f"Finished in {seconds:.1f}s")
         if self.thread:
-            self.thread.quit(); self.thread.wait()
-            self.thread = None; self.worker = None
+            self.thread.quit()
+            self.thread.wait()
+            self.thread = None
+            self.worker = None
         self.update_preview()
 
+    # ------------------------------
+    # Presets
+    # ------------------------------
     def save_current_preset(self):
         name, ok = QtWidgets.QInputDialog.getText(self, "Save File Preset", "Preset name:")
         if not ok or not name.strip():
