@@ -9,8 +9,11 @@
 [![Status](https://img.shields.io/badge/status-maintenance-D29922?style=flat)](#)
 [![Last commit](https://img.shields.io/github/last-commit/TechCabana/utility-tool?style=flat)](https://github.com/TechCabana/utility-tool/commits/main)
 
+[Overview](#overview) ·
 [Installation](#installation) ·
-[Architecture](#architecture)
+[Architecture](#architecture) ·
+[Testing](#testing) ·
+[Contributing & Licence](#contributing--licence)
 
 </div>
 
