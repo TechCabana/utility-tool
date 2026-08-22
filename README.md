@@ -129,12 +129,8 @@ The build step writes `dist/UtilityTool.app` on macOS or `dist/UtilityTool.exe` 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Window opens with no dark styling | `styles/dark.qss` failed to load | Run from the repo root; the path in `main.py` is relative. Check the console for a `[WARN] Could not load stylesheet` line |
-| No app icon in the title bar | `main.py` points at `assets/icon.png`, which is not committed to the repo | Harmless: Qt silently skips a missing icon path. See the TODO below |
+| No app icon in the title bar | `main.py` points at `assets/icon.png`, which is not committed to the repo | Harmless: Qt silently skips a missing icon path |
 | Rename or convert stops partway through a batch | A destination folder is missing or not writable | Point the destination picker at a folder you have write access to |
-
-**TODO(owner):** `main.py` references `assets/icon.png` for the window icon, but no
-`assets/` directory exists in the repo. Either commit the icon or drop the
-`setWindowIcon` call.
 
 ---
 
@@ -286,10 +282,6 @@ There is no automated test suite in this repo: no `tests/` directory and no test
 dependency in `requirements.txt`. Verification today is manual, per the
 [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps above.
 
-**TODO(owner):** decide whether `utils/image_utils.py` and `utils/file_utils.py` (the
-Qt-free logic layer) are worth a small `pytest` suite. They take plain paths and strings
-in, so they would not need a Qt test harness.
-
 ---
 
 ## Contributing & Licence
@@ -305,10 +297,6 @@ approach can be agreed first. Commits follow
 
 Released under the MIT licence. The full text is in [LICENSE](LICENSE), and it covers the
 code in this repository only.
-
-**TODO(owner):** the `LICENSE` file currently holds only the title "MIT License" with no
-copyright line or permission text. Shields.io and GitHub's own license detector may not
-recognise it as MIT until the standard MIT template text is filled in.
 
 ### Credits and third-party terms
 
