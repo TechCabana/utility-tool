@@ -73,10 +73,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Stacked pages
         self.stacked = QtWidgets.QStackedWidget()
-        self.stacked.addWidget(HomeTab())      # 0
+        self.home_tab = HomeTab()
+        self.stacked.addWidget(self.home_tab)  # 0
         self.stacked.addWidget(ImageTab())     # 1
         self.stacked.addWidget(FileTab())      # 2
         self.stacked.addWidget(SettingsTab())  # 3
+
+        # Home's entry cards switch tabs through the same path the sidebar
+        # buttons use, so both stay in sync.
+        self.home_tab.switch_requested.connect(self.go_to_tab)
 
         root.addWidget(sidebar)
         root.addWidget(self.stacked, 1)
@@ -92,10 +97,12 @@ class MainWindow(QtWidgets.QMainWindow):
         btn = self.sender()
         if not isinstance(btn, SidebarButton):
             return
+        self.go_to_tab(btn.index)
+
+    def go_to_tab(self, index):
         for b in self.buttons:
-            b.setChecked(False)
-        btn.setChecked(True)
-        self.stacked.setCurrentIndex(btn.index)
+            b.setChecked(b.index == index)
+        self.stacked.setCurrentIndex(index)
 
 
 # Panels/cards named in the QSS that should read as elevated surfaces.

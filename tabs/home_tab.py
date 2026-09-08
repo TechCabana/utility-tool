@@ -1,124 +1,127 @@
 from PySide6 import QtWidgets, QtCore
 
 
+class EntryCard(QtWidgets.QFrame):
+    """A clickable dashboard card that requests a tab switch.
+
+    Uses the existing "#Card" objectName so it picks up the Soft Rose panel
+    styling and drop shadow for free (see apply_card_shadows() in main.py) --
+    no new QSS needed.
+    """
+    clicked = QtCore.Signal()
+
+    def __init__(self, title: str, description: str, badge: str = ""):
+        super().__init__()
+        self.setObjectName("Card")
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.setSpacing(6)
+
+        head = QtWidgets.QHBoxLayout()
+        name = QtWidgets.QLabel(title)
+        name.setObjectName("H2")
+        head.addWidget(name)
+        head.addStretch(1)
+        if badge:
+            tag = QtWidgets.QLabel(badge)
+            tag.setObjectName("FormLabel")
+            head.addWidget(tag)
+        v.addLayout(head)
+
+        desc = QtWidgets.QLabel(description)
+        desc.setObjectName("Hint")
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class HomeTab(QtWidgets.QWidget):
+    # Emitted with the target QStackedWidget index; MainWindow wires this to
+    # the same tab-switch path the sidebar buttons use (see main.py).
+    switch_requested = QtCore.Signal(int)
+
     def __init__(self):
         super().__init__()
 
         layout = QtWidgets.QVBoxLayout(self)
         # Margins leave room for the card drop shadows to render un-clipped
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(12)
-        welcome = QtWidgets.QLabel("Welcome to the Utility Tool - Your Swiss Army Knife for Files & Images")
-        welcome.setStyleSheet("font-size: 20px; font-weight: 600; color: #18181b;")
-        welcome.setAlignment(QtCore.Qt.AlignCenter)
+        layout.setSpacing(16)
 
-        description = QtWidgets.QLabel(
-            "Use the tabs above to manage files, process images, and save your presets.\n"
-            "Presets can be applied to both File Tools and Image Tools."
-        )
-        description.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(welcome)
-        layout.addWidget(description)
-        layout.addStretch()
-
-        self.setLayout(layout)
-        
-        # Header
-        header = QtWidgets.QLabel("Preset Manager")
+        header = QtWidgets.QLabel("Utility Tool")
         header.setObjectName("H1")
         layout.addWidget(header)
 
-        # Row: two cards side-by-side (save + list)
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(12)
-        layout.addLayout(row)
+        sub = QtWidgets.QLabel("Pick a tool to get started.")
+        sub.setObjectName("Hint")
+        layout.addWidget(sub)
 
-        # Save preset card
-        save_card = QtWidgets.QFrame()
-        save_card.setObjectName("Card")
-        save_l = QtWidgets.QVBoxLayout(save_card)
-        save_l.setSpacing(8)
+        # Entry cards: Image Tools / File Manager / Disk
+        cards = QtWidgets.QHBoxLayout()
+        cards.setSpacing(12)
+        layout.addLayout(cards)
 
-        sub = QtWidgets.QLabel("Save New Preset")
-        sub.setObjectName("H2")
-        save_l.addWidget(sub)
+        image_card = EntryCard("Image Tools", "Batch compress, resize and convert images.")
+        image_card.clicked.connect(lambda: self.switch_requested.emit(1))
+        cards.addWidget(image_card, 1)
 
-        self.kind = QtWidgets.QComboBox()
-        self.kind.addItems(["Image Tools", "File Tools"])
-        self.name_edit = QtWidgets.QLineEdit()
-        self.name_edit.setPlaceholderText("Preset name…")
+        file_card = EntryCard("File Manager", "Batch rename, move, copy or delete files.")
+        file_card.clicked.connect(lambda: self.switch_requested.emit(2))
+        cards.addWidget(file_card, 1)
 
-        save_l.addWidget(QtWidgets.QLabel("Preset Type"))
-        save_l.addWidget(self.kind)
-        save_l.addWidget(QtWidgets.QLabel("Name"))
-        save_l.addWidget(self.name_edit)
+        # Disk (Overview/Cleanup/Duplicates/Backup, see DESIGN.md) isn't a
+        # real tab yet -- point at Settings rather than invent one.
+        disk_card = EntryCard("Disk", "Cleanup, duplicates and backup.", badge="COMING SOON")
+        disk_card.clicked.connect(lambda: self.switch_requested.emit(3))
+        cards.addWidget(disk_card, 1)
 
-        btns = QtWidgets.QHBoxLayout()
-        save_btn = QtWidgets.QPushButton("Save Preset")
-        save_btn.setObjectName("Primary")
-        clear_btn = QtWidgets.QPushButton("Clear")
-        clear_btn.setObjectName("Secondary")
-        btns.addWidget(save_btn)
-        btns.addWidget(clear_btn)
-        save_l.addLayout(btns)
+        # Recent Activity
+        activity_header = QtWidgets.QLabel("Recent Activity")
+        activity_header.setObjectName("H2")
+        layout.addWidget(activity_header)
 
-        row.addWidget(save_card, 1)
+        self._activity_card = QtWidgets.QFrame()
+        self._activity_card.setObjectName("Card")
+        self._activity_layout = QtWidgets.QVBoxLayout(self._activity_card)
+        self._activity_layout.setSpacing(6)
+        layout.addWidget(self._activity_card)
 
-        # Saved presets card
-        list_card = QtWidgets.QFrame()
-        list_card.setObjectName("Card")
-        list_l = QtWidgets.QVBoxLayout(list_card)
-        list_l.setSpacing(8)
+        self._activity_entries = []
+        self._render_activity()
 
-        sub2 = QtWidgets.QLabel("Saved Presets")
-        sub2.setObjectName("H2")
-        list_l.addWidget(sub2)
-
-        self.listw = QtWidgets.QListWidget()
-        self.listw.addItems(["Example Image Preset", "Example File Preset"])
-        list_l.addWidget(self.listw)
-
-        act = QtWidgets.QHBoxLayout()
-        apply_btn = QtWidgets.QPushButton("Apply")
-        apply_btn.setObjectName("Primary")
-        delete_btn = QtWidgets.QPushButton("Delete")
-        delete_btn.setObjectName("Secondary")
-        act.addWidget(apply_btn)
-        act.addWidget(delete_btn)
-        list_l.addLayout(act)
-
-        row.addWidget(list_card, 1)
-
-        # Glue
         layout.addStretch(1)
 
-        # Wire placeholder actions
-        clear_btn.clicked.connect(lambda: self.name_edit.clear())
-        save_btn.clicked.connect(self._save_placeholder)
-        delete_btn.clicked.connect(self._delete_placeholder)
-        apply_btn.clicked.connect(self._apply_placeholder)
+    def add_activity(self, text):
+        """Record a batch-operation summary at the top of Recent Activity.
 
-    # Placeholder slots — replace with real preset logic later
-    def _save_placeholder(self):
-        name = self.name_edit.text().strip()
-        if not name:
-            QtWidgets.QMessageBox.information(self, "Preset", "Enter a preset name.")
-            return
-        self.listw.addItem(f"{name}")
-        self.name_edit.clear()
-        QtWidgets.QMessageBox.information(self, "Preset", "Preset saved (placeholder).")
+        ponytail: in-memory only, cleared on restart -- no batch in the app
+        calls this yet (nothing logs history today), so a persistence layer
+        would be speculative. Add one (e.g. a small JSON file next to
+        presets.json) if a real activity log is ever wanted.
+        """
+        stamp = QtCore.QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+        self._activity_entries.insert(0, f"{stamp}  -  {text}")
+        self._render_activity()
 
-    def _delete_placeholder(self):
-        row = self.listw.currentRow()
-        if row < 0:
-            QtWidgets.QMessageBox.information(self, "Preset", "Select a preset to delete.")
-            return
-        self.listw.takeItem(row)
+    def _render_activity(self):
+        while self._activity_layout.count():
+            item = self._activity_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
 
-    def _apply_placeholder(self):
-        item = self.listw.currentItem()
-        if not item:
-            QtWidgets.QMessageBox.information(self, "Preset", "Select a preset to apply.")
+        if not self._activity_entries:
+            empty = QtWidgets.QLabel("No recent activity yet - batches you run will show up here.")
+            empty.setObjectName("Hint")
+            empty.setWordWrap(True)
+            self._activity_layout.addWidget(empty)
             return
-        QtWidgets.QMessageBox.information(self, "Preset", f"Applied '{item.text()}' (placeholder).")
+
+        for entry in self._activity_entries[:5]:
+            row = QtWidgets.QLabel(entry)
+            self._activity_layout.addWidget(row)
