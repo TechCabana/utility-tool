@@ -4,7 +4,9 @@ from typing import List, Optional
 from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
 from utils.image_utils import spec_to_pixels, estimate_compressed_size, convert_and_save
-from utils.presets import add_image_preset, load_all
+from utils.file_utils import build_new_name
+from utils.presets import add_image_preset, get_image_presets, load_all
+from widgets.common import ConfirmDialog, EmptyState
 
 class ImageRow(QtWidgets.QWidget):
     def __init__(self, path: str):
@@ -24,16 +26,26 @@ class ImageWorker(QtCore.QObject):
     error = QtCore.Signal(int, str)
     finished = QtCore.Signal(float)
 
-    def __init__(self, files: List[str], out_dir: str, fmt: str, size_key: str, quality: int, prefix: str, suffix: str, keep_exif: bool):
+    def __init__(self, files: List[str], out_dir: str, fmt: str, size_key: str, quality: int,
+                 compression: int, keep_exif: bool, pattern: str, prefix: str, suffix: str,
+                 start: int, pad: int, regex_find: str, regex_replace: str, case: str, date_source: str):
         super().__init__()
         self.files = files
         self.out_dir = out_dir
         self.fmt = fmt
         self.size_key = size_key
         self.quality = quality
+        self.compression = compression
+        self.keep_exif = keep_exif
+        self.pattern = pattern
         self.prefix = prefix
         self.suffix = suffix
-        self.keep_exif = keep_exif
+        self.start = start
+        self.pad = pad
+        self.regex_find = regex_find
+        self.regex_replace = regex_replace
+        self.case = case
+        self.date_source = date_source
         self._abort = False
 
     @QtCore.Slot()
@@ -45,17 +57,26 @@ class ImageWorker(QtCore.QObject):
             try:
                 # small step: estimate
                 try:
-                    est = estimate_compressed_size(p, self.fmt, self.quality, self.keep_exif)
+                    est = estimate_compressed_size(p, self.fmt, self.quality, self.keep_exif, self.compression)
                 except Exception:
                     est = None
                 self.progress.emit(i, 5)
-                base, ext = os.path.splitext(os.path.basename(p))
-                out_ext = (self.fmt if self.fmt != "ORIGINAL" else ext.replace(".", "")) or "jpg"
-                out_name = f"{self.prefix}{base}{self.suffix}.{out_ext.lower()}"
+                # Same pattern-based naming engine File Tools uses, so an
+                # image preset's naming fields (pattern/prefix/suffix/num/
+                # regex/case/date) behave identically -- only the extension
+                # is swapped for the chosen output format below.
+                base_name, _ = build_new_name(
+                    p, self.pattern, self.prefix, self.suffix, i, self.start, self.pad,
+                    self.date_source, self.regex_find, self.regex_replace, self.case
+                )
+                stem, _old_ext = os.path.splitext(base_name)
+                _, src_ext = os.path.splitext(os.path.basename(p))
+                out_ext = (self.fmt if self.fmt != "ORIGINAL" else src_ext.replace(".", "")) or "jpg"
+                out_name = f"{stem}.{out_ext.lower()}"
                 out_path = os.path.join(self.out_dir, out_name)
                 size_px = spec_to_pixels(self.size_key)
                 # do save (this is the heavy op)
-                bytes_out = convert_and_save(p, out_path, self.fmt, size_px, self.quality, self.keep_exif)
+                bytes_out = convert_and_save(p, out_path, self.fmt, size_px, self.quality, self.keep_exif, self.compression)
                 self.progress.emit(i, 100)
                 self.done.emit(i, bytes_out)
             except Exception as e:
@@ -77,13 +98,7 @@ class ImageTab(QtWidgets.QWidget):
         header.setObjectName("H1")
         v.addWidget(header)
 
-        # Instruction label (centered in the available space)
-        self.drop_label = QtWidgets.QLabel("Drag and drop your files to begin")
-        self.drop_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.drop_label.setStyleSheet("color: gray; font-size: 14px; padding: 40px;")
-        v.addWidget(self.drop_label)
-    
-        # file list
+        # file list (also the drop target)
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.listw.setAcceptDrops(True)
@@ -91,26 +106,70 @@ class ImageTab(QtWidgets.QWidget):
         self.listw.dropEvent = self._drop
         v.addWidget(self.listw, 1)
 
+        # Empty-state overlay: shown only while no files are added, hidden
+        # once files land via drag/drop. Transparent to mouse events so
+        # drag/drop still reaches the list widget underneath it.
+        self.empty_state = EmptyState(
+            title="No images added yet",
+            hint="Drag and drop image files here to begin",
+            parent=self.listw,
+        )
+        self.empty_state.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.listw.resizeEvent = lambda e: (
+            self.empty_state.resize(self.listw.size()),
+            QtWidgets.QListWidget.resizeEvent(self.listw, e),
+        )
+        self._update_empty_state()
+
         # controls
         form = QtWidgets.QFormLayout()
+
+        # Preset: applies format/size/quality/compression/naming fields in
+        # one shot, the same way File Tools' preset dropdown applies its
+        # pattern-based rename presets.
+        self.preset_combo = QtWidgets.QComboBox()
+        form.addRow("Preset:", self.preset_combo)
+
         self.fmt = QtWidgets.QComboBox(); self.fmt.addItems(["ORIGINAL","JPEG","PNG","WEBP","TIFF"])
-        self.size = QtWidgets.QComboBox(); self.size.addItems(list(spec_to_pixels.__self__ if hasattr(spec_to_pixels, "__self__") else [] ) or list(load_all().get("image", [])))
-        # issue: above is placeholder — override with STANDARD keys below
-        # But we can't import STANDARD_SIZES_MM here without circular import; instead, provide fixed list:
-        self.size.clear()
-        self.size.addItems(["Original", "Passport – India (35×45 mm)", "Passport – Netherlands (35×45 mm)",
+        self.size = QtWidgets.QComboBox()
+        self.size.addItems(["Original", "1920px long edge", "1024px long edge", "Instagram 1080×1080 px",
+                            "Passport – India (35×45 mm)", "Passport – Netherlands (35×45 mm)",
                             "Photo 4×6 in (102×152 mm)", "Photo 5×7 in (127×178 mm)", "A4 (210×297 mm)", "A5 (148×210 mm)"])
         self.quality = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.quality.setRange(10, 100); self.quality.setValue(85)
+        self.compression = QtWidgets.QSpinBox(); self.compression.setRange(1, 6); self.compression.setValue(4)
         self.prefix = QtWidgets.QLineEdit(); self.suffix = QtWidgets.QLineEdit()
         self.keep_exif = QtWidgets.QCheckBox("Keep EXIF"); self.keep_exif.setChecked(True)
+
+        # Pattern-based naming -- same fields/shape as File Tools (utils/file_utils.build_new_name).
+        self.pattern = QtWidgets.QLineEdit("{name}")
+        # Named num_start (not `start`) -- ImageTab already has a `start()`
+        # method (the batch-start handler) that an instance attribute of the
+        # same name would shadow.
+        self.num_start = QtWidgets.QSpinBox(); self.num_start.setRange(0, 1_000_000); self.num_start.setValue(1)
+        self.pad = QtWidgets.QSpinBox(); self.pad.setRange(1, 10); self.pad.setValue(3)
+        self.regex_find = QtWidgets.QLineEdit()
+        self.regex_replace = QtWidgets.QLineEdit()
+        self.case = QtWidgets.QComboBox(); self.case.addItems(["none", "lower", "upper", "title"])
+        self.date_source = QtWidgets.QComboBox(); self.date_source.addItems(["now", "file_modified"])
 
         form.addRow("Format:", self.fmt)
         form.addRow("Target size:", self.size)
         form.addRow("Quality:", self.quality)
+        form.addRow("Compression effort (1-6):", self.compression)
+        form.addRow("Pattern:", self.pattern)
         form.addRow("Prefix:", self.prefix)
         form.addRow("Suffix:", self.suffix)
+        form.addRow("Number start:", self.num_start)
+        form.addRow("Number pad:", self.pad)
+        form.addRow("Regex find:", self.regex_find)
+        form.addRow("Regex replace:", self.regex_replace)
+        form.addRow("Case:", self.case)
+        form.addRow("Date source:", self.date_source)
         form.addRow("", self.keep_exif)
         v.addLayout(form)
+
+        self._reload_presets()
+        self.preset_combo.currentIndexChanged.connect(self._apply_selected_preset)
 
         # output folder
         out_h = QtWidgets.QHBoxLayout()
@@ -143,7 +202,7 @@ class ImageTab(QtWidgets.QWidget):
 
         self.start_btn.clicked.connect(self.start)
         self.stop_btn.clicked.connect(self.stop)
-        self.clear_btn.clicked.connect(self.listw.clear)
+        self.clear_btn.clicked.connect(self.clear_files)
         self.save_preset_btn.clicked.connect(self.save_current_preset)
 
         self.thread = None
@@ -165,6 +224,34 @@ class ImageTab(QtWidgets.QWidget):
         it = QtWidgets.QListWidgetItem(os.path.basename(path))
         it.setData(QtCore.Qt.UserRole, path)
         self.listw.addItem(it)
+        self._update_empty_state()
+
+    def _update_empty_state(self):
+        self.empty_state.setVisible(self.listw.count() == 0)
+
+    def clear_files(self):
+        """Clear button: discards the current file selection.
+
+        Nothing gets deleted from disk, but this does throw away the
+        user's batch setup (added files, per-file rows) with no way to
+        undo it, so it goes through the shared confirm dialog -- Move/
+        Copy/Delete in File Manager aren't built yet, so this is the
+        first genuinely destructive-from-the-user's-POV action in the app.
+        """
+        count = self.listw.count()
+        if not count:
+            return
+        if not ConfirmDialog.ask(
+            self,
+            "Clear file list?",
+            f"This removes all {count} file(s) from the list. "
+            "Files on disk are not affected.",
+            confirm_text="Clear",
+        ):
+            return
+        self.listw.clear()
+        self.rows.clear()
+        self._update_empty_state()
 
     def _choose_out(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose output folder")
@@ -194,6 +281,7 @@ class ImageTab(QtWidgets.QWidget):
             item.setData(QtCore.Qt.UserRole, p)
             self.listw.addItem(item)
             self.listw.setItemWidget(item, row)
+        self._update_empty_state()
 
     def start(self):
         files = [self.listw.item(i).data(QtCore.Qt.UserRole) for i in range(self.listw.count())]
@@ -204,16 +292,25 @@ class ImageTab(QtWidgets.QWidget):
         fmt = self.fmt.currentText()
         size_key = self.size.currentText()
         quality = self.quality.value()
+        compression = self.compression.value()
         prefix = self.prefix.text()
         suffix = self.suffix.text()
         keep_exif = self.keep_exif.isChecked()
+        pattern = self.pattern.text()
+        start = self.num_start.value()
+        pad = self.pad.value()
+        regex_find = self.regex_find.text()
+        regex_replace = self.regex_replace.text()
+        case = self.case.currentText()
+        date_source = self.date_source.currentText()
 
         self._inflate_rows(files)
         self.overall.setValue(0)
         self.status.setText("Starting…")
 
         self.thread = QtCore.QThread(self)
-        self.worker = ImageWorker(files, out_dir, fmt, size_key, quality, prefix, suffix, keep_exif)
+        self.worker = ImageWorker(files, out_dir, fmt, size_key, quality, compression, keep_exif,
+                                   pattern, prefix, suffix, start, pad, regex_find, regex_replace, case, date_source)
         self.worker.moveToThread(self.thread)
         self.worker.progress.connect(self.on_progress)
         self.worker.done.connect(self.on_done)
@@ -249,7 +346,7 @@ class ImageTab(QtWidgets.QWidget):
     def on_error(self, idx: int, msg: str):
         if 0 <= idx < len(self.rows):
             self.rows[idx].label.setText(self.rows[idx].label.text() + f" — ERROR: {msg}")
-            self.rows[idx].bar.setStyleSheet("QProgressBar::chunk { background:#d9534f; }")
+            self.rows[idx].bar.setStyleSheet("QProgressBar::chunk { background: #c23b32; }")
 
     def on_finished(self, seconds: float):
         self.status.setText(f"Completed in {seconds:.1f}s")
@@ -266,9 +363,53 @@ class ImageTab(QtWidgets.QWidget):
             "format": self.fmt.currentText(),
             "quality": self.quality.value(),
             "size_key": self.size.currentText(),
+            "compression": self.compression.value(),
+            "keep_exif": self.keep_exif.isChecked(),
+            "pattern": self.pattern.text(),
             "prefix": self.prefix.text(),
             "suffix": self.suffix.text(),
-            "keep_exif": self.keep_exif.isChecked()
+            "start": self.num_start.value(),
+            "pad": self.pad.value(),
+            "regex_find": self.regex_find.text(),
+            "regex_replace": self.regex_replace.text(),
+            "case": self.case.currentText(),
+            "date_source": self.date_source.currentText(),
         }
         add_image_preset(preset)
+        self._reload_presets()
         QtWidgets.QMessageBox.information(self, "Saved", f"Image preset '{name}' saved.")
+
+    # ------------------------------
+    # Presets: load + apply
+    # ------------------------------
+    def _reload_presets(self):
+        """Repopulate the preset dropdown from disk (initial load, and after
+        Save Preset adds a new one)."""
+        self._image_presets = get_image_presets()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("— Select preset —")
+        for p in self._image_presets:
+            self.preset_combo.addItem(p.get("name", "(unnamed)"))
+        self.preset_combo.blockSignals(False)
+
+    def _apply_selected_preset(self, index: int):
+        """Apply a preset's format/size/quality/compression/naming fields to
+        the form -- mirrors File Tools' _apply_selected_preset."""
+        if index <= 0 or index - 1 >= len(self._image_presets):
+            return
+        p = self._image_presets[index - 1]
+        self.fmt.setCurrentText(p.get("format", "ORIGINAL"))
+        self.size.setCurrentText(p.get("size_key", "Original"))
+        self.quality.setValue(int(p.get("quality", 85)))
+        self.compression.setValue(int(p.get("compression", 4)))
+        self.keep_exif.setChecked(bool(p.get("keep_exif", True)))
+        self.pattern.setText(p.get("pattern", "{name}"))
+        self.prefix.setText(p.get("prefix", ""))
+        self.suffix.setText(p.get("suffix", ""))
+        self.num_start.setValue(int(p.get("start", 1)))
+        self.pad.setValue(int(p.get("pad", 3)))
+        self.regex_find.setText(p.get("regex_find", ""))
+        self.regex_replace.setText(p.get("regex_replace", ""))
+        self.case.setCurrentText(p.get("case", "none"))
+        self.date_source.setCurrentText(p.get("date_source", "now"))

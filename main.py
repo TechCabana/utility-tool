@@ -14,8 +14,9 @@ class SidebarButton(QtWidgets.QPushButton):
         self.setCheckable(True)
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self.setMinimumHeight(42)
-        # Base shape; colors come from QSS
-        self.setStyleSheet("border-radius: 10px; padding: 10px; text-align: left;")
+        # Shape and colors both come from the '#Sidebar QPushButton' rules in
+        # the QSS. No inline stylesheet here: a widget-level one outranks the
+        # app-level sheet and would silently pin the radius against the theme.
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -72,10 +73,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Stacked pages
         self.stacked = QtWidgets.QStackedWidget()
-        self.stacked.addWidget(HomeTab())      # 0
+        self.home_tab = HomeTab()
+        self.stacked.addWidget(self.home_tab)  # 0
         self.stacked.addWidget(ImageTab())     # 1
         self.stacked.addWidget(FileTab())      # 2
         self.stacked.addWidget(SettingsTab())  # 3
+
+        # Home's entry cards switch tabs through the same path the sidebar
+        # buttons use, so both stay in sync.
+        self.home_tab.switch_requested.connect(self.go_to_tab)
 
         root.addWidget(sidebar)
         root.addWidget(self.stacked, 1)
@@ -84,17 +90,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.buttons[0].setChecked(True)
         self.stacked.setCurrentIndex(0)
 
+        # Soft elevation on every panel/card, once the whole tree exists
+        apply_card_shadows(central)
+
     def change_page(self):
         btn = self.sender()
         if not isinstance(btn, SidebarButton):
             return
+        self.go_to_tab(btn.index)
+
+    def go_to_tab(self, index):
         for b in self.buttons:
-            b.setChecked(False)
-        btn.setChecked(True)
-        self.stacked.setCurrentIndex(btn.index)
+            b.setChecked(b.index == index)
+        self.stacked.setCurrentIndex(index)
 
 
-def load_stylesheet(app, path="styles/dark.qss"):
+# Panels/cards named in the QSS that should read as elevated surfaces.
+SHADOWED_FRAMES = ("Card", "Sidebar")
+
+
+def apply_card_shadows(root):
+    """Give every card/panel frame under `root` the Soft Rose card shadow.
+
+    QSS has no `box-shadow`, so the theme's elevation cue has to be a
+    QGraphicsDropShadowEffect set on each widget. Walking the tree once from
+    here keeps that out of the tab modules: a new card only needs
+    setObjectName("Card") to pick the shadow up, exactly as it already does
+    to pick up the QSS surface styling.
+    """
+    for frame in root.findChildren(QtWidgets.QFrame):
+        if frame.objectName() not in SHADOWED_FRAMES:
+            continue
+        # One effect instance per widget - a QGraphicsEffect cannot be shared.
+        shadow = QtWidgets.QGraphicsDropShadowEffect(frame)
+        shadow.setBlurRadius(16)
+        shadow.setOffset(0, 2)
+        shadow.setColor(QtGui.QColor(24, 24, 27, 28))  # rgba(24,24,27,.11)
+        frame.setGraphicsEffect(shadow)
+
+
+def load_stylesheet(app, path="styles/theme.qss"):
     try:
         with open(path, "r", encoding="utf-8") as f:
             app.setStyleSheet(f.read())

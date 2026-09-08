@@ -18,31 +18,74 @@ def app_dir() -> str:
 
 PRESETS_FILE = os.path.join(app_dir(), "presets.json")
 
+# Image presets carry the same pattern-based naming fields as file presets
+# (pattern/prefix/suffix/start/pad/regex_find/regex_replace/case/date_source)
+# plus the image-only fields (format/quality/size_key/compression/keep_exif).
+# `pattern` defaults to "{name}" everywhere below, which preserves the
+# original filename unless a preset explicitly overrides it (DESIGN.md).
+_IMAGE_NAMING_DEFAULTS = {
+    "pattern": "{name}",
+    "prefix": "",
+    "suffix": "",
+    "start": 1,
+    "pad": 3,
+    "regex_find": "",
+    "regex_replace": "",
+    "case": "none",
+    "date_source": "now",
+}
+
+
+def _image_preset(name: str, format: str, quality: int, size_key: str,
+                   compression: int = 4, keep_exif: bool = True, **naming) -> Dict[str, Any]:
+    """Build an image preset dict with the shared naming fields filled in.
+
+    `compression` defaults to 4 ("balanced" effort, see DESIGN.md's starter
+    preset table) unless a preset overrides it (e.g. Print 4x6 -> 6).
+    """
+    preset = {
+        "name": name,
+        "format": format,
+        "quality": quality,
+        "size_key": size_key,
+        "compression": compression,
+        "keep_exif": keep_exif,
+    }
+    preset.update(_IMAGE_NAMING_DEFAULTS)
+    preset.update(naming)
+    return preset
+
+
+def _file_preset(name: str, **naming) -> Dict[str, Any]:
+    preset = {"name": name}
+    preset.update(_IMAGE_NAMING_DEFAULTS)
+    preset.update(naming)
+    return preset
+
+
+# Starter presets (v1) -- DESIGN.md "Starter presets" table is the source of
+# truth for these exact values. Shipped once, on first run only: load_all()
+# below only ever writes DEFAULT when presets.json does not exist yet, so a
+# user who deletes a starter preset never has it silently reappear.
 DEFAULT = {
     "image": [
-        {
-            "name": "Default Image (JPEG 85)",
-            "format": "JPEG",
-            "quality": 85,
-            "size_key": "Original",
-            "prefix": "",
-            "suffix": "",
-            "keep_exif": True
-        }
+        _image_preset("Web Upload", "JPEG", 85, "1920px long edge"),
+        _image_preset("Email Attachment", "JPEG", 70, "1024px long edge"),
+        _image_preset("Social Media Square", "JPEG", 90, "Instagram 1080×1080 px"),
+        _image_preset("Passport – India", "JPEG", 95, "Passport – India (35×45 mm)"),
+        _image_preset("Print 4×6", "JPEG", 95, "Photo 4×6 in (102×152 mm)", compression=6),
+        _image_preset("Archive (lossless)", "PNG", 100, "Original", keep_exif=True),
     ],
     "file": [
-        {
-            "name": "Default File (date prefix)",
-            "pattern": "{date:%Y%m%d}_{name}",
-            "prefix": "",
-            "suffix": "",
-            "start": 1,
-            "pad": 3,
-            "regex_find": "",
-            "regex_replace": "",
-            "case": "none",
-            "date_source": "now"
-        }
+        _file_preset("Date Prefix", pattern="{date:%Y%m%d}_{name}"),
+        _file_preset("Sequential Numbering", pattern="{name}_{num}", pad=3),
+        # Strips a " (copy N)" suffix (e.g. "Report (copy 2)" -> "Report").
+        _file_preset("Strip \"copy N\" Suffix", regex_find=r" \(copy \d+\)", regex_replace=""),
+        # Web-safe slug: any run of non-alphanumeric characters -> a single
+        # hyphen, then lowercased -- a single regex pass is all build_new_name
+        # supports, so this is the one-shot slugify pattern.
+        _file_preset("Lowercase + Hyphens", regex_find=r"[^A-Za-z0-9]+", regex_replace="-", case="lower"),
+        _file_preset("Document Numbering", pattern="INV_{num}", pad=4, start=1001),
     ]
 }
 
