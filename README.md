@@ -47,12 +47,9 @@ progress feedback for long batches.
 | Compressing, resizing and format-converting images (JPEG, PNG, WEBP) | Editing images beyond resize/format/compress (no crop, filters, colour edits) |
 | Fixed passport/photo/print size presets (India and Netherlands passport, 4x6, A4, A5, Instagram) | Arbitrary custom paper sizes beyond the built-in list |
 | Batch file renaming by pattern, regex, case and date tokens | Renaming based on file content or metadata beyond modified time |
+| Batch move, copy and delete (File Manager), with a conflict policy and Recycle-Bin-only delete | Undo for a completed batch operation |
 | Saving and loading presets for both tools (`utils/presets.py`) | Syncing presets across machines or accounts, no cloud storage |
 | Windows and macOS, run from source or packaged with PyInstaller | An installer/updater; PyInstaller output is a raw binary only |
-
-The Home tab's preset save/apply/delete buttons are wired to placeholder handlers
-(`tabs/home_tab.py`) rather than the real functions in `utils/presets.py`. The storage
-layer works; the Home tab UI just does not call it yet.
 
 ---
 
@@ -63,7 +60,7 @@ layer works; the Home tab UI just does not call it yet.
 | Requirement | Version | Notes |
 | --- | --- | --- |
 | Python | 3.9+ | Only interpreter this was built against |
-| pip | Any recent | Installs the two pinned dependencies |
+| pip | Any recent | Installs the three pinned dependencies |
 
 ### 1. Clone
 
@@ -84,7 +81,9 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Installs `PySide6==6.7.2` and `Pillow==10.2.0`.
+Installs `PySide6==6.7.2`, `Pillow==10.2.0` and `send2trash==2.1.0` (File Manager Delete
+routes through this, so a batch delete always goes to the Recycle Bin, never a permanent
+delete).
 
 ### 3. Run
 
@@ -98,8 +97,8 @@ Settings.
 ### 4. Verify
 
 There is no automated test suite (see [Testing](#testing) note below). Confirm the install
-worked by checking that the window opens, the dark stylesheet is applied (not the plain
-OS default), and all four sidebar tabs switch pages when clicked.
+worked by checking that the window opens, the light Soft Rose stylesheet is applied (not
+the plain OS default), and all four sidebar tabs switch pages when clicked.
 
 ### 5. Configure
 
@@ -141,12 +140,14 @@ The build step writes `dist/UtilityTool.app` on macOS or `dist/UtilityTool.exe` 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat&logo=python&logoColor=white)
 ![PySide6](https://img.shields.io/badge/PySide6-6.7.2-41CD52?style=flat&logo=qt&logoColor=white)
 ![Pillow](https://img.shields.io/badge/Pillow-10.2.0-3776AB?style=flat&logo=python&logoColor=white)
+![send2trash](https://img.shields.io/badge/send2trash-2.1.0-3776AB?style=flat&logo=python&logoColor=white)
 
 | Layer | Choice | Why this one |
 | --- | --- | --- |
 | Language | Python 3.9+ | Same language on both target OSes, minimal setup for a personal tool |
 | UI toolkit | PySide6 (Qt for Python) | Native-feeling cross-platform desktop widgets, QSS for theming |
 | Image processing | Pillow | Handles resize/convert/compress and EXIF without a native dependency |
+| File deletion | send2trash | Sends File Manager deletes to the OS Recycle Bin/Trash, never a permanent delete |
 | Storage | JSON file in the OS app-data directory | No database needed for a handful of saved presets |
 | Hosting | None (local desktop app) | Nothing to deploy or serve |
 | Automation | None | No CI configured; see [Testing](#testing) |
@@ -178,8 +179,9 @@ flowchart LR
    Image Tools, File Tools, Settings) into a `QStackedWidget` switched by the sidebar
    buttons.
 2. In `tabs/image_tab.py` or `tabs/file_tab.py`, the user picks files and sets options: an
-   output format, a fixed size preset, and quality for images; a rename pattern, regex and
-   case rule for files.
+   output format, a fixed size preset, and quality for images; for files, an operation
+   picker (Rename/Move/Copy/Delete) swaps in the fields for that operation -- a rename
+   pattern/regex/case rule, or a destination folder and conflict policy for Move/Copy.
 3. Starting a batch spawns a `QThread` running `ImageWorker` or `FileWorker`, which calls
    the pure functions in `utils/image_utils.py` or `utils/file_utils.py` per file and emits
    progress signals the tab renders as per-file progress bars.
@@ -201,25 +203,36 @@ flowchart LR
 <details>
 <summary><b>Data model</b></summary>
 
-One JSON file (`presets.json`), two lists: `image` and `file`. Shown here in the shape
-`utils/presets.py` writes by default.
+One JSON file (`presets.json`), two lists: `image` and `file`. 11 starter presets (6 image,
+5 file) ship on first run only (see `utils/presets.py`'s `DEFAULT`); deleting one never
+brings it back on the next launch. Image presets carry the same pattern-naming fields as
+file presets, so both apply through one shared engine (`utils/file_utils.build_new_name`).
+Shown here in the shape `utils/presets.py` writes by default:
 
 ```json
 {
   "image": [
     {
-      "name": "Default Image (JPEG 85)",
+      "name": "Web Upload",
       "format": "JPEG",
       "quality": 85,
-      "size_key": "Original",
+      "size_key": "1920px long edge",
+      "compression": 4,
+      "keep_exif": true,
+      "pattern": "{name}",
       "prefix": "",
       "suffix": "",
-      "keep_exif": true
+      "start": 1,
+      "pad": 3,
+      "regex_find": "",
+      "regex_replace": "",
+      "case": "none",
+      "date_source": "now"
     }
   ],
   "file": [
     {
-      "name": "Default File (date prefix)",
+      "name": "Date Prefix",
       "pattern": "{date:%Y%m%d}_{name}",
       "prefix": "",
       "suffix": "",
@@ -236,10 +249,11 @@ One JSON file (`presets.json`), two lists: `image` and `file`. Shown here in the
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `format` | string | `JPEG`, `PNG`, `WEBP` or `ORIGINAL` to keep the source format |
-| `size_key` | string | Key into the fixed size list in `utils/image_utils.py`, or `Original` |
-| `quality` | int | JPEG/WEBP quality, 1-100 |
-| `pattern` | string | Rename template; supports `{name}`, `{ext}`, `{num}`, `{date:FMT}` tokens |
+| `format` | string | `JPEG`, `PNG`, `WEBP` or `ORIGINAL` to keep the source format (image presets only) |
+| `size_key` | string | Key into the fixed size list in `utils/image_utils.py`, or `Original` (image presets only) |
+| `quality` | int | JPEG/WEBP quality, 1-100 (image presets only) |
+| `compression` | int | 1-6 "effort" dial (image presets only); maps to PNG `compress_level` or WEBP `method`, a no-op for JPEG/TIFF beyond `optimize` |
+| `pattern` | string | Rename/naming template; supports `{name}`, `{ext}`, `{num}`, `{date:FMT}` tokens |
 | `case` | string | `none`, `lower`, `upper` or `title`, applied to the final name |
 
 </details>
@@ -250,18 +264,20 @@ One JSON file (`presets.json`), two lists: `image` and `file`. Shown here in the
 ```
 utility-tool/
 ├── main.py               app entry point; window shell, sidebar, tab wiring
-├── requirements.txt      pinned runtime dependencies (PySide6, Pillow)
+├── requirements.txt      pinned runtime dependencies (PySide6, Pillow, send2trash)
 ├── LICENSE                MIT
 ├── styles/
 │   └── theme.qss          Qt stylesheet for the Soft Rose light theme
 ├── tabs/                  one QWidget per sidebar page
-│   ├── home_tab.py         preset manager UI (save/apply/delete are placeholders)
+│   ├── home_tab.py         task-first dashboard: entry cards + recent activity
 │   ├── image_tab.py        image compress/resize/convert UI + worker thread
-│   ├── file_tab.py         batch rename UI + worker thread
-│   └── settings_tab.py     settings placeholder, no options yet
+│   ├── file_tab.py         batch rename/move/copy/delete UI + worker thread
+│   └── settings_tab.py     preset management (list + delete); other settings TBD
+├── widgets/               reusable Qt widgets shared across tabs
+│   └── common.py           ConfirmDialog (destructive-action confirm), EmptyState
 └── utils/                 pure logic, no Qt imports
     ├── image_utils.py      Pillow-based resize/convert/compress helpers
-    ├── file_utils.py       filename pattern, regex and case helpers
+    ├── file_utils.py       filename pattern/regex/case helpers, move/copy/delete
     └── presets.py          JSON preset load/save, OS app-data path
 ```
 
@@ -269,6 +285,7 @@ utility-tool/
 | --- | --- |
 | `main.py` | Composes the window, sidebar and tabs; loads the QSS theme |
 | `tabs/` | UI for each sidebar page, one file per tab |
+| `widgets/` | Shared Qt widgets (dialogs, placeholders) reused across tabs |
 | `utils/` | Framework-free helpers the tabs call into; safe to unit test in isolation |
 | `styles/theme.qss` | The only styling, apart from card drop shadows (`apply_card_shadows` in `main.py`, since QSS has no `box-shadow`) and a few label-level inline styles |
 
