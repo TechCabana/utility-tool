@@ -8,7 +8,9 @@ from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
 
 from utils.disk_utils import (
-    CleanupCategory, cleanup_scan, human_size, top_level_breakdown,
+    CleanupCategory, DuplicateGroup, cleanup_scan, duplicate_roots,
+    find_duplicate_files, find_duplicate_images, human_size,
+    top_level_breakdown,
 )
 from utils.file_utils import delete_file
 from widgets.common import ConfirmDialog, EmptyState
@@ -236,6 +238,192 @@ class CategorySection(QtWidgets.QWidget):
         return list(self.category.items) if self.check.isChecked() else []
 
 
+class DuplicateScanWorker(QtCore.QObject):
+    """Runs one Duplicates scan -- Files or Images mode -- off the UI thread.
+
+    Same shape as the two scan workers above: a plain QObject moved onto a
+    QThread, started by `thread.started`, reporting only through signals.
+    Hashing every same-sized file in Downloads/Documents/Desktop, or opening
+    every image in them, is minutes of work in the worst case, so this is the
+    one part of the tab that absolutely cannot run on the UI thread.
+    """
+    progress = QtCore.Signal(int, int)     # files fingerprinted, total
+    finished = QtCore.Signal(list, int)    # [DuplicateGroup, ...], skipped
+
+    # One signal per file would queue thousands of cross-thread events for a
+    # scan whose whole point is that it is long. The bar does not need every
+    # step -- it needs to move.
+    REPORT_EVERY = 25
+
+    def __init__(self, mode: str, home: str):
+        super().__init__()
+        self.mode = mode            # "files" | "images"
+        self.home = home
+        self._abort = False
+
+    @QtCore.Slot()
+    def run(self):
+        finder = (find_duplicate_images if self.mode == "images"
+                  else find_duplicate_files)
+        groups, skipped = finder(
+            duplicate_roots(self.home),
+            should_abort=lambda: self._abort,
+            on_progress=self._report,
+        )
+        self.finished.emit(groups, skipped)
+
+    def _report(self, done: int, total: int):
+        if done == total or done % self.REPORT_EVERY == 0:
+            self.progress.emit(done, total)
+
+    def abort(self):
+        self._abort = True
+
+
+class DuplicateGroupSection(QtWidgets.QWidget):
+    """One duplicate group: a summary row expanding to its individual files.
+
+    Deliberately *not* a `CategorySection`. That widget carries one checkbox
+    for a whole category and renders its detail as a read-only label, which is
+    exactly right for "delete this pile of cache" and exactly wrong here: a
+    duplicate group is a per-file decision, one file in it must never be
+    removable, and the copies need to arrive already checked. The two share
+    the collapsible-summary shape, not an implementation.
+
+    Selection is held in `_checked`, not in the checkbox widgets, because the
+    file rows are built lazily on first expand -- a group the user never opens
+    still has to know its copies are selected.
+    """
+    toggled = QtCore.Signal()
+
+    def __init__(self, group: DuplicateGroup, number: int, show_similarity: bool):
+        super().__init__()
+        self.setObjectName("CardBody")
+        self.group = group
+        self._detail_built = False
+        self._checked = {path: True for path, _ in group.duplicates}
+
+        home = str(Path.home())
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(0, 6, 0, 6)
+        v.setSpacing(4)
+
+        head = QtWidgets.QHBoxLayout()
+        head.setSpacing(12)
+
+        # The similarity badge lives inside the Group cell, not as a column of
+        # its own: an extra header-level widget in Images mode and not in
+        # Files mode would put the size out of line with its own column
+        # header, which is the exact complaint DESIGN.md v4 rule 3 records.
+        copies = len(group.duplicates)
+        group_cell = QtWidgets.QWidget()
+        group_cell.setObjectName("CardBody")
+        gh = QtWidgets.QHBoxLayout(group_cell)
+        gh.setContentsMargins(0, 0, 0, 0)
+        gh.setSpacing(8)
+        title = QtWidgets.QLabel(f"Group {number} - {copies + 1} matching file(s)")
+        gh.addWidget(title)
+        if show_similarity:
+            badge = QtWidgets.QLabel(f"{group.similarity}% match")
+            badge.setObjectName("Tag")
+            badge.setToolTip(
+                "How closely the least similar copy matches the file being "
+                "kept, from a perceptual hash -- these files are visually "
+                "alike, not byte-identical.")
+            gh.addWidget(badge)
+        gh.addStretch(1)
+        head.addWidget(group_cell, 3)
+
+        keeping = QtWidgets.QLabel(os.path.basename(group.keep[0]))
+        keeping.setObjectName("Hint")
+        keeping.setToolTip(_shorten(group.keep[0], home))
+        head.addWidget(keeping, 3)
+
+        size_label = QtWidgets.QLabel(human_size(group.size))
+        size_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        size_label.setMinimumWidth(90)
+        head.addWidget(size_label, 1)
+
+        self.expand_btn = QtWidgets.QPushButton("Show files")
+        self.expand_btn.setObjectName("Secondary")
+        self.expand_btn.clicked.connect(self.toggle_detail)
+        head.addWidget(self.expand_btn)
+
+        v.addLayout(head)
+
+        self.detail = QtWidgets.QWidget()
+        self.detail.setObjectName("CardBody")
+        self.detail_layout = QtWidgets.QVBoxLayout(self.detail)
+        self.detail_layout.setContentsMargins(24, 4, 0, 4)
+        self.detail_layout.setSpacing(2)
+        self.detail.setVisible(False)
+        v.addWidget(self.detail)
+
+    def toggle_detail(self):
+        """Show or hide the group's files, building the rows the first time."""
+        if not self._detail_built:
+            home = str(Path.home())
+            self.detail_layout.addWidget(self._keep_row(home))
+            for path, size in self.group.duplicates:
+                self.detail_layout.addWidget(self._copy_row(path, size, home))
+            self._detail_built = True
+        visible = not self.detail.isVisible()
+        self.detail.setVisible(visible)
+        self.expand_btn.setText("Hide files" if visible else "Show files")
+
+    def _row(self, lead: QtWidgets.QWidget, path: str, size: int, home: str):
+        row = QtWidgets.QWidget()
+        row.setObjectName("CardBody")
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        h.addWidget(lead)
+        label = QtWidgets.QLabel(_shorten(path, home))
+        label.setObjectName("Hint")
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # One deep path would otherwise set the width of the whole Cleanup
+        # page; the card denies a horizontal scrollbar, so it has to wrap.
+        label.setWordWrap(True)
+        h.addWidget(label, 1)
+        size_label = QtWidgets.QLabel(human_size(size))
+        size_label.setObjectName("Hint")
+        size_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        size_label.setMinimumWidth(80)
+        h.addWidget(size_label)
+        return row
+
+    def _keep_row(self, home: str) -> QtWidgets.QWidget:
+        """The kept file: a KEEP tag where the other rows have a checkbox.
+
+        No disabled checkbox, on purpose -- a checkbox says "you may change
+        this", and this one is not yet changeable (choosing the keeper is a
+        tracked follow-up). A tag says what is true instead of offering a
+        control that does nothing.
+        """
+        tag = QtWidgets.QLabel("KEEP")
+        tag.setObjectName("Tag")
+        tag.setToolTip(
+            "Kept automatically: the oldest copy in Files mode, the highest "
+            "resolution one in Images mode. Choosing it yourself is not "
+            "supported yet.")
+        return self._row(tag, self.group.keep[0], self.group.keep[1], home)
+
+    def _copy_row(self, path: str, size: int, home: str) -> QtWidgets.QWidget:
+        check = QtWidgets.QCheckBox()
+        check.setChecked(self._checked[path])
+        check.toggled.connect(lambda on, p=path: self._set_checked(p, on))
+        return self._row(check, path, size, home)
+
+    def _set_checked(self, path: str, on: bool):
+        self._checked[path] = on
+        self.toggled.emit()
+
+    def selected_items(self) -> List[Tuple[str, int]]:
+        """The (path, size) copies this group contributes to Remove Selected."""
+        return [(path, size) for path, size in self.group.duplicates
+                if self._checked.get(path)]
+
+
 class BreakdownRow(QtWidgets.QWidget):
     """One folder in the Overview breakdown: name, proportional bar, size.
 
@@ -284,9 +472,14 @@ class DiskTab(QtWidgets.QWidget):
 
     Overview and Cleanup have real content. Backup is a separate card; its
     sub-tab carries an EmptyState rather than a half-built screen. Duplicates
-    is a further section inside Cleanup (DESIGN.md v4), not a fourth sub-tab,
-    and is not built yet.
+    is a further section inside Cleanup (DESIGN.md v4), not a fourth sub-tab.
     """
+
+    # A messy Documents folder can produce hundreds of duplicate groups, and
+    # each one is several widgets. Render the biggest wins and say how many
+    # were held back -- laying out a thousand rows to show a 3 KB group at
+    # the bottom is how this screen would come to feel broken.
+    MAX_DUPLICATE_GROUPS = 200
 
     def __init__(self):
         super().__init__()
@@ -301,6 +494,15 @@ class DiskTab(QtWidgets.QWidget):
         self.clean_worker: Optional[CleanWorker] = None
         self.sections: List[CategorySection] = []
         self._cleanup_scanned = False
+
+        self.dup_thread: Optional[QtCore.QThread] = None
+        self.dup_worker: Optional[DuplicateScanWorker] = None
+        self.dup_clean_thread: Optional[QtCore.QThread] = None
+        self.dup_clean_worker: Optional[CleanWorker] = None
+        self.dup_sections: List[DuplicateGroupSection] = []
+        # Carries a removal outcome across the rescan that follows it, so the
+        # rescan's own result line does not erase what just happened.
+        self._dup_notice = ""
 
         v = QtWidgets.QVBoxLayout(self)
         # Margins leave room for the card drop shadows to render un-clipped
@@ -534,6 +736,7 @@ class DiskTab(QtWidgets.QWidget):
         cv.addWidget(self.sections_host)
 
         bv.addWidget(card)
+        bv.addWidget(self._build_duplicates())
         bv.addStretch(1)
 
         scroll = QtWidgets.QScrollArea()
@@ -575,6 +778,334 @@ class DiskTab(QtWidgets.QWidget):
 
         outer.addWidget(footer)
         return page
+
+    # ------------------------------
+    # Duplicates (a section inside Cleanup, not a fourth sub-tab)
+    # ------------------------------
+    def _build_duplicates(self) -> QtWidgets.QWidget:
+        """The Duplicates card, below Quick scan on the Cleanup screen.
+
+        Its own footer sits inside the card rather than in the screen's fixed
+        footer: the two scans are separate decisions over separate files, and
+        one "Clean Selected" button that mixed browser cache with the user's
+        photographs would be a bad thing to click by accident.
+        """
+        card = QtWidgets.QFrame()
+        card.setObjectName("Card")
+        cv = QtWidgets.QVBoxLayout(card)
+        cv.setSpacing(8)
+
+        head = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Duplicates")
+        title.setObjectName("H2")
+        head.addWidget(title)
+        head.addStretch(1)
+
+        mode_label = QtWidgets.QLabel("Mode")
+        mode_label.setObjectName("FormLabel")
+        head.addWidget(mode_label)
+        # A QComboBox, matching File Manager's operation picker -- the app
+        # already has one mode-picker idiom and does not need a second.
+        self.dup_mode = QtWidgets.QComboBox()
+        self.dup_mode.addItems(["Files (exact match)", "Images (visual match)"])
+        self.dup_mode.currentIndexChanged.connect(self.on_dup_mode_changed)
+        head.addWidget(self.dup_mode)
+
+        self.dup_scan_btn = QtWidgets.QPushButton("Scan")
+        self.dup_scan_btn.setObjectName("Secondary")
+        self.dup_scan_btn.clicked.connect(self.start_duplicate_scan)
+        head.addWidget(self.dup_scan_btn)
+        cv.addLayout(head)
+
+        self.dup_hint = QtWidgets.QLabel()
+        self.dup_hint.setObjectName("Hint")
+        self.dup_hint.setWordWrap(True)
+        cv.addWidget(self.dup_hint)
+
+        self.dup_scan_box = QtWidgets.QWidget()
+        self.dup_scan_box.setObjectName("CardBody")
+        sv = QtWidgets.QVBoxLayout(self.dup_scan_box)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(6)
+        self.dup_bar = QtWidgets.QProgressBar()
+        self.dup_bar.setRange(0, 0)  # indeterminate until the walk finishes
+        self.dup_bar.setTextVisible(False)
+        sv.addWidget(self.dup_bar)
+        self.dup_status = QtWidgets.QLabel("Scanning...")
+        self.dup_status.setObjectName("Hint")
+        sv.addWidget(self.dup_status)
+        self.dup_scan_box.setVisible(False)
+        cv.addWidget(self.dup_scan_box)
+
+        # A header row over the group table, same rule as Quick scan's.
+        header = QtWidgets.QWidget()
+        header.setObjectName("CardBody")
+        hh = QtWidgets.QHBoxLayout(header)
+        hh.setContentsMargins(0, 0, 0, 0)
+        hh.setSpacing(12)
+        for text, stretch, align in (
+            ("Group", 3, Qt.AlignLeft | Qt.AlignVCenter),
+            ("Keeping", 3, Qt.AlignLeft | Qt.AlignVCenter),
+            ("Reclaimable", 1, Qt.AlignRight | Qt.AlignVCenter),
+        ):
+            label = QtWidgets.QLabel(text)
+            label.setObjectName("FormLabel")
+            label.setAlignment(align)
+            hh.addWidget(label, stretch)
+        spacer = QtWidgets.QLabel("")
+        spacer.setMinimumWidth(96)
+        hh.addWidget(spacer)
+        self.dup_header = header
+        self.dup_header.setVisible(False)
+        cv.addWidget(header)
+
+        self.dup_host = QtWidgets.QWidget()
+        self.dup_host.setObjectName("CardBody")
+        self.dup_layout = QtWidgets.QVBoxLayout(self.dup_host)
+        self.dup_layout.setContentsMargins(0, 0, 0, 0)
+        self.dup_layout.setSpacing(2)
+        cv.addWidget(self.dup_host)
+
+        self.dup_empty = EmptyState(
+            title="No duplicate scan yet",
+            hint="Duplicate detection reads every candidate file, so it runs "
+                 "only when you ask for it. Press Scan.",
+        )
+        cv.addWidget(self.dup_empty)
+
+        footer = QtWidgets.QHBoxLayout()
+        self.dup_selection_label = QtWidgets.QLabel("Nothing selected")
+        footer.addWidget(self.dup_selection_label)
+        footer.addStretch(1)
+        self.dup_remove_btn = QtWidgets.QPushButton("Remove Selected")
+        self.dup_remove_btn.setObjectName("Danger")
+        self.dup_remove_btn.setEnabled(False)
+        self.dup_remove_btn.clicked.connect(self.remove_duplicates)
+        footer.addWidget(self.dup_remove_btn)
+        cv.addLayout(footer)
+
+        self.dup_clean_bar = QtWidgets.QProgressBar()
+        self.dup_clean_bar.setVisible(False)
+        cv.addWidget(self.dup_clean_bar)
+
+        self.dup_result = QtWidgets.QLabel()
+        self.dup_result.setObjectName("Hint")
+        self.dup_result.setWordWrap(True)
+        self.dup_result.setVisible(False)
+        cv.addWidget(self.dup_result)
+
+        self._update_dup_hint()
+        return card
+
+    def dup_mode_key(self) -> str:
+        return "images" if self.dup_mode.currentIndex() == 1 else "files"
+
+    def _update_dup_hint(self):
+        if self.dup_mode_key() == "images":
+            self.dup_hint.setText(
+                "Pictures that look alike -- the same photo resaved, resized "
+                "or recompressed -- matched by a perceptual hash, not by "
+                "their bytes. The highest-resolution copy is kept, and each "
+                "group shows how closely the rest match it. Checked copies "
+                "are moved to the Recycle Bin after you confirm.")
+        else:
+            self.dup_hint.setText(
+                "Files with byte-identical contents in Downloads, Documents "
+                "and Desktop, matched by a SHA-256 of every candidate. The "
+                "oldest copy is kept. Checked copies are moved to the "
+                "Recycle Bin after you confirm.")
+
+    def on_dup_mode_changed(self):
+        """Switching mode invalidates the results, so clear rather than mix.
+
+        No automatic rescan: the two scans read different files and both are
+        expensive, so changing the picker must not silently start minutes of
+        work the user did not ask for.
+        """
+        self._update_dup_hint()
+        if self.dup_thread is not None or self.dup_clean_thread is not None:
+            return
+        self._clear_dup_sections()
+        self.dup_header.setVisible(False)
+        self.dup_result.setVisible(False)
+        self.dup_empty.setVisible(True)
+        self.update_dup_selection()
+
+    def start_duplicate_scan(self):
+        if self.dup_thread is not None or self.dup_clean_thread is not None:
+            return
+        self._clear_dup_sections()
+        self.dup_header.setVisible(False)
+        self.dup_empty.setVisible(False)
+        self.dup_result.setVisible(False)
+        self.dup_bar.setRange(0, 0)
+        self.dup_status.setText("Looking for candidates...")
+        self.dup_scan_box.setVisible(True)
+        self.dup_scan_btn.setEnabled(False)
+        self.dup_mode.setEnabled(False)
+        self.dup_remove_btn.setEnabled(False)
+        self.dup_selection_label.setText("Nothing selected")
+
+        self.dup_thread = QtCore.QThread(self)
+        self.dup_worker = DuplicateScanWorker(self.dup_mode_key(), self.home)
+        self.dup_worker.moveToThread(self.dup_thread)
+        self.dup_worker.progress.connect(self.on_dup_progress)
+        self.dup_worker.finished.connect(self.on_dup_finished)
+        self.dup_thread.started.connect(self.dup_worker.run)
+        self.dup_thread.start()
+
+    def on_dup_progress(self, done: int, total: int):
+        # The total is only known once the walk is done, so the bar starts
+        # indeterminate and becomes a real count here.
+        self.dup_bar.setRange(0, total)
+        self.dup_bar.setValue(done)
+        word = "image" if self.dup_mode_key() == "images" else "file"
+        self.dup_status.setText(f"Fingerprinting {done} of {total} {word}(s)...")
+
+    def on_dup_finished(self, groups: List[DuplicateGroup], skipped: int):
+        self.dup_scan_box.setVisible(False)
+        self.dup_scan_btn.setEnabled(True)
+        self.dup_mode.setEnabled(True)
+        if self.dup_thread:
+            self.dup_thread.quit()
+            self.dup_thread.wait()
+            self.dup_thread = None
+            self.dup_worker = None
+        self._render_dup_sections(groups, skipped)
+
+    def _clear_dup_sections(self):
+        self.dup_sections = []
+        while self.dup_layout.count():
+            item = self.dup_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    def _render_dup_sections(self, groups: List[DuplicateGroup], skipped: int):
+        self._clear_dup_sections()
+        notice, self._dup_notice = self._dup_notice, ""
+        if not groups:
+            self.dup_empty.setVisible(True)
+            self.dup_result.setText(
+                (notice + " " if notice else "")
+                + "No duplicates found in Downloads, Documents and Desktop."
+                + (f" {skipped} file(s) could not be read." if skipped else ""))
+            self.dup_result.setVisible(True)
+            self.update_dup_selection()
+            return
+
+        self.dup_empty.setVisible(False)
+        self.dup_header.setVisible(True)
+        show_similarity = self.dup_mode_key() == "images"
+        shown = groups[:self.MAX_DUPLICATE_GROUPS]
+        for number, group in enumerate(shown, 1):
+            section = DuplicateGroupSection(group, number, show_similarity)
+            section.toggled.connect(self.update_dup_selection)
+            self.dup_sections.append(section)
+            self.dup_layout.addWidget(section)
+
+        notes = [notice] if notice else []
+        if len(groups) > len(shown):
+            notes.append(
+                f"Showing the {len(shown)} largest of {len(groups)} groups; "
+                "clean these up and scan again for the rest")
+        if skipped:
+            notes.append(f"{skipped} file(s) could not be read and were skipped")
+        if notes:
+            self.dup_result.setText(
+                ". ".join(note.rstrip(".") for note in notes) + ".")
+            self.dup_result.setVisible(True)
+        self.update_dup_selection()
+
+    def selected_duplicates(self) -> List[Tuple[str, int]]:
+        """Every checked copy across the rendered groups, de-duplicated.
+
+        A path cannot legitimately appear in two groups, but the same guard
+        the Cleanup footer uses costs nothing and keeps a double delete --
+        which fails on the second attempt -- structurally impossible.
+        """
+        seen = {}
+        for section in self.dup_sections:
+            for path, size in section.selected_items():
+                seen.setdefault(os.path.normcase(path), (path, size))
+        return list(seen.values())
+
+    def update_dup_selection(self):
+        items = self.selected_duplicates()
+        total = sum(size for _, size in items)
+        if items:
+            self.dup_selection_label.setText(
+                f"{len(items)} copy(ies) selected - {human_size(total)}")
+        else:
+            self.dup_selection_label.setText("Nothing selected")
+        self.dup_remove_btn.setEnabled(
+            bool(items) and self.dup_clean_thread is None)
+
+    def remove_duplicates(self):
+        """Confirm, then move every checked copy to the Recycle Bin.
+
+        Reuses CleanWorker and ConfirmDialog rather than a second deletion
+        path -- the kept file is simply never in `items`, so it cannot be
+        touched by this.
+        """
+        items = self.selected_duplicates()
+        if not items or self.dup_clean_thread is not None:
+            return
+        total = sum(size for _, size in items)
+        kept = len(self.dup_sections)
+        if not ConfirmDialog.ask(
+            self,
+            "Move duplicate copies to Recycle Bin?",
+            f"{len(items)} copy(ies) totalling {human_size(total)} will be "
+            f"moved to the Recycle Bin. The {kept} file(s) marked KEEP are "
+            "left exactly where they are. You can restore anything from the "
+            "Recycle Bin if you change your mind.",
+            confirm_text="Move to Recycle Bin",
+        ):
+            return
+
+        self.dup_remove_btn.setEnabled(False)
+        self.dup_scan_btn.setEnabled(False)
+        self.dup_mode.setEnabled(False)
+        self.dup_result.setVisible(False)
+        self.dup_clean_bar.setRange(0, len(items))
+        self.dup_clean_bar.setValue(0)
+        self.dup_clean_bar.setVisible(True)
+
+        self.dup_clean_thread = QtCore.QThread(self)
+        self.dup_clean_worker = CleanWorker(items)
+        self.dup_clean_worker.moveToThread(self.dup_clean_thread)
+        self.dup_clean_worker.progress.connect(self.on_dup_clean_progress)
+        self.dup_clean_worker.finished.connect(self.on_dup_clean_finished)
+        self.dup_clean_thread.started.connect(self.dup_clean_worker.run)
+        self.dup_clean_thread.start()
+
+    def on_dup_clean_progress(self, done: int, total: int):
+        self.dup_clean_bar.setValue(done)
+
+    def on_dup_clean_finished(self, removed: int, freed: int, errors: List[str]):
+        self.dup_clean_bar.setVisible(False)
+        message = (f"Moved {removed} duplicate copy(ies) to the Recycle Bin, "
+                   f"reclaiming {human_size(freed)}.")
+        if errors:
+            message += (f" {len(errors)} could not be moved: "
+                        + "; ".join(errors[:3]))
+            if len(errors) > 3:
+                message += f"; and {len(errors) - 3} more"
+
+        if self.dup_clean_thread:
+            self.dup_clean_thread.quit()
+            self.dup_clean_thread.wait()
+            self.dup_clean_thread = None
+            self.dup_clean_worker = None
+        self.dup_scan_btn.setEnabled(True)
+        self.dup_mode.setEnabled(True)
+        # Rescan so the groups reflect what is actually left on disk. The
+        # outcome rides along in `_dup_notice` rather than being written here:
+        # the rescan finishes later and would otherwise overwrite it with its
+        # own result line.
+        self._dup_notice = message
+        self.start_duplicate_scan()
 
     def on_sub_changed(self, index: int):
         """Scan for junk the first time Cleanup is actually opened.
@@ -792,14 +1323,16 @@ class DiskTab(QtWidgets.QWidget):
         """Stop every in-flight worker so quitting mid-scan doesn't destroy a
         running QThread. Wired to QApplication.aboutToQuit.
 
-        All three workers are stopped, not just Overview's: the Cleanup scan
-        and the Recycle Bin move each own a QThread of their own, and either
-        one left running at quit is the same crash.
+        Every worker is stopped, not just Overview's: the Cleanup scan, the
+        Duplicates scan and the two Recycle Bin moves each own a QThread of
+        their own, and any one left running at quit is the same crash.
         """
         for worker, thread in (
             (self.worker, self.thread),
             (self.cleanup_worker, self.cleanup_thread),
             (self.clean_worker, self.clean_thread),
+            (self.dup_worker, self.dup_thread),
+            (self.dup_clean_worker, self.dup_clean_thread),
         ):
             if worker:
                 worker.abort()
@@ -809,6 +1342,8 @@ class DiskTab(QtWidgets.QWidget):
         self.thread = self.worker = None
         self.cleanup_thread = self.cleanup_worker = None
         self.clean_thread = self.clean_worker = None
+        self.dup_thread = self.dup_worker = None
+        self.dup_clean_thread = self.dup_clean_worker = None
 
     # ------------------------------
     # Rendering

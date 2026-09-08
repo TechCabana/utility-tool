@@ -3,6 +3,12 @@ from PIL import Image, ImageOps
 import io, os
 from typing import Tuple, Optional
 
+# The file extensions this app treats as images, lower-case and dot-prefixed.
+# One definition, because two screens filter on it: Image Tools' drag-drop
+# accepts these, and the Disk tab's Duplicates image scan only fingerprints
+# these. A second hand-written tuple in either place would drift.
+SUPPORTED_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")
+
 # Standard sizes: mm (or px:widthxheight)
 STANDARD_SIZES_MM = {
     "Original": None,

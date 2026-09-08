@@ -3,7 +3,9 @@ import os, time
 from typing import List, Optional
 from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
-from utils.image_utils import spec_to_pixels, estimate_compressed_size, convert_and_save
+from utils.image_utils import (
+    SUPPORTED_SUFFIXES, spec_to_pixels, estimate_compressed_size, convert_and_save,
+)
 from utils.file_utils import build_new_name
 from utils.presets import add_image_preset, get_image_presets, load_all
 from widgets.common import ConfirmDialog, EmptyState
@@ -217,7 +219,7 @@ class ImageTab(QtWidgets.QWidget):
     def _drop(self, ev):
         for url in ev.mimeData().urls():
             p = url.toLocalFile()
-            if os.path.isfile(p) and p.lower().split(".")[-1] in ("jpg","jpeg","png","webp","tif","tiff"):
+            if os.path.isfile(p) and p.lower().endswith(SUPPORTED_SUFFIXES):
                 self._add_file(p)
 
     def _add_file(self, path: str):

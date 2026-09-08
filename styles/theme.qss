@@ -134,6 +134,21 @@ QLabel#Hint {
     color: #71717a;
 }
 
+/* Small bordered status tag -- Duplicates' KEEP marker and its similarity
+   badge. Neutral on purpose: the accent is reserved for focus/hover/selection
+   (DESIGN.md), and the status colours mean success/error/warning, which a
+   "this is the copy being kept" marker is none of. Same bordered-tag register
+   as the comp's NOT YET BUILT tag. */
+QLabel#Tag {
+    color: #52525b;
+    border: 1px solid rgba(24, 24, 27, 0.16);
+    border-radius: 6px;
+    padding: 1px 6px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+}
+
 QLabel:disabled {
     color: #71717a;
 }
