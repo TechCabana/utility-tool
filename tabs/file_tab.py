@@ -4,7 +4,7 @@ from typing import List
 from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
 from utils.file_utils import build_new_name, apply_renames
-from utils.presets import add_file_preset, load_all
+from utils.presets import add_file_preset, get_file_presets, load_all
 
 
 class FileWorker(QtCore.QObject):
@@ -122,6 +122,12 @@ class FileTab(QtWidgets.QWidget):
 
         # Form
         form = QtWidgets.QFormLayout()
+
+        # Preset: applies pattern/prefix/suffix/number/regex/case/date fields
+        # in one shot.
+        self.preset_combo = QtWidgets.QComboBox()
+        form.addRow("Preset:", self.preset_combo)
+
         self.prefix = QtWidgets.QLineEdit()
         self.suffix = QtWidgets.QLineEdit()
         self.pattern = QtWidgets.QLineEdit("{name}")
@@ -170,6 +176,9 @@ class FileTab(QtWidgets.QWidget):
         self.pad.valueChanged.connect(self.update_preview)
         self.case.currentIndexChanged.connect(self.update_preview)
         self.date_source.currentIndexChanged.connect(self.update_preview)
+
+        self._reload_presets()
+        self.preset_combo.currentIndexChanged.connect(self._apply_selected_preset)
 
         # Threading
         self.thread = None
@@ -302,4 +311,32 @@ class FileTab(QtWidgets.QWidget):
             "date_source": self.date_source.currentText()
         }
         add_file_preset(preset)
+        self._reload_presets()
         QtWidgets.QMessageBox.information(self, "Saved", f"File preset '{name}' saved.")
+
+    def _reload_presets(self):
+        """Repopulate the preset dropdown from disk (initial load, and after
+        Save Preset adds a new one)."""
+        self._file_presets = get_file_presets()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("— Select preset —")
+        for p in self._file_presets:
+            self.preset_combo.addItem(p.get("name", "(unnamed)"))
+        self.preset_combo.blockSignals(False)
+
+    def _apply_selected_preset(self, index: int):
+        """Apply a preset's pattern-naming fields to the form."""
+        if index <= 0 or index - 1 >= len(self._file_presets):
+            return
+        p = self._file_presets[index - 1]
+        self.pattern.setText(p.get("pattern", "{name}"))
+        self.prefix.setText(p.get("prefix", ""))
+        self.suffix.setText(p.get("suffix", ""))
+        self.start.setValue(int(p.get("start", 1)))
+        self.pad.setValue(int(p.get("pad", 3)))
+        self.regex_find.setText(p.get("regex_find", ""))
+        self.regex_replace.setText(p.get("regex_replace", ""))
+        self.case.setCurrentText(p.get("case", "none"))
+        self.date_source.setCurrentText(p.get("date_source", "now"))
+        self.update_preview()
