@@ -331,7 +331,7 @@ pytest tests/
 ```
 
 Covers the Qt-free `utils/` layer only (`image_utils.py`, `disk_utils.py`, `file_utils.py`,
-`presets.py`), using real `tmp_path` files, no mocking. 120 tests, all passing, including the
+`presets.py`), using real `tmp_path` files, no mocking. 122 tests, all passing, including the
 exact-hash and perceptual-dHash duplicate detection in `disk_utils.py`. The Qt-driven `tabs/`
 layer (including Disk's worker threads and UI) has no automated coverage and stays manually
 verified, per the [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps

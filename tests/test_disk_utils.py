@@ -614,6 +614,33 @@ def test_image_dhash_returns_none_for_a_non_image(tmp_path):
     assert image_dhash(path) is None
 
 
+def test_image_dhash_returns_none_for_a_perfectly_flat_image(tmp_path):
+    """A solid-colour image has no gradient for dHash to describe either --
+    it is treated as unfingerprintable, the same as an unreadable file,
+    rather than silently hashing to the same all-zero value every other
+    flat image gets."""
+    path = str(tmp_path / "solid.png")
+    Image.new("RGB", (240, 180), (128, 64, 200)).save(path)
+
+    assert image_dhash(path) is None
+
+
+def test_find_duplicate_images_does_not_group_two_different_flat_images(tmp_path):
+    """Regression: two unrelated solid-colour images (a white scan, a black
+    one) must never be proposed as a duplicate pair. Without the flat-image
+    guard in `image_dhash`, both hash to the same all-zero value and this
+    scan would report a false 100% match -- the exact aHash failure mode
+    dHash was chosen to avoid, which turns out to need an explicit guard
+    rather than being automatic."""
+    Image.new("RGB", (240, 180), (255, 255, 255)).save(tmp_path / "white.png")
+    Image.new("RGB", (240, 180), (0, 0, 0)).save(tmp_path / "black.png")
+
+    groups, skipped = find_duplicate_images([str(tmp_path)])
+
+    assert groups == []
+    assert skipped == 2  # both flat images counted as unfingerprintable
+
+
 def test_image_dhash_survives_a_resave_and_a_resize(tmp_path):
     original = _photo(str(tmp_path / "original.png"), size=(240, 180))
     with Image.open(original) as im:

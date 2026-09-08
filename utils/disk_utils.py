@@ -746,7 +746,8 @@ def find_duplicate_files(roots: Sequence[str],
 
 def image_dhash(path: str, side: int = IMAGE_HASH_SIDE
                 ) -> Optional[Tuple[int, int, int]]:
-    """`(hash_bits, width, height)` for an image, or None if it is unreadable.
+    """`(hash_bits, width, height)` for an image, or None if it can't be
+    fingerprinted (unreadable, or genuinely flat -- see below).
 
     Difference hash: reduce to `(side + 1) x side` greyscale pixels and set one
     bit per pixel for "brighter than the pixel to its right". The result
@@ -755,10 +756,18 @@ def image_dhash(path: str, side: int = IMAGE_HASH_SIDE
     its actual bytes are completely different.
 
     dHash rather than the average hash (aHash) the brief also allowed, at the
-    same code size: aHash compares each pixel to the frame's mean, so a flat
-    or near-flat image hashes to all zeros and every flat image then "matches"
-    every other one -- a plain white scan and a plain black one included.
-    dHash has no such degenerate case.
+    same code size: aHash compares each pixel to the frame's mean, so a
+    near-flat image (a photo of an overcast sky, a mostly-white document scan)
+    hashes to all, or nearly all, zeros regardless of its actual content --
+    dHash's neighbour comparison is far less prone to that. It is not immune
+    to it, though: a *perfectly* flat image (every pixel the same value, no
+    gradient at all -- solid-colour icon art, a blank scan, a corrupt export)
+    has no "brighter than" edges either way, so it still hashes to all zeros
+    under dHash too. Verified directly: a solid white PNG and a solid black
+    PNG produce the identical zero hash here, exactly the collision aHash was
+    rejected for. That case is guarded below rather than left to the grouping
+    step, since a false "100% match" between two unrelated flat images is
+    exactly the kind of thing this scan must not propose for deletion.
 
     Pillow only, deliberately: no `imagehash`, no numpy, no OpenCV. The whole
     technique is the twelve lines below.
@@ -770,8 +779,17 @@ def image_dhash(path: str, side: int = IMAGE_HASH_SIDE
                 (side + 1, side), Image.Resampling.LANCZOS)
     except (OSError, ValueError):
         return None  # not an image, truncated, or an unsupported variant
-    pixels = list(small.getdata())
 
+    low, high = small.getextrema()
+    if low == high:
+        # Perfectly flat: no gradient for dHash to describe, so any hash it
+        # produced would collide with every other flat image regardless of
+        # colour. Treated the same as an unreadable image -- the caller
+        # counts it as skipped rather than folding it into a group it cannot
+        # meaningfully belong to.
+        return None
+
+    pixels = list(small.getdata())
     bits = 0
     index = 0
     for row in range(side):
