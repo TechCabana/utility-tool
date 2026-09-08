@@ -2,3 +2,7 @@
 PySide6==6.7.2
 Pillow==10.2.0
 send2trash==2.1.0
+
+# test-only, but no dev/prod split convention exists in this repo yet -- flat
+# file, per CLAUDE.md card wS7hWaWW's decision (build the pytest suite)
+pytest==9.1.1
