@@ -9,6 +9,13 @@ __pycache__/
 # Build artifacts
 *.egg-info/
 .eggs/
+dist/
+dist_*/
+build_*/
+
+# Assistant design-tracking files - not needed to run the app (W11)
+DESIGN.md
+PRODUCT.md
 
 # VS Code settings
 .vscode/
