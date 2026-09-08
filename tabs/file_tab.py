@@ -86,23 +86,14 @@ class FileTab(QtWidgets.QWidget):
         # File list (drop zone)
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.listw.setStyleSheet("""
-            QListWidget {
-                border: 2px dashed gray;
-                border-radius: 8px;
-                background: transparent;
-                color: white;
-            }
-            QListWidget::item {
-                padding: 4px;
-            }
-        """)
+        # Drop-zone styling comes from the QSS QListWidget rules, same as the
+        # Image Tools list - no inline sheet, which would outrank the theme.
         v.addWidget(self.listw, 1)
 
         # Overlay placeholder
         self.placeholder = QtWidgets.QLabel("Drag and drop your files to begin", self.listw)
         self.placeholder.setAlignment(Qt.AlignCenter)
-        self.placeholder.setStyleSheet("color: gray; font-size: 14px;")
+        self.placeholder.setStyleSheet("color: #71717a; font-size: 14px; background: transparent;")
         self.placeholder.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.placeholder.resize(self.listw.size())
         self.listw.resizeEvent = lambda e: (

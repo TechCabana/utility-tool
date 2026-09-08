@@ -6,7 +6,8 @@ class SettingsTab(QtWidgets.QWidget):
         super().__init__()
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        # Margins leave room for the card drop shadow to render un-clipped
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(12)
 
         header = QtWidgets.QLabel("Settings")

@@ -80,7 +80,7 @@ class ImageTab(QtWidgets.QWidget):
         # Instruction label (centered in the available space)
         self.drop_label = QtWidgets.QLabel("Drag and drop your files to begin")
         self.drop_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.drop_label.setStyleSheet("color: gray; font-size: 14px; padding: 40px;")
+        self.drop_label.setStyleSheet("color: #71717a; font-size: 14px; padding: 40px;")
         v.addWidget(self.drop_label)
     
         # file list
@@ -249,7 +249,7 @@ class ImageTab(QtWidgets.QWidget):
     def on_error(self, idx: int, msg: str):
         if 0 <= idx < len(self.rows):
             self.rows[idx].label.setText(self.rows[idx].label.text() + f" — ERROR: {msg}")
-            self.rows[idx].bar.setStyleSheet("QProgressBar::chunk { background:#d9534f; }")
+            self.rows[idx].bar.setStyleSheet("QProgressBar::chunk { background: #c23b32; }")
 
     def on_finished(self, seconds: float):
         self.status.setText(f"Completed in {seconds:.1f}s")

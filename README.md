@@ -92,7 +92,7 @@ Installs `PySide6==6.7.2` and `Pillow==10.2.0`.
 python main.py
 ```
 
-A dark-themed window opens with a sidebar and four tabs: Home, Image Tools, File Tools,
+A light-themed window opens with a sidebar and four tabs: Home, Image Tools, File Tools,
 Settings.
 
 ### 4. Verify
@@ -128,7 +128,7 @@ The build step writes `dist/UtilityTool.app` on macOS or `dist/UtilityTool.exe` 
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Window opens with no dark styling | `styles/dark.qss` failed to load | Run from the repo root; the path in `main.py` is relative. Check the console for a `[WARN] Could not load stylesheet` line |
+| Window opens with no theme styling | `styles/theme.qss` failed to load | Run from the repo root; the path in `main.py` is relative. Check the console for a `[WARN] Could not load stylesheet` line |
 | No app icon in the title bar | `main.py` points at `assets/icon.png`, which is not committed to the repo | Harmless: Qt silently skips a missing icon path |
 | Rename or convert stops partway through a batch | A destination folder is missing or not writable | Point the destination picker at a folder you have write access to |
 
@@ -174,7 +174,7 @@ flowchart LR
 
 ### End to end walk-through
 
-1. `main.py` builds `MainWindow`, loads `styles/dark.qss`, and mounts four tabs (Home,
+1. `main.py` builds `MainWindow`, loads `styles/theme.qss`, and mounts four tabs (Home,
    Image Tools, File Tools, Settings) into a `QStackedWidget` switched by the sidebar
    buttons.
 2. In `tabs/image_tab.py` or `tabs/file_tab.py`, the user picks files and sets options: an
@@ -253,7 +253,7 @@ utility-tool/
 ├── requirements.txt      pinned runtime dependencies (PySide6, Pillow)
 ├── LICENSE                MIT
 ├── styles/
-│   └── dark.qss           Qt stylesheet for the dark theme
+│   └── theme.qss          Qt stylesheet for the Soft Rose light theme
 ├── tabs/                  one QWidget per sidebar page
 │   ├── home_tab.py         preset manager UI (save/apply/delete are placeholders)
 │   ├── image_tab.py        image compress/resize/convert UI + worker thread
@@ -270,7 +270,7 @@ utility-tool/
 | `main.py` | Composes the window, sidebar and tabs; loads the QSS theme |
 | `tabs/` | UI for each sidebar page, one file per tab |
 | `utils/` | Framework-free helpers the tabs call into; safe to unit test in isolation |
-| `styles/dark.qss` | The only styling; no per-widget inline styles beyond a few labels |
+| `styles/theme.qss` | The only styling, apart from card drop shadows (`apply_card_shadows` in `main.py`, since QSS has no `box-shadow`) and a few label-level inline styles |
 
 </details>
 

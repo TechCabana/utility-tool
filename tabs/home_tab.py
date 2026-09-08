@@ -6,10 +6,11 @@ class HomeTab(QtWidgets.QWidget):
         super().__init__()
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        # Margins leave room for the card drop shadows to render un-clipped
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(12)
         welcome = QtWidgets.QLabel("Welcome to the Utility Tool - Your Swiss Army Knife for Files & Images")
-        welcome.setStyleSheet("font-size: 20px; font-weight: bold; color: #64dd17;")
+        welcome.setStyleSheet("font-size: 20px; font-weight: 600; color: #18181b;")
         welcome.setAlignment(QtCore.Qt.AlignCenter)
 
         description = QtWidgets.QLabel(
