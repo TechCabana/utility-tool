@@ -5,6 +5,7 @@ from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
 from utils.image_utils import spec_to_pixels, estimate_compressed_size, convert_and_save
 from utils.presets import add_image_preset, load_all
+from widgets.common import ConfirmDialog, EmptyState
 
 class ImageRow(QtWidgets.QWidget):
     def __init__(self, path: str):
@@ -77,19 +78,28 @@ class ImageTab(QtWidgets.QWidget):
         header.setObjectName("H1")
         v.addWidget(header)
 
-        # Instruction label (centered in the available space)
-        self.drop_label = QtWidgets.QLabel("Drag and drop your files to begin")
-        self.drop_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.drop_label.setStyleSheet("color: #71717a; font-size: 14px; padding: 40px;")
-        v.addWidget(self.drop_label)
-    
-        # file list
+        # file list (also the drop target)
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.listw.setAcceptDrops(True)
         self.listw.dragEnterEvent = self._drag_enter
         self.listw.dropEvent = self._drop
         v.addWidget(self.listw, 1)
+
+        # Empty-state overlay: shown only while no files are added, hidden
+        # once files land via drag/drop. Transparent to mouse events so
+        # drag/drop still reaches the list widget underneath it.
+        self.empty_state = EmptyState(
+            title="No images added yet",
+            hint="Drag and drop image files here to begin",
+            parent=self.listw,
+        )
+        self.empty_state.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.listw.resizeEvent = lambda e: (
+            self.empty_state.resize(self.listw.size()),
+            QtWidgets.QListWidget.resizeEvent(self.listw, e),
+        )
+        self._update_empty_state()
 
         # controls
         form = QtWidgets.QFormLayout()
@@ -143,7 +153,7 @@ class ImageTab(QtWidgets.QWidget):
 
         self.start_btn.clicked.connect(self.start)
         self.stop_btn.clicked.connect(self.stop)
-        self.clear_btn.clicked.connect(self.listw.clear)
+        self.clear_btn.clicked.connect(self.clear_files)
         self.save_preset_btn.clicked.connect(self.save_current_preset)
 
         self.thread = None
@@ -165,6 +175,34 @@ class ImageTab(QtWidgets.QWidget):
         it = QtWidgets.QListWidgetItem(os.path.basename(path))
         it.setData(QtCore.Qt.UserRole, path)
         self.listw.addItem(it)
+        self._update_empty_state()
+
+    def _update_empty_state(self):
+        self.empty_state.setVisible(self.listw.count() == 0)
+
+    def clear_files(self):
+        """Clear button: discards the current file selection.
+
+        Nothing gets deleted from disk, but this does throw away the
+        user's batch setup (added files, per-file rows) with no way to
+        undo it, so it goes through the shared confirm dialog -- Move/
+        Copy/Delete in File Manager aren't built yet, so this is the
+        first genuinely destructive-from-the-user's-POV action in the app.
+        """
+        count = self.listw.count()
+        if not count:
+            return
+        if not ConfirmDialog.ask(
+            self,
+            "Clear file list?",
+            f"This removes all {count} file(s) from the list. "
+            "Files on disk are not affected.",
+            confirm_text="Clear",
+        ):
+            return
+        self.listw.clear()
+        self.rows.clear()
+        self._update_empty_state()
 
     def _choose_out(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose output folder")
@@ -194,6 +232,7 @@ class ImageTab(QtWidgets.QWidget):
             item.setData(QtCore.Qt.UserRole, p)
             self.listw.addItem(item)
             self.listw.setItemWidget(item, row)
+        self._update_empty_state()
 
     def start(self):
         files = [self.listw.item(i).data(QtCore.Qt.UserRole) for i in range(self.listw.count())]

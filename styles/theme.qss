@@ -17,7 +17,9 @@
  *   accent-hover   #bd3c58            accent, lifted
  *   accent-press   #8e2c42            accent, depressed
  *   accent-text    #ffffff            on top of an accent-filled surface
- *   success        #1f8a5c   error #c23b32   warn #a66a0c   (status only)
+ *   success        #1f8a5c   error #c23b32   warn #a66a0c   (status only;
+ *                                     error is reused for the #Danger button
+ *                                     -- see ConfirmDialog in widgets/common.py)
  *   radius-s       6px                small controls
  *   radius-m       10px               panels, cards, drop zones
  *
@@ -395,6 +397,38 @@ QPushButton#Secondary:disabled {
     color: #71717a;
     border-color: rgba(24, 24, 27, 0.08);
     background-color: transparent;
+}
+
+/* Danger Button - the confirm action in ConfirmDialog (widgets/common.py)
+   and any other destructive confirmation. Uses --error, not the rose
+   interaction accent, so a destructive confirm reads distinctly from
+   ordinary primary actions. */
+QPushButton#Danger {
+    background-color: #c23b32;
+    color: #ffffff;
+    border: 1px solid #c23b32;
+    font-weight: 600;
+}
+
+QPushButton#Danger:hover {
+    background-color: #d14840;
+    border-color: #d14840;
+}
+
+QPushButton#Danger:pressed {
+    background-color: #a83229;
+    border-color: #a83229;
+}
+
+QPushButton#Danger:disabled {
+    background-color: #f0f0f1;
+    color: #71717a;
+    border-color: rgba(24, 24, 27, 0.08);
+}
+
+/* ===== Empty State (widgets/common.py) ===== */
+#EmptyState {
+    background: transparent;
 }
 
 /* ===== List Widgets (double as file drop zones) ===== */
