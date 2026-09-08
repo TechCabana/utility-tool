@@ -23,7 +23,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Utility Tool - Swiss Army Edition")
-        self.setWindowIcon(QtGui.QIcon("assets/icon.png"))
 
         # Adjustable window size
         self.resize(1100, 700)
