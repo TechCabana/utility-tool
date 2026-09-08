@@ -48,6 +48,7 @@ progress feedback for long batches.
 | Fixed passport/photo/print size presets (India and Netherlands passport, 4x6, A4, A5, Instagram) | Arbitrary custom paper sizes beyond the built-in list |
 | Batch file renaming by pattern, regex, case and date tokens | Renaming based on file content or metadata beyond modified time |
 | Batch move, copy and delete (File Manager), with a conflict policy and Recycle-Bin-only delete | Undo for a completed batch operation |
+| Disk usage overview (drive used/free, per-folder breakdown) and a Cleanup quick scan across 8 reclaimable-space categories, moving checked items to the Recycle Bin | Duplicate finding and backup (Disk's other sub-areas) -- not built yet |
 | Saving and loading presets for both tools (`utils/presets.py`) | Syncing presets across machines or accounts, no cloud storage |
 | Windows and macOS, run from source or packaged with PyInstaller | An installer/updater; PyInstaller output is a raw binary only |
 
@@ -81,9 +82,10 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Installs `PySide6==6.7.2`, `Pillow==10.2.0` and `send2trash==2.1.0` (File Manager Delete
-routes through this, so a batch delete always goes to the Recycle Bin, never a permanent
-delete).
+Installs `PySide6==6.7.2`, `Pillow==10.2.0` and `send2trash==2.1.0` (File Manager Delete and
+Disk Cleanup's "Clean Selected" both route through this, so a batch delete always goes to
+the Recycle Bin, never a permanent delete), plus `pytest==9.1.1` -- listed in the same flat
+`requirements.txt`, since no dev/prod split convention exists in this repo yet.
 
 ### 3. Run
 
@@ -91,14 +93,14 @@ delete).
 python main.py
 ```
 
-A light-themed window opens with a sidebar and four tabs: Home, Image Tools, File Tools,
-Settings.
+A light-themed window opens with a sidebar and five tabs: Home, Image Tools, File Tools,
+Disk, Settings.
 
 ### 4. Verify
 
-There is no automated test suite (see [Testing](#testing) note below). Confirm the install
+Run the automated suite (`pytest tests/`, see [Testing](#testing)), then confirm the install
 worked by checking that the window opens, the light Soft Rose stylesheet is applied (not
-the plain OS default), and all four sidebar tabs switch pages when clicked.
+the plain OS default), and all five sidebar tabs switch pages when clicked.
 
 ### 5. Configure
 
@@ -128,7 +130,6 @@ The build step writes `dist/UtilityTool.app` on macOS or `dist/UtilityTool.exe` 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Window opens with no theme styling | `styles/theme.qss` failed to load | Run from the repo root; the path in `main.py` is relative. Check the console for a `[WARN] Could not load stylesheet` line |
-| No app icon in the title bar | `main.py` points at `assets/icon.png`, which is not committed to the repo | Harmless: Qt silently skips a missing icon path |
 | Rename or convert stops partway through a batch | A destination folder is missing or not writable | Point the destination picker at a folder you have write access to |
 
 ---
@@ -141,24 +142,25 @@ The build step writes `dist/UtilityTool.app` on macOS or `dist/UtilityTool.exe` 
 ![PySide6](https://img.shields.io/badge/PySide6-6.7.2-41CD52?style=flat&logo=qt&logoColor=white)
 ![Pillow](https://img.shields.io/badge/Pillow-10.2.0-3776AB?style=flat&logo=python&logoColor=white)
 ![send2trash](https://img.shields.io/badge/send2trash-2.1.0-3776AB?style=flat&logo=python&logoColor=white)
+![pytest](https://img.shields.io/badge/pytest-9.1.1-0A9EDC?style=flat&logo=pytest&logoColor=white)
 
 | Layer | Choice | Why this one |
 | --- | --- | --- |
 | Language | Python 3.9+ | Same language on both target OSes, minimal setup for a personal tool |
 | UI toolkit | PySide6 (Qt for Python) | Native-feeling cross-platform desktop widgets, QSS for theming |
 | Image processing | Pillow | Handles resize/convert/compress and EXIF without a native dependency |
-| File deletion | send2trash | Sends File Manager deletes to the OS Recycle Bin/Trash, never a permanent delete |
+| File deletion | send2trash | Sends File Manager deletes and Disk Cleanup's "Clean Selected" to the OS Recycle Bin/Trash, never a permanent delete |
 | Storage | JSON file in the OS app-data directory | No database needed for a handful of saved presets |
 | Hosting | None (local desktop app) | Nothing to deploy or serve |
 | Automation | None | No CI configured; see [Testing](#testing) |
-| Testing | None | No automated suite exists yet |
+| Testing | pytest, `utils/` only | See [Testing](#testing) -- the Qt-driven `tabs/` layer stays manually verified |
 
 ### How the pieces fit
 
 ```mermaid
 flowchart LR
     A[Sidebar nav] --> B[QStackedWidget]
-    B --> C[Tab UI: Image / File / Home / Settings]
+    B --> C[Tab UI: Image / File / Disk / Home / Settings]
     C --> D[QThread worker]
     D --> E[utils: image_utils / file_utils]
     E --> F[Output files]
@@ -175,8 +177,8 @@ flowchart LR
 
 ### End to end walk-through
 
-1. `main.py` builds `MainWindow`, loads `styles/theme.qss`, and mounts four tabs (Home,
-   Image Tools, File Tools, Settings) into a `QStackedWidget` switched by the sidebar
+1. `main.py` builds `MainWindow`, loads `styles/theme.qss`, and mounts five tabs (Home,
+   Image Tools, File Tools, Disk, Settings) into a `QStackedWidget` switched by the sidebar
    buttons.
 2. In `tabs/image_tab.py` or `tabs/file_tab.py`, the user picks files and sets options: an
    output format, a fixed size preset, and quality for images; for files, an operation
@@ -272,13 +274,20 @@ utility-tool/
 │   ├── home_tab.py         task-first dashboard: entry cards + recent activity
 │   ├── image_tab.py        image compress/resize/convert UI + worker thread
 │   ├── file_tab.py         batch rename/move/copy/delete UI + worker thread
+│   ├── disk_tab.py         Disk: Overview usage breakdown + Cleanup quick scan, both on worker threads; Backup TBD
 │   └── settings_tab.py     preset management (list + delete); other settings TBD
 ├── widgets/               reusable Qt widgets shared across tabs
 │   └── common.py           ConfirmDialog (destructive-action confirm), EmptyState
-└── utils/                 pure logic, no Qt imports
-    ├── image_utils.py      Pillow-based resize/convert/compress helpers
-    ├── file_utils.py       filename pattern/regex/case helpers, move/copy/delete
-    └── presets.py          JSON preset load/save, OS app-data path
+├── utils/                 pure logic, no Qt imports
+│   ├── image_utils.py      Pillow-based resize/convert/compress helpers
+│   ├── disk_utils.py       byte formatting, folder sizing, top-level breakdown, 8-category Cleanup scan
+│   ├── file_utils.py       filename pattern/regex/case helpers, move/copy/delete
+│   └── presets.py          JSON preset load/save, OS app-data path
+└── tests/                 pytest suite over utils/ (Qt-free layer only, see Testing)
+    ├── test_image_utils.py
+    ├── test_disk_utils.py
+    ├── test_file_utils.py
+    └── test_presets.py
 ```
 
 | Path | Role |
@@ -295,9 +304,14 @@ utility-tool/
 
 ## Testing
 
-There is no automated test suite in this repo: no `tests/` directory and no test
-dependency in `requirements.txt`. Verification today is manual, per the
-[Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps above.
+```bash
+pytest tests/
+```
+
+Covers the Qt-free `utils/` layer only (`image_utils.py`, `disk_utils.py`, `file_utils.py`,
+`presets.py`) -- real `tmp_path` files, no mocking. The Qt-driven `tabs/` layer (including
+the Disk tab's worker threads and UI) has no automated coverage and stays manually verified,
+per the [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps above.
 
 ---
 

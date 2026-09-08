@@ -4,6 +4,7 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from tabs.home_tab import HomeTab
 from tabs.image_tab import ImageTab
 from tabs.file_tab import FileTab
+from tabs.disk_tab import DiskTab
 from tabs.settings_tab import SettingsTab
 
 
@@ -23,7 +24,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Utility Tool - Swiss Army Edition")
-        self.setWindowIcon(QtGui.QIcon("assets/icon.png"))
 
         # Adjustable window size
         self.resize(1100, 700)
@@ -63,7 +63,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Nav buttons
         self.buttons = []
-        for idx, name in enumerate(["Home", "Image Tools", "File Tools", "Settings"]):
+        for idx, name in enumerate(["Home", "Image Tools", "File Tools", "Disk", "Settings"]):
             btn = SidebarButton(name, idx)
             btn.clicked.connect(self.change_page)
             self.buttons.append(btn)
@@ -77,7 +77,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stacked.addWidget(self.home_tab)  # 0
         self.stacked.addWidget(ImageTab())     # 1
         self.stacked.addWidget(FileTab())      # 2
-        self.stacked.addWidget(SettingsTab())  # 3
+        self.stacked.addWidget(DiskTab())      # 3
+        self.stacked.addWidget(SettingsTab())  # 4
 
         # Home's entry cards switch tabs through the same path the sidebar
         # buttons use, so both stay in sync.
