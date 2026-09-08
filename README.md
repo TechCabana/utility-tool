@@ -48,6 +48,7 @@ progress feedback for long batches.
 | Fixed passport/photo/print size presets (India and Netherlands passport, 4x6, A4, A5, Instagram) | Arbitrary custom paper sizes beyond the built-in list |
 | Batch file renaming by pattern, regex, case and date tokens | Renaming based on file content or metadata beyond modified time |
 | Batch move, copy and delete (File Manager), with a conflict policy and Recycle-Bin-only delete | Undo for a completed batch operation |
+| Disk usage overview: drive used/free and a per-folder size breakdown of your home directory | Cleanup, duplicate finding and backup (Disk's other sub-areas) -- not built yet |
 | Saving and loading presets for both tools (`utils/presets.py`) | Syncing presets across machines or accounts, no cloud storage |
 | Windows and macOS, run from source or packaged with PyInstaller | An installer/updater; PyInstaller output is a raw binary only |
 
@@ -91,8 +92,8 @@ delete).
 python main.py
 ```
 
-A light-themed window opens with a sidebar and four tabs: Home, Image Tools, File Tools,
-Settings.
+A light-themed window opens with a sidebar and five tabs: Home, Image Tools, File Tools,
+Disk, Settings.
 
 ### 4. Verify
 
@@ -158,7 +159,7 @@ The build step writes `dist/UtilityTool.app` on macOS or `dist/UtilityTool.exe` 
 ```mermaid
 flowchart LR
     A[Sidebar nav] --> B[QStackedWidget]
-    B --> C[Tab UI: Image / File / Home / Settings]
+    B --> C[Tab UI: Image / File / Disk / Home / Settings]
     C --> D[QThread worker]
     D --> E[utils: image_utils / file_utils]
     E --> F[Output files]
@@ -175,8 +176,8 @@ flowchart LR
 
 ### End to end walk-through
 
-1. `main.py` builds `MainWindow`, loads `styles/theme.qss`, and mounts four tabs (Home,
-   Image Tools, File Tools, Settings) into a `QStackedWidget` switched by the sidebar
+1. `main.py` builds `MainWindow`, loads `styles/theme.qss`, and mounts five tabs (Home,
+   Image Tools, File Tools, Disk, Settings) into a `QStackedWidget` switched by the sidebar
    buttons.
 2. In `tabs/image_tab.py` or `tabs/file_tab.py`, the user picks files and sets options: an
    output format, a fixed size preset, and quality for images; for files, an operation
@@ -272,11 +273,13 @@ utility-tool/
 │   ├── home_tab.py         task-first dashboard: entry cards + recent activity
 │   ├── image_tab.py        image compress/resize/convert UI + worker thread
 │   ├── file_tab.py         batch rename/move/copy/delete UI + worker thread
+│   ├── disk_tab.py         Disk: Overview usage breakdown + worker thread; Cleanup/Backup TBD
 │   └── settings_tab.py     preset management (list + delete); other settings TBD
 ├── widgets/               reusable Qt widgets shared across tabs
 │   └── common.py           ConfirmDialog (destructive-action confirm), EmptyState
 └── utils/                 pure logic, no Qt imports
     ├── image_utils.py      Pillow-based resize/convert/compress helpers
+    ├── disk_utils.py       byte formatting, recursive folder sizing, top-level breakdown
     ├── file_utils.py       filename pattern/regex/case helpers, move/copy/delete
     └── presets.py          JSON preset load/save, OS app-data path
 ```

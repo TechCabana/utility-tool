@@ -438,6 +438,14 @@ QPushButton#Danger:disabled {
     background: transparent;
 }
 
+/* Plain container widgets sitting inside a QFrame#Card (e.g. the Disk
+   Overview breakdown rows in tabs/disk_tab.py). The base QWidget rule above
+   gives every widget the page ground, which would paint a grey block over
+   the card's white surface -- same reason #EmptyState is transparent. */
+#CardBody {
+    background: transparent;
+}
+
 /* ===== List Widgets (double as file drop zones) ===== */
 QListWidget {
     background-color: #ffffff;

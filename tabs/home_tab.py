@@ -93,9 +93,10 @@ class HomeTab(QtWidgets.QWidget):
         file_card.clicked.connect(lambda: self.switch_requested.emit(2))
         cards.addWidget(file_card, 1)
 
-        # Disk (Overview/Cleanup/Duplicates/Backup, see DESIGN.md) isn't a
-        # real tab yet -- point at Settings rather than invent one.
-        disk_card = EntryCard("Disk", "Cleanup, duplicates and backup.", badge="COMING SOON")
+        # Disk (Overview / Cleanup / Backup, see DESIGN.md). Only Overview is
+        # built so far; the card routes to the real tab, which carries its own
+        # placeholders for the two sub-areas that aren't.
+        disk_card = EntryCard("Disk", "Usage overview, cleanup and backup.")
         disk_card.clicked.connect(lambda: self.switch_requested.emit(3))
         cards.addWidget(disk_card, 1)
 
