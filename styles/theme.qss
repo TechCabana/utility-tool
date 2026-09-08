@@ -23,6 +23,15 @@
  *   radius-s       6px                small controls
  *   radius-m       10px               panels, cards, drop zones
  *
+ * Typeface: Geist (400/500/600/700), bundled as .ttf in assets/fonts/ and
+ * registered by load_fonts() in main.py before this sheet is applied. It has
+ * to be bundled -- the app makes no network calls, so there is no webfont
+ * route, and a family that is merely *named* here resolves to whatever the OS
+ * happens to have. That is exactly what the previous "Public Sans" rule did:
+ * it is not a system font on Windows or macOS and was never bundled, so the
+ * app rendered in a fallback face for as long as the rule existed. Do not add
+ * a font-family here for a face that is not in assets/fonts/.
+ *
  * Card/panel elevation is a soft drop shadow, which QSS cannot express. It is
  * applied programmatically by apply_card_shadows() in main.py to every QFrame
  * named "Card" or "Sidebar"; the 1px border below only crisps the edge.
@@ -32,7 +41,7 @@
 QWidget {
     background-color: #fafafa;
     color: #18181b;
-    font-family: "Public Sans", -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     font-size: 14px;
 }
 

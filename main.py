@@ -1,4 +1,6 @@
 import sys
+from pathlib import Path
+
 from PySide6 import QtWidgets, QtCore, QtGui
 
 from tabs.home_tab import HomeTab
@@ -6,6 +8,11 @@ from tabs.image_tab import ImageTab
 from tabs.file_tab import FileTab
 from tabs.disk_tab import DiskTab
 from tabs.settings_tab import SettingsTab
+
+# Assets and styles are read relative to this file, not the working directory,
+# so the app behaves the same whether it is started from the repo root or from
+# anywhere else.
+BASE_DIR = Path(__file__).resolve().parent
 
 
 class SidebarButton(QtWidgets.QPushButton):
@@ -24,6 +31,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Utility Tool - Swiss Army Edition")
+        set_window_icon(self)
 
         # Adjustable window size
         self.resize(1100, 700)
@@ -130,7 +138,41 @@ def apply_card_shadows(root):
         frame.setGraphicsEffect(shadow)
 
 
-def load_stylesheet(app, path="styles/theme.qss"):
+def set_window_icon(window):
+    """Put the Soft Rose app mark on the window (title bar and taskbar).
+
+    Checked rather than passed straight to QIcon: a missing file makes a null
+    icon with no error at all, which is how the previous reference to
+    assets/icon.png sat dead in this file long enough to need its own card.
+    """
+    path = BASE_DIR / "assets" / "icon.png"
+    if not path.is_file():
+        print(f"[WARN] Could not load window icon '{path}': file not found")
+        return
+    window.setWindowIcon(QtGui.QIcon(str(path)))
+
+
+def load_fonts(directory=None):
+    """Register the bundled UI typeface so the QSS can name it.
+
+    The app makes no network calls, so a webfont is not an option: the Geist
+    .ttf files ship in assets/fonts/ and are registered here, before the
+    stylesheet is applied. Without this the 'Geist' in theme.qss would fall
+    back to a system face with no warning -- see DESIGN.md, Typography.
+    """
+    directory = Path(directory or BASE_DIR / "assets" / "fonts")
+    files = sorted(directory.glob("*.ttf"))
+    if not files:
+        # Silence here would mean the app quietly renders in a system font.
+        print(f"[WARN] No bundled fonts found in '{directory}'; the UI will use a fallback face")
+        return
+    for path in files:
+        if QtGui.QFontDatabase.addApplicationFont(str(path)) == -1:
+            print(f"[WARN] Could not load font '{path}'")
+
+
+def load_stylesheet(app, path=None):
+    path = path or BASE_DIR / "styles" / "theme.qss"
     try:
         with open(path, "r", encoding="utf-8") as f:
             app.setStyleSheet(f.read())
@@ -140,6 +182,7 @@ def load_stylesheet(app, path="styles/theme.qss"):
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
+    load_fonts()
     load_stylesheet(app)
     win = MainWindow()
     win.show()

@@ -129,7 +129,8 @@ The build step writes `dist/UtilityTool.app` on macOS or `dist/UtilityTool.exe` 
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Window opens with no theme styling | `styles/theme.qss` failed to load | Run from the repo root; the path in `main.py` is relative. Check the console for a `[WARN] Could not load stylesheet` line |
+| Window opens with no theme styling | `styles/theme.qss` failed to load | Paths are resolved next to `main.py`, so the working directory does not matter -- check the console for a `[WARN] Could not load stylesheet` line and that `styles/` was not moved |
+| Text renders in a system font, not Geist | The bundled `.ttf` files under `assets/fonts/` are missing | Check the console for `[WARN] Could not load font`; restore `assets/fonts/` from the repo |
 | Rename or convert stops partway through a batch | A destination folder is missing or not writable | Point the destination picker at a folder you have write access to |
 
 ---
@@ -268,6 +269,9 @@ utility-tool/
 ├── main.py               app entry point; window shell, sidebar, tab wiring
 ├── requirements.txt      pinned runtime dependencies (PySide6, Pillow, send2trash)
 ├── LICENSE                MIT
+├── assets/
+│   ├── icon.png           window/taskbar app mark
+│   └── fonts/             Geist (SIL OFL 1.1), the bundled UI typeface + OFL.txt
 ├── styles/
 │   └── theme.qss          Qt stylesheet for the Soft Rose light theme
 ├── tabs/                  one QWidget per sidebar page
@@ -292,7 +296,8 @@ utility-tool/
 
 | Path | Role |
 | --- | --- |
-| `main.py` | Composes the window, sidebar and tabs; loads the QSS theme |
+| `main.py` | Composes the window, sidebar and tabs; registers the bundled fonts, then loads the QSS theme |
+| `assets/` | App icon and the bundled Geist typeface. The app makes no network calls, so the UI font ships as `.ttf` files and is registered by `load_fonts()` before the stylesheet is applied -- naming a font in the QSS without a file here silently falls back to a system face |
 | `tabs/` | UI for each sidebar page, one file per tab |
 | `widgets/` | Shared Qt widgets (dialogs, placeholders) reused across tabs |
 | `utils/` | Framework-free helpers the tabs call into; safe to unit test in isolation |
@@ -333,6 +338,10 @@ code in this repository only.
 
 - Image processing via [Pillow](https://python-pillow.org/), MIT licensed.
 - UI built on [PySide6](https://doc.qt.io/qtforpython-6/), LGPLv3 licensed (Qt for Python).
+- UI typeface is [Geist](https://vercel.com/font), copyright 2024 The Geist Project Authors,
+  used under the SIL Open Font License 1.1. The font files are redistributed in
+  `assets/fonts/` with the licence text at
+  [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt); the MIT licence above does not cover them.
 
 ---
 
