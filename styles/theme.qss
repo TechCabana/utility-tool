@@ -92,6 +92,13 @@ QFrame#Card {
     padding: 24px;
 }
 
+/* Keyboard-focus ring for a clickable Card (e.g. Home's EntryCard) -- same
+   accent treatment as every other focusable control below. A no-op for
+   non-interactive Card frames, which never receive Qt focus. */
+QFrame#Card:focus {
+    border: 1px solid #a8354e;
+}
+
 /* ===== Typography ===== */
 QLabel {
     background: transparent;

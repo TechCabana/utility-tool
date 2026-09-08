@@ -6,7 +6,14 @@ class EntryCard(QtWidgets.QFrame):
 
     Uses the existing "#Card" objectName so it picks up the Soft Rose panel
     styling and drop shadow for free (see apply_card_shadows() in main.py) --
-    no new QSS needed.
+    no new QSS needed beyond the #Card:focus rule in styles/theme.qss.
+
+    DESIGN.md's Operate mode requires "every component is a real, working
+    control ... the world is a skin over standard Qt affordances, not a
+    replacement for them" -- a QFrame with only a mouse handler fails that:
+    it is invisible to Tab and unusable from the keyboard. StrongFocus plus
+    a Return/Space keyPressEvent makes it behave like the real button it
+    visually reads as.
     """
     clicked = QtCore.Signal()
 
@@ -14,6 +21,9 @@ class EntryCard(QtWidgets.QFrame):
         super().__init__()
         self.setObjectName("Card")
         self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setAccessibleName(title)
+        self.setAccessibleDescription(description)
 
         v = QtWidgets.QVBoxLayout(self)
         v.setSpacing(6)
@@ -38,6 +48,15 @@ class EntryCard(QtWidgets.QFrame):
         if event.button() == QtCore.Qt.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        # Activate the same as a click on Return/Enter/Space -- the standard
+        # QAbstractButton keyboard-activation keys -- so a Tab-focused card
+        # is actually usable, not just visually a button.
+        if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Space):
+            self.clicked.emit()
+            return
+        super().keyPressEvent(event)
 
 
 class HomeTab(QtWidgets.QWidget):
