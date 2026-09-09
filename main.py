@@ -180,7 +180,39 @@ def load_stylesheet(app, path=None):
         print(f"[WARN] Could not load stylesheet '{path}': {e}")
 
 
+def run_backup_job_cli(job_id):
+    """Run one backup job with no GUI at all, and return a process exit code.
+
+    This is what the Windows scheduled task registered by the Backup screen
+    actually invokes (`main.py --run-backup-job <id>`). It must not construct
+    a QApplication or open a window: a scheduled backup runs while nobody is
+    at the machine, and a window appearing at 8pm every night is not a
+    feature. Everything it needs is in utils/backup_utils.py, which is
+    Qt-free by design, so nothing here touches the widget layer.
+
+    Exit codes: 0 backed up, 1 the backup failed, 2 no such job.
+    """
+    from utils import backup_utils
+
+    job = backup_utils.get_job(job_id)
+    if job is None:
+        print(f"[ERROR] No backup job with id '{job_id}'")
+        return 2
+    result = backup_utils.run_job(job)
+    backup_utils.record_run(job_id, result)
+    print(("[OK] " if result.get("ok") else "[ERROR] ") + result.get("message", ""))
+    return 0 if result.get("ok") else 1
+
+
 if __name__ == "__main__":
+    # The headless path is resolved before any Qt object exists, so a
+    # scheduled run costs no QApplication and shows no window.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--run-backup-job":
+        sys.exit(run_backup_job_cli(sys.argv[2]))
+    if "--run-backup-job" in sys.argv:
+        print("usage: main.py --run-backup-job <job id>")
+        sys.exit(2)
+
     app = QtWidgets.QApplication(sys.argv)
     load_fonts()
     load_stylesheet(app)
