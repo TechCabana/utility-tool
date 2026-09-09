@@ -15,7 +15,7 @@ from utils.disk_utils import (
     top_level_breakdown,
 )
 from utils.file_utils import delete_file
-from widgets.common import ConfirmDialog, EmptyState
+from widgets.common import ConfirmDialog, EmptyState, divider
 
 
 class ScanWorker(QtCore.QObject):
@@ -163,8 +163,13 @@ class CategorySection(QtWidgets.QWidget):
         self._detail_built = False
 
         v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(0, 6, 0, 6)
-        v.setSpacing(4)
+        # Asymmetric on purpose. Before this the gap from a row to its own
+        # description was almost the same as the gap to the next row, so a
+        # description read as floating between two categories rather than
+        # belonging to the one above it. Tight to its own hint, generous to
+        # the next row -- and a divider() between rows in _render_sections.
+        v.setContentsMargins(0, 10, 0, 12)
+        v.setSpacing(2)
 
         head = QtWidgets.QHBoxLayout()
         head.setSpacing(12)
@@ -207,6 +212,10 @@ class CategorySection(QtWidgets.QWidget):
         hint_label = QtWidgets.QLabel(hint)
         hint_label.setObjectName("Hint")
         hint_label.setWordWrap(True)
+        # Indented to start under the category name rather than under the
+        # checkbox, so it hangs off its own row instead of sitting flush with
+        # the column header above it.
+        hint_label.setContentsMargins(26, 0, 0, 0)
         v.addWidget(hint_label)
 
         self.detail = QtWidgets.QLabel()
@@ -307,8 +316,10 @@ class DuplicateGroupSection(QtWidgets.QWidget):
 
         home = str(Path.home())
         v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(0, 6, 0, 6)
-        v.setSpacing(4)
+        # Same asymmetric rhythm as CategorySection: tight to the group's own
+        # detail, generous to the next group.
+        v.setContentsMargins(0, 10, 0, 12)
+        v.setSpacing(2)
 
         head = QtWidgets.QHBoxLayout()
         head.setSpacing(12)
@@ -736,7 +747,7 @@ class JobRow(QtWidgets.QWidget):
         self.job = job
 
         h = QtWidgets.QHBoxLayout(self)
-        h.setContentsMargins(0, 6, 0, 6)
+        h.setContentsMargins(0, 10, 0, 10)
         h.setSpacing(12)
 
         status, style = self._status(job)
@@ -816,7 +827,7 @@ class RestoreRow(QtWidgets.QWidget):
         self.job = job
 
         h = QtWidgets.QHBoxLayout(self)
-        h.setContentsMargins(0, 6, 0, 6)
+        h.setContentsMargins(0, 10, 0, 10)
         h.setSpacing(12)
 
         when = changes.get("when") if changes.get("ok") else None
@@ -1155,7 +1166,10 @@ class DiskTab(QtWidgets.QWidget):
         cv.addWidget(self.cleanup_scan_box)
 
         # A header row over every repeated-row table (DESIGN.md v4 rule 3), so
-        # the three columns are labelled rather than inferred.
+        # the three columns are labelled rather than inferred. The extra space
+        # above it separates the table from the safety note; the rule under it
+        # ties it to the rows it labels.
+        cv.addSpacing(8)
         header = QtWidgets.QWidget()
         header.setObjectName("CardBody")
         hh = QtWidgets.QHBoxLayout(header)
@@ -1175,12 +1189,15 @@ class DiskTab(QtWidgets.QWidget):
         spacer.setMinimumWidth(96)
         hh.addWidget(spacer)
         cv.addWidget(header)
+        cv.addWidget(divider())
 
         self.sections_host = QtWidgets.QWidget()
         self.sections_host.setObjectName("CardBody")
         self.sections_layout = QtWidgets.QVBoxLayout(self.sections_host)
         self.sections_layout.setContentsMargins(0, 0, 0, 0)
-        self.sections_layout.setSpacing(2)
+        # Row separation is the divider() between rows plus each row's own
+        # margins, so the layout adds nothing on top of it.
+        self.sections_layout.setSpacing(0)
         cv.addWidget(self.sections_host)
 
         bv.addWidget(card)
@@ -1285,10 +1302,17 @@ class DiskTab(QtWidgets.QWidget):
         self.dup_scan_box.setVisible(False)
         cv.addWidget(self.dup_scan_box)
 
-        # A header row over the group table, same rule as Quick scan's.
+        # A header row over the group table, same rule as Quick scan's. Header
+        # and its underline live in one container so the three places that
+        # show/hide the header cannot leave a stray rule behind.
         header = QtWidgets.QWidget()
         header.setObjectName("CardBody")
-        hh = QtWidgets.QHBoxLayout(header)
+        header_v = QtWidgets.QVBoxLayout(header)
+        header_v.setContentsMargins(0, 8, 0, 0)
+        header_v.setSpacing(8)
+        header_row = QtWidgets.QWidget()
+        header_row.setObjectName("CardBody")
+        hh = QtWidgets.QHBoxLayout(header_row)
         hh.setContentsMargins(0, 0, 0, 0)
         hh.setSpacing(12)
         for text, stretch, align in (
@@ -1303,6 +1327,8 @@ class DiskTab(QtWidgets.QWidget):
         spacer = QtWidgets.QLabel("")
         spacer.setMinimumWidth(96)
         hh.addWidget(spacer)
+        header_v.addWidget(header_row)
+        header_v.addWidget(divider())
         self.dup_header = header
         self.dup_header.setVisible(False)
         cv.addWidget(header)
@@ -1311,7 +1337,9 @@ class DiskTab(QtWidgets.QWidget):
         self.dup_host.setObjectName("CardBody")
         self.dup_layout = QtWidgets.QVBoxLayout(self.dup_host)
         self.dup_layout.setContentsMargins(0, 0, 0, 0)
-        self.dup_layout.setSpacing(2)
+        # Row separation is each row's own margins plus the divider() between
+        # them, so the layout adds nothing on top.
+        self.dup_layout.setSpacing(0)
         cv.addWidget(self.dup_host)
 
         self.dup_empty = EmptyState(
@@ -1395,7 +1423,9 @@ class DiskTab(QtWidgets.QWidget):
         self.jobs_host.setObjectName("CardBody")
         self.jobs_layout = QtWidgets.QVBoxLayout(self.jobs_host)
         self.jobs_layout.setContentsMargins(0, 0, 0, 0)
-        self.jobs_layout.setSpacing(2)
+        # Row separation is each row's own margins plus the divider() between
+        # them, so the layout adds nothing on top.
+        self.jobs_layout.setSpacing(0)
         jv.addWidget(self.jobs_host)
 
         self.jobs_empty = EmptyState(
@@ -1450,7 +1480,9 @@ class DiskTab(QtWidgets.QWidget):
         self.restore_host.setObjectName("CardBody")
         self.restore_layout = QtWidgets.QVBoxLayout(self.restore_host)
         self.restore_layout.setContentsMargins(0, 0, 0, 0)
-        self.restore_layout.setSpacing(2)
+        # Same as the jobs table above: rows carry their own margins and a
+        # divider() sits between them.
+        self.restore_layout.setSpacing(0)
         rv.addWidget(self.restore_host)
 
         self.restore_empty = EmptyState(
@@ -1483,9 +1515,18 @@ class DiskTab(QtWidgets.QWidget):
         spec the rows do -- same stretch, same minimum width -- so the two
         cannot drift apart, and `action_width` reserves the row's buttons.
         """
+        # The labels and the rule that underlines them are one widget: the
+        # callers show and hide the header as a unit, and a rule left behind
+        # over an empty table reads as a table with a missing first row.
         header = QtWidgets.QWidget()
         header.setObjectName("CardBody")
-        h = QtWidgets.QHBoxLayout(header)
+        v = QtWidgets.QVBoxLayout(header)
+        v.setContentsMargins(0, 8, 0, 0)
+        v.setSpacing(8)
+
+        row = QtWidgets.QWidget()
+        row.setObjectName("CardBody")
+        h = QtWidgets.QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(12)
         for text, stretch, minimum in columns:
@@ -1496,6 +1537,9 @@ class DiskTab(QtWidgets.QWidget):
         spacer = QtWidgets.QLabel("")
         spacer.setMinimumWidth(action_width)
         h.addWidget(spacer)
+
+        v.addWidget(row)
+        v.addWidget(divider())
         return header
 
     def refresh_backup(self):
@@ -1506,7 +1550,11 @@ class DiskTab(QtWidgets.QWidget):
 
         self.jobs_empty.setVisible(not self.jobs)
         self.job_header.setVisible(bool(self.jobs))
-        for job in self.jobs:
+        for index, job in enumerate(self.jobs):
+            # A hairline between rows but not after the last one, same rhythm
+            # as the Cleanup categories -- both are repeated-row tables here.
+            if index:
+                self.jobs_layout.addWidget(divider())
             row = JobRow(job)
             row.run_requested.connect(self.run_backup_job)
             row.edit_requested.connect(self.edit_backup_job)
@@ -1515,7 +1563,9 @@ class DiskTab(QtWidgets.QWidget):
 
         self.restore_empty.setVisible(not self.jobs)
         self.restore_header.setVisible(bool(self.jobs))
-        for job in self.jobs:
+        for index, job in enumerate(self.jobs):
+            if index:
+                self.restore_layout.addWidget(divider())
             row = RestoreRow(job, self._changes.get(job["id"], {}))
             row.restore_requested.connect(self.restore_backup_job)
             self.restore_layout.addWidget(row)
@@ -1852,6 +1902,10 @@ class DiskTab(QtWidgets.QWidget):
         show_similarity = self.dup_mode_key() == "images"
         shown = groups[:self.MAX_DUPLICATE_GROUPS]
         for number, group in enumerate(shown, 1):
+            # Same row rhythm as the Cleanup categories above -- both are
+            # repeated-row tables on the one screen, so they read as one.
+            if number > 1:
+                self.dup_layout.addWidget(divider())
             section = DuplicateGroupSection(group, number, show_similarity)
             section.toggled.connect(self.update_dup_selection)
             self.dup_sections.append(section)
@@ -2020,7 +2074,11 @@ class DiskTab(QtWidgets.QWidget):
 
     def _render_sections(self, categories: List[CleanupCategory]):
         self._clear_sections()
-        for category in categories:
+        for index, category in enumerate(categories):
+            # A hairline between rows, not after the last one: a rule sitting
+            # just above the card's own edge reads as an unfinished table.
+            if index:
+                self.sections_layout.addWidget(divider())
             section = CategorySection(category)
             section.toggled.connect(self.update_selection)
             self.sections.append(section)
