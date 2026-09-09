@@ -271,9 +271,12 @@ class ImageTab(QtWidgets.QWidget):
         fv = QtWidgets.QVBoxLayout(footer)
         fv.setSpacing(SPACE_FIELD)
 
-        # One row: what runs the batch on the left, what inspects it on the
-        # right. Two rows of buttons made the footer taller than the form it
-        # acts on.
+        # Two rows, not one: six widgets (4 buttons + a button + a label) on
+        # one QHBoxLayout do not fit the app's own documented minimum window
+        # width (900px, main.py's setMinimumSize) -- measured at that width,
+        # Save Preset and Estimate Selected were squeezed below their
+        # sizeHint and their text clipped. Splitting back into two rows costs
+        # a little footer height but both rows independently fit at 900px.
         act = QtWidgets.QHBoxLayout()
         act.setSpacing(8)
         self.start_btn = QtWidgets.QPushButton("Start")
@@ -286,14 +289,18 @@ class ImageTab(QtWidgets.QWidget):
         act.addWidget(self.start_btn); act.addWidget(self.stop_btn)
         act.addWidget(self.clear_btn); act.addWidget(self.save_preset_btn)
         act.addStretch(1)
+        fv.addLayout(act)
 
+        est_h = QtWidgets.QHBoxLayout()
+        est_h.setSpacing(8)
         self.preview_btn = QtWidgets.QPushButton("Estimate Selected")
         self.preview_btn.setObjectName("Secondary")
         self.preview_btn.clicked.connect(self.preview_selected)
         self.preview_label = QtWidgets.QLabel("Estimated: —")
-        act.addWidget(self.preview_btn)
-        act.addWidget(self.preview_label)
-        fv.addLayout(act)
+        est_h.addWidget(self.preview_btn)
+        est_h.addWidget(self.preview_label)
+        est_h.addStretch(1)
+        fv.addLayout(est_h)
 
         self.overall = QtWidgets.QProgressBar()
         self.status = QtWidgets.QLabel("Idle")
