@@ -30,7 +30,7 @@ class SidebarButton(QtWidgets.QPushButton):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Utility Tool - Swiss Army Edition")
+        self.setWindowTitle("UtilityTool")
         set_window_icon(self)
 
         # Adjustable window size
@@ -65,7 +65,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sbl.setSpacing(8)
 
         # App title (styled by QSS)
-        title = QtWidgets.QLabel("Utility Tool")
+        title = QtWidgets.QLabel("UtilityTool")
         title.setObjectName("AppTitle")
         sbl.addWidget(title)
 

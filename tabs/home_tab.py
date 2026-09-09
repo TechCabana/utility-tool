@@ -72,7 +72,7 @@ class HomeTab(QtWidgets.QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(16)
 
-        header = QtWidgets.QLabel("Utility Tool")
+        header = QtWidgets.QLabel("UtilityTool")
         header.setObjectName("H1")
         layout.addWidget(header)
 

@@ -1,6 +1,6 @@
 <div align="center">
 
-# Utility Tool
+# UtilityTool
 
 **Batch image tools, file operations and disk cleanup in one offline desktop app.**
 
@@ -19,7 +19,7 @@
 
 ---
 
-> **TL;DR:** Utility Tool is a PySide6 desktop app with three pillars: batch image
+> **TL;DR:** UtilityTool is a PySide6 desktop app with three pillars: batch image
 > compress/resize/convert, batch file rename/move/copy/delete, and disk cleanup with
 > duplicate detection. All three share one pattern-based preset system, and the app runs
 > fully offline.
@@ -98,9 +98,8 @@ python main.py
 ```
 
 A light-themed window opens with a sidebar and five tabs: Home, Image Tools, File Manager,
-Disk, Settings. The window title bar still reads "Utility Tool - Swiss Army Edition"
-(`main.py`'s `setWindowTitle`), a leftover from before the v1 redesign. The icon and every
-other surface in the app now go by "Utility Tool" alone.
+Disk, Settings. The window title bar, sidebar header and every other surface in the app go by
+"UtilityTool" (one word).
 
 ### 4. Verify
 
@@ -127,9 +126,48 @@ Nothing here is committed to the repo, and nothing needs to be.
 | Task | Command |
 | --- | --- |
 | Run from source | `python main.py` |
-| Build a standalone binary | `pip install pyinstaller` then `pyinstaller --onefile --windowed main.py --name "UtilityTool"` |
+| Build a standalone binary | See [Building a standalone binary](#building-a-standalone-binary) below |
 
-The build step writes `dist/UtilityTool.app` on macOS or `dist/UtilityTool.exe` on Windows.
+### Building a standalone binary
+
+`pyinstaller --onefile --windowed main.py` alone does **not** bundle `assets/` or `styles/`
+(confirmed against a real build, which reported "Copying 0 resources to EXE") — the resulting
+binary launches with no theme, no bundled font and no icon. Pass `--add-data` for both
+directories; the separator between source and destination differs by OS (`;` on Windows, `:`
+everywhere else).
+
+```bash
+pip install pyinstaller
+```
+
+**Windows (PowerShell or cmd):**
+
+```powershell
+pyinstaller --onefile --windowed --name "UtilityTool" `
+  --add-data "styles;styles" `
+  --add-data "assets;assets" `
+  main.py
+```
+
+Writes `dist\UtilityTool.exe`.
+
+**macOS (or Linux):**
+
+```bash
+pyinstaller --onefile --windowed --name "UtilityTool" \
+  --add-data "styles:styles" \
+  --add-data "assets:assets" \
+  main.py
+```
+
+Writes `dist/UtilityTool.app` on macOS, or a plain `dist/UtilityTool` executable on Linux.
+
+The packaged binary is unsigned on both platforms — see
+[If it does not work](#if-it-does-not-work) for the SmartScreen/Gatekeeper warnings this
+triggers and the one-time workaround for each. Windows Task Scheduler entries created by Disk
+→ Backup point at the interpreter and script path used at job-creation time; re-create backup
+jobs after switching from running-from-source to a packaged binary so the scheduled task
+invokes the right thing.
 
 ### If it does not work
 

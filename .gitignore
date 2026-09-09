@@ -11,7 +11,9 @@ __pycache__/
 .eggs/
 dist/
 dist_*/
+build/
 build_*/
+*.spec
 
 # Assistant design-tracking files - not needed to run the app (W11)
 DESIGN.md
