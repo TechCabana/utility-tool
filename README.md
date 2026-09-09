@@ -140,6 +140,14 @@ The build step writes `dist/UtilityTool.app` on macOS or `dist/UtilityTool.exe` 
 | A packaged binary is missing its font, icon or theme | `pyinstaller --onefile` alone does not bundle `assets/`, `styles/` or `widgets/` (confirmed against a real build, which reported "Copying 0 resources to EXE") | Add `--add-data` flags (or a `.spec` file) for `assets`, `styles` and `widgets` before packaging for distribution; running from source is unaffected |
 | Rename, move, copy or a Cleanup/Duplicates removal stops partway through a batch | A destination folder is missing or not writable | Point the destination picker at a folder you have write access to |
 | Windows taskbar shows the Python interpreter icon, not the app icon | `setWindowIcon()` sets the title-bar icon only; Windows groups taskbar icons by process, which needs an explicit AppUserModelID or a packaged binary | Cosmetic only: package with PyInstaller, or set an AppUserModelID before opening the window, to fix the taskbar icon specifically |
+| Windows shows "Windows protected your PC" (SmartScreen) when running the packaged `.exe` | The binary isn't code-signed (see below) | Click "More info", then "Run anyway" |
+| macOS says the app "is damaged and can't be opened" / prompts to move it to the Trash (Gatekeeper) | The binary isn't code-signed or notarized (see below) | Right-click (or Control-click) the app, choose "Open", then confirm "Open" in the dialog that appears. This is a one-time step per machine — it tells Gatekeeper to trust this specific app going forward |
+
+**Why these warnings appear:** this is a personal, single-developer tool, and no Apple
+Developer account or Windows code-signing certificate has been purchased for it — both cost
+money on an ongoing basis, for a tool built primarily for its own developer to use. The OS has
+no way to vouch for an unsigned binary, so it warns by default; that warning is not a sign of
+malware, just of an indie tool that hasn't paid for a certificate.
 
 ---
 
