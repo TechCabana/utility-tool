@@ -3,23 +3,34 @@
 # sorted top-level breakdown and the Cleanup quick scan the Disk tab's QThread
 # workers call. Uses real temp trees (tmp_path), no filesystem mocking -- the
 # whole point of these walks is how they behave against a real directory.
+import hashlib
 import os
 import subprocess
 import sys
 import time
 
 import pytest
+from PIL import Image
 
 from utils.disk_utils import (
+    IMAGE_HASH_BITS,
+    IMAGE_HASH_MAX_DISTANCE,
     LARGE_FILE_BYTES,
     browser_cache_dirs,
     cleanup_roots,
     cleanup_scan,
+    duplicate_roots,
     empty_folders,
+    file_sha256,
+    find_duplicate_files,
+    find_duplicate_images,
     find_files,
     folder_size,
+    hamming_distance,
     human_size,
+    image_dhash,
     recycle_bin_stats,
+    similarity_percent,
     top_level_breakdown,
 )
 
@@ -448,3 +459,253 @@ def test_cleanup_scan_stops_after_the_first_category_when_aborted(fake_appdata, 
     # An aborted scan returns what it finished, never a partial category or
     # an exception -- the tab renders the short list as-is.
     assert [c.key for c in cats] == ["system_cache"]
+
+
+# ===========================================================================
+# Duplicates -- exact (Files mode)
+# ===========================================================================
+
+
+def _write_bytes(path, data):
+    """Write real content, not a sparse hole -- these tests hash the bytes."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def test_file_sha256_matches_hashlib_over_the_same_bytes(tmp_path):
+    path = str(tmp_path / "payload.bin")
+    data = os.urandom(3 * 1024 * 1024 + 17)  # spans several read chunks
+    _write_bytes(path, data)
+
+    assert file_sha256(path) == hashlib.sha256(data).hexdigest()
+
+
+def test_find_duplicate_files_groups_identical_copies(tmp_path):
+    original = str(tmp_path / "invoice.pdf")
+    copy = str(tmp_path / "sub" / "invoice (1).pdf")
+    _write_bytes(original, b"same bytes")
+    _write_bytes(copy, b"same bytes")
+    _age(original, 30)  # the older file is the one to keep
+
+    groups, skipped = find_duplicate_files([str(tmp_path)])
+
+    assert skipped == 0
+    assert len(groups) == 1
+    assert groups[0].keep == (original, 10)
+    assert groups[0].duplicates == [(copy, 10)]
+    assert groups[0].similarity == 100
+    assert groups[0].size == 10
+
+
+def test_find_duplicate_files_keeps_the_oldest_of_three_copies(tmp_path):
+    paths = []
+    for name, age in (("a.txt", 1), ("b.txt", 400), ("c.txt", 90)):
+        path = str(tmp_path / name)
+        _write_bytes(path, b"identical")
+        _age(path, age)
+        paths.append(path)
+
+    groups, _ = find_duplicate_files([str(tmp_path)])
+
+    assert groups[0].keep[0] == paths[1]          # b.txt, backdated 400 days
+    assert sorted(p for p, _ in groups[0].duplicates) == sorted(
+        [paths[0], paths[2]])
+
+
+def test_find_duplicate_files_ignores_same_size_different_content(tmp_path):
+    _write_bytes(str(tmp_path / "one.bin"), b"aaaa")
+    _write_bytes(str(tmp_path / "two.bin"), b"bbbb")
+
+    groups, _ = find_duplicate_files([str(tmp_path)])
+
+    # Equal size is only the cheap prefilter; the hash is what decides.
+    assert groups == []
+
+
+def test_find_duplicate_files_ignores_empty_files(tmp_path):
+    _write_bytes(str(tmp_path / "empty_one"), b"")
+    _write_bytes(str(tmp_path / "empty_two"), b"")
+
+    groups, _ = find_duplicate_files([str(tmp_path)])
+
+    # Every zero-byte file matches every other one and reclaims nothing.
+    assert groups == []
+
+
+def test_find_duplicate_files_sorts_groups_by_reclaimable_size(tmp_path):
+    for name, data in (("small", b"xx"), ("big", b"y" * 500)):
+        _write_bytes(str(tmp_path / (name + "_1")), data)
+        _write_bytes(str(tmp_path / (name + "_2")), data)
+
+    groups, _ = find_duplicate_files([str(tmp_path)])
+
+    assert [g.size for g in groups] == [500, 2]
+
+
+def test_find_duplicate_files_reports_hashing_progress(tmp_path):
+    _write_bytes(str(tmp_path / "a"), b"dup")
+    _write_bytes(str(tmp_path / "b"), b"dup")
+    _write_bytes(str(tmp_path / "unique"), b"only me")
+    seen = []
+
+    find_duplicate_files([str(tmp_path)],
+                         on_progress=lambda d, t: seen.append((d, t)))
+
+    # The unique-sized file is never hashed, so it never reaches the total.
+    assert seen == [(1, 2), (2, 2)]
+
+
+def test_find_duplicate_files_stops_when_aborted(tmp_path):
+    _write_bytes(str(tmp_path / "a"), b"dup")
+    _write_bytes(str(tmp_path / "b"), b"dup")
+
+    groups, _ = find_duplicate_files([str(tmp_path)], should_abort=lambda: True)
+
+    assert groups == []
+
+
+def test_duplicate_roots_are_the_large_and_old_file_roots(fake_appdata, tmp_path):
+    (tmp_path / "Downloads").mkdir(exist_ok=True)
+    (tmp_path / "Documents").mkdir(exist_ok=True)
+
+    roots = duplicate_roots(home=str(tmp_path))
+
+    # Desktop does not exist in this fixture, so it is simply absent.
+    assert [os.path.basename(r) for r in roots] == ["Downloads", "Documents"]
+
+
+# ===========================================================================
+# Duplicates -- perceptual (Images mode)
+# ===========================================================================
+
+
+def _photo(path, size=(240, 180), seed=0):
+    """A deterministic non-flat test image with real gradient structure.
+
+    A solid colour is useless here: every flat image has the same difference
+    hash, so a test built on one would pass whatever the hash did.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    width, height = size
+    image = Image.new("RGB", size)
+    image.putdata([
+        ((x * 7 + seed * 53) % 256, (y * 5 + seed * 31) % 256, (x + y) % 256)
+        for y in range(height) for x in range(width)
+    ])
+    image.save(path)
+    return path
+
+
+def test_image_dhash_is_stable_and_reports_dimensions(tmp_path):
+    path = _photo(str(tmp_path / "a.png"), size=(120, 90))
+
+    bits, width, height = image_dhash(path)
+
+    assert (width, height) == (120, 90)
+    assert image_dhash(path)[0] == bits          # deterministic
+    assert 0 <= bits < 2 ** IMAGE_HASH_BITS
+
+
+def test_image_dhash_returns_none_for_a_non_image(tmp_path):
+    path = str(tmp_path / "notes.txt")
+    _write_bytes(path, b"this is not a picture")
+
+    assert image_dhash(path) is None
+
+
+def test_image_dhash_returns_none_for_a_perfectly_flat_image(tmp_path):
+    """A solid-colour image has no gradient for dHash to describe either --
+    it is treated as unfingerprintable, the same as an unreadable file,
+    rather than silently hashing to the same all-zero value every other
+    flat image gets."""
+    path = str(tmp_path / "solid.png")
+    Image.new("RGB", (240, 180), (128, 64, 200)).save(path)
+
+    assert image_dhash(path) is None
+
+
+def test_find_duplicate_images_does_not_group_two_different_flat_images(tmp_path):
+    """Regression: two unrelated solid-colour images (a white scan, a black
+    one) must never be proposed as a duplicate pair. Without the flat-image
+    guard in `image_dhash`, both hash to the same all-zero value and this
+    scan would report a false 100% match -- the exact aHash failure mode
+    dHash was chosen to avoid, which turns out to need an explicit guard
+    rather than being automatic."""
+    Image.new("RGB", (240, 180), (255, 255, 255)).save(tmp_path / "white.png")
+    Image.new("RGB", (240, 180), (0, 0, 0)).save(tmp_path / "black.png")
+
+    groups, skipped = find_duplicate_images([str(tmp_path)])
+
+    assert groups == []
+    assert skipped == 2  # both flat images counted as unfingerprintable
+
+
+def test_image_dhash_survives_a_resave_and_a_resize(tmp_path):
+    original = _photo(str(tmp_path / "original.png"), size=(240, 180))
+    with Image.open(original) as im:
+        im.resize((120, 90), Image.Resampling.LANCZOS).save(tmp_path / "small.png")
+
+    a = image_dhash(original)[0]
+    b = image_dhash(str(tmp_path / "small.png"))[0]
+
+    assert hamming_distance(a, b) <= IMAGE_HASH_MAX_DISTANCE
+
+
+def test_image_dhash_separates_different_pictures(tmp_path):
+    a = image_dhash(_photo(str(tmp_path / "a.png"), seed=1))[0]
+    b = image_dhash(_photo(str(tmp_path / "b.png"), seed=9))[0]
+
+    assert hamming_distance(a, b) > IMAGE_HASH_MAX_DISTANCE
+
+
+def test_similarity_percent_reads_as_a_badge():
+    assert similarity_percent(0) == 100
+    assert similarity_percent(IMAGE_HASH_BITS) == 0
+    assert similarity_percent(IMAGE_HASH_MAX_DISTANCE) == 92
+
+
+def test_find_duplicate_images_groups_a_resized_copy_and_keeps_the_bigger(tmp_path):
+    big = _photo(str(tmp_path / "holiday.png"), size=(240, 180))
+    small = str(tmp_path / "copies" / "holiday-small.png")
+    os.makedirs(os.path.dirname(small), exist_ok=True)
+    with Image.open(big) as im:
+        im.resize((120, 90), Image.Resampling.LANCZOS).save(small)
+
+    groups, _ = find_duplicate_images([str(tmp_path)])
+
+    assert len(groups) == 1
+    # Highest resolution is kept; the downscaled copy is what gets removed.
+    assert groups[0].keep[0] == big
+    assert [p for p, _ in groups[0].duplicates] == [small]
+    assert groups[0].similarity >= 92
+
+
+def test_find_duplicate_images_leaves_different_pictures_alone(tmp_path):
+    _photo(str(tmp_path / "a.png"), seed=1)
+    _photo(str(tmp_path / "b.png"), seed=9)
+
+    assert find_duplicate_images([str(tmp_path)])[0] == []
+
+
+def test_find_duplicate_images_ignores_non_image_files(tmp_path):
+    _write_bytes(str(tmp_path / "one.txt"), b"same")
+    _write_bytes(str(tmp_path / "two.txt"), b"same")
+
+    groups, skipped = find_duplicate_images([str(tmp_path)])
+
+    # Byte-identical, but not images -- that is Files mode's job, not this one.
+    assert groups == []
+    assert skipped == 0
+
+
+def test_find_duplicate_images_reports_progress_and_aborts(tmp_path):
+    _photo(str(tmp_path / "a.png"))
+    _photo(str(tmp_path / "b.png"), seed=4)
+    seen = []
+
+    find_duplicate_images([str(tmp_path)],
+                          on_progress=lambda d, t: seen.append((d, t)))
+
+    assert seen == [(1, 2), (2, 2)]
+    assert find_duplicate_images([str(tmp_path)], should_abort=lambda: True)[0] == []

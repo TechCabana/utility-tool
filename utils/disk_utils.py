@@ -1,6 +1,7 @@
 # utils/disk_utils.py
 """Disk inspection helpers for the Disk tab: byte formatting, a
-per-top-level-folder size breakdown, and the Cleanup quick scan.
+per-top-level-folder size breakdown, the Cleanup quick scan, and the
+duplicate-file / duplicate-image scans that share Cleanup's screen.
 
 Qt-free by design (CLAUDE.md §3/§8) -- these take plain paths in and return
 plain values out. `tabs/disk_tab.py` runs `top_level_breakdown` and
@@ -13,10 +14,15 @@ wrapped here either: `utils/file_utils.delete_file()` already sends a path to
 the Recycle Bin via send2trash, and Cleanup reuses it.
 """
 import ctypes
+import hashlib
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+from PIL import Image
+
+from utils.image_utils import SUPPORTED_SUFFIXES
 
 _UNITS = ("B", "KB", "MB", "GB", "TB", "PB")
 
@@ -594,3 +600,315 @@ def cleanup_scan(home: Optional[str] = None,
         note="These reclaim no space; they are listed because they are clutter.",
     ))
     return results
+
+
+# ===========================================================================
+# Duplicates
+# ===========================================================================
+#
+# Two modes, per PRODUCT.md's "files: exact match; images: visual-similarity
+# match with a confidence badge". Both return the same `DuplicateGroup` shape
+# so the Disk tab renders them with one widget:
+#
+#   Files  -- identical bytes, decided by SHA-256. One file per group is kept
+#             (the oldest), the rest are offered for the Recycle Bin.
+#   Images -- visually similar, decided by a difference hash. The highest
+#             resolution file is kept, and the group carries a similarity %.
+#
+# Everything here is plain functions over plain paths (CLAUDE.md §3/§8);
+# `tabs/disk_tab.py` runs them from a QThread and renders what comes back.
+
+HASH_CHUNK_BYTES = 1024 * 1024   # read big files a MB at a time, never whole
+IMAGE_HASH_SIDE = 8              # 8x8 comparisons -> 64 bits
+IMAGE_HASH_BITS = IMAGE_HASH_SIDE * IMAGE_HASH_SIDE
+# 5 differing bits out of 64 is ~92% similar. Tight enough that two different
+# photographs of the same scene stay apart, loose enough that a resave, a
+# resize or a recompression of one picture still lands in its own group.
+IMAGE_HASH_MAX_DISTANCE = 5
+
+
+@dataclass
+class DuplicateGroup:
+    """One set of duplicate files: the one being kept, and the copies.
+
+    `keep` and each entry of `duplicates` are the same `(path, size_bytes)`
+    pair the Cleanup categories use, so the Recycle Bin worker takes either
+    without a second code path.
+
+    `similarity` is the percentage the *least* similar copy matches `keep` --
+    always 100 in Files mode, where the match is byte-exact. Which file is
+    kept is not user-configurable yet; that is a deliberate follow-up, not an
+    oversight (see `_exact_group` / `_image_group` for the rules applied).
+    """
+    keep: Tuple[str, int]
+    duplicates: List[Tuple[str, int]] = field(default_factory=list)
+    similarity: int = 100
+
+    @property
+    def size(self) -> int:
+        """Bytes reclaimed if every copy in this group is removed."""
+        return sum(size for _, size in self.duplicates)
+
+
+def file_sha256(path: str, chunk_bytes: int = HASH_CHUNK_BYTES) -> str:
+    """The SHA-256 of a file's contents, read in chunks.
+
+    Chunked because "large & old files" in this app means 100 MB and up, and
+    a duplicate scan that read a 4 GB video into memory to hash it would take
+    the app down instead of finding the duplicate.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_bytes), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _mtime(path: str) -> float:
+    """Modification time, or 0.0 for a file that cannot be stat'd.
+
+    A file that vanished between the walk and the sort must not abort the
+    scan; treating it as maximally old only affects which copy is proposed
+    for keeping, and the user confirms that anyway.
+    """
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _exact_group(paths: Sequence[str], size: int) -> DuplicateGroup:
+    """Build a group from byte-identical paths, keeping the oldest.
+
+    Oldest by `st_mtime`: the copies are identical, so the only thing telling
+    them apart is which one has been sitting there since the original was
+    made. Ties break on the normalised path so the same folder always yields
+    the same answer -- a scan that proposed a different keeper each run would
+    be impossible to trust.
+    """
+    ordered = sorted(paths, key=lambda p: (_mtime(p), os.path.normcase(p)))
+    return DuplicateGroup(
+        keep=(ordered[0], size),
+        duplicates=[(p, size) for p in ordered[1:]],
+    )
+
+
+def find_duplicate_files(roots: Sequence[str],
+                         should_abort: Optional[Callable[[], bool]] = None,
+                         on_progress: Optional[Callable[[int, int], None]] = None
+                         ) -> Tuple[List[DuplicateGroup], int]:
+    """Exact-duplicate groups under `roots`, largest reclaimable first.
+
+    Two passes, because hashing everything would be the slow way round: files
+    are grouped by size first (free -- the walk already stat'd them), and only
+    sizes shared by more than one file are hashed. Files of a unique size
+    cannot possibly be byte-identical to anything, so they are never read.
+
+    Zero-byte files are skipped entirely. Every empty file is byte-identical
+    to every other one, so including them would produce a single enormous
+    "duplicate" group that reclaims nothing.
+
+    `on_progress(done, total)` counts hashed files, not walked ones -- that is
+    the part that takes the time. `should_abort()` is polled between files and
+    returns the groups completed so far, same contract as `cleanup_scan`.
+    """
+    files, skipped = find_files(roots, min_size=1, should_abort=should_abort)
+
+    by_size: Dict[int, List[str]] = {}
+    for path, size in files:
+        by_size.setdefault(size, []).append(path)
+    candidates = [(size, paths) for size, paths in by_size.items() if len(paths) > 1]
+
+    total = sum(len(paths) for _, paths in candidates)
+    done = 0
+    groups: List[DuplicateGroup] = []
+    for size, paths in candidates:
+        by_hash: Dict[str, List[str]] = {}
+        for path in paths:
+            if should_abort is not None and should_abort():
+                return groups, skipped
+            done += 1
+            if on_progress is not None:
+                on_progress(done, total)
+            try:
+                by_hash.setdefault(file_sha256(path), []).append(path)
+            except OSError:
+                # Locked or vanished between the walk and the read. Counted,
+                # never raised -- one unreadable file must not lose the scan.
+                skipped += 1
+        for same in by_hash.values():
+            if len(same) > 1:
+                groups.append(_exact_group(same, size))
+
+    groups.sort(key=lambda group: group.size, reverse=True)
+    return groups, skipped
+
+
+def image_dhash(path: str, side: int = IMAGE_HASH_SIDE
+                ) -> Optional[Tuple[int, int, int]]:
+    """`(hash_bits, width, height)` for an image, or None if it can't be
+    fingerprinted (unreadable, or genuinely flat -- see below).
+
+    Difference hash: reduce to `(side + 1) x side` greyscale pixels and set one
+    bit per pixel for "brighter than the pixel to its right". The result
+    describes the picture's gradient structure, so a resave, a resize or a
+    recompression of the same photograph produces nearly the same bits while
+    its actual bytes are completely different.
+
+    dHash rather than the average hash (aHash) the brief also allowed, at the
+    same code size: aHash compares each pixel to the frame's mean, so a
+    near-flat image (a photo of an overcast sky, a mostly-white document scan)
+    hashes to all, or nearly all, zeros regardless of its actual content --
+    dHash's neighbour comparison is far less prone to that. It is not immune
+    to it, though: a *perfectly* flat image (every pixel the same value, no
+    gradient at all -- solid-colour icon art, a blank scan, a corrupt export)
+    has no "brighter than" edges either way, so it still hashes to all zeros
+    under dHash too. Verified directly: a solid white PNG and a solid black
+    PNG produce the identical zero hash here, exactly the collision aHash was
+    rejected for. That case is guarded below rather than left to the grouping
+    step, since a false "100% match" between two unrelated flat images is
+    exactly the kind of thing this scan must not propose for deletion.
+
+    Pillow only, deliberately: no `imagehash`, no numpy, no OpenCV. The whole
+    technique is the twelve lines below.
+    """
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+            small = image.convert("L").resize(
+                (side + 1, side), Image.Resampling.LANCZOS)
+    except (OSError, ValueError):
+        return None  # not an image, truncated, or an unsupported variant
+
+    low, high = small.getextrema()
+    if low == high:
+        # Perfectly flat: no gradient for dHash to describe, so any hash it
+        # produced would collide with every other flat image regardless of
+        # colour. Treated the same as an unreadable image -- the caller
+        # counts it as skipped rather than folding it into a group it cannot
+        # meaningfully belong to.
+        return None
+
+    pixels = list(small.getdata())
+    bits = 0
+    index = 0
+    for row in range(side):
+        base = row * (side + 1)
+        for column in range(side):
+            if pixels[base + column] > pixels[base + column + 1]:
+                bits |= 1 << index
+            index += 1
+    return bits, width, height
+
+
+def hamming_distance(left: int, right: int) -> int:
+    """How many bits differ between two hashes."""
+    return bin(left ^ right).count("1")
+
+
+def similarity_percent(distance: int, bits: int = IMAGE_HASH_BITS) -> int:
+    """A Hamming distance rendered as the similarity badge's percentage."""
+    return int(round(100 * (1 - distance / bits)))
+
+
+def _image_group(entries: Sequence[Tuple[str, int, int, int]]) -> DuplicateGroup:
+    """Build a group from similar images, keeping the highest resolution one.
+
+    `entries` are `(path, size_bytes, hash_bits, pixel_count)`.
+
+    Resolution, not a sharpness measure. Between two copies of one picture the
+    larger one is the one that has not been downscaled, and pixel count comes
+    free from the header Pillow already read. A real sharpness score (the
+    variance of a Laplacian, say) means a per-pixel convolution over full-size
+    images in pure Python, or OpenCV/numpy as a new dependency -- a lot of
+    cost to re-rank copies that resolution has usually already ordered
+    correctly. Ties break on file size (less recompression), then on age, then
+    on path, so the proposed keeper is stable across runs.
+
+    The similarity carried by the group is the *worst* match against the kept
+    file, so the badge never overstates how alike the set is.
+    """
+    ordered = sorted(entries,
+                     key=lambda e: (-e[3], -e[1], _mtime(e[0]), os.path.normcase(e[0])))
+    keep = ordered[0]
+    copies = ordered[1:]
+    worst = min(similarity_percent(hamming_distance(keep[2], other[2]))
+                for other in copies)
+    return DuplicateGroup(
+        keep=(keep[0], keep[1]),
+        duplicates=[(other[0], other[1]) for other in copies],
+        similarity=worst,
+    )
+
+
+def find_duplicate_images(roots: Sequence[str],
+                          max_distance: int = IMAGE_HASH_MAX_DISTANCE,
+                          should_abort: Optional[Callable[[], bool]] = None,
+                          on_progress: Optional[Callable[[int, int], None]] = None
+                          ) -> Tuple[List[DuplicateGroup], int]:
+    """Visually-similar image groups under `roots`, largest reclaimable first.
+
+    Only files with an extension in `image_utils.SUPPORTED_SUFFIXES` are
+    fingerprinted -- the same set Image Tools accepts, so the two screens
+    agree on what an image is.
+
+    Unlike the exact scan there is no size prefilter to lean on: two versions
+    of one picture are different sizes, which is the point, so every image has
+    to be opened. That is what `on_progress` is for.
+
+    ponytail: grouping is an O(n^2) pairwise compare of the fingerprints, and
+    greedy -- the first image of a group seeds it and claims every image
+    within `max_distance`. Fine for the thousands of images a Downloads /
+    Documents / Desktop scan turns up (the hashes are plain ints and the
+    compare is a popcount). If it ever has to handle a whole photo library,
+    the upgrade is BK-tree or multi-index hashing over the same hashes, not a
+    different fingerprint.
+    """
+    files, skipped = find_files(roots, suffixes=SUPPORTED_SUFFIXES, min_size=1,
+                                should_abort=should_abort)
+
+    fingerprints: List[Tuple[str, int, int, int]] = []
+    total = len(files)
+    for done, (path, size) in enumerate(files, 1):
+        if should_abort is not None and should_abort():
+            return [], skipped
+        if on_progress is not None:
+            on_progress(done, total)
+        hashed = image_dhash(path)
+        if hashed is None:
+            skipped += 1
+            continue
+        bits, width, height = hashed
+        fingerprints.append((path, size, bits, width * height))
+
+    groups: List[DuplicateGroup] = []
+    claimed = set()
+    for index, seed in enumerate(fingerprints):
+        if index in claimed:
+            continue
+        members = [seed]
+        for other_index in range(index + 1, len(fingerprints)):
+            if other_index in claimed:
+                continue
+            other = fingerprints[other_index]
+            if hamming_distance(seed[2], other[2]) <= max_distance:
+                claimed.add(other_index)
+                members.append(other)
+        if len(members) > 1:
+            claimed.add(index)
+            groups.append(_image_group(members))
+
+    groups.sort(key=lambda group: group.size, reverse=True)
+    return groups, skipped
+
+
+def duplicate_roots(home: Optional[str] = None) -> List[str]:
+    """The folders both duplicate scans look in: Downloads, Documents, Desktop.
+
+    Deliberately the same three roots as the "Large & old files" category
+    rather than a new set. They are the user's own working folders, so a
+    duplicate found there is a file they actually put there twice -- whereas
+    scanning AppData or %TEMP% would report caches that are meant to hold
+    identical copies and are not the user's to reason about.
+    """
+    return _present(cleanup_roots(home), "downloads", "documents", "desktop")
