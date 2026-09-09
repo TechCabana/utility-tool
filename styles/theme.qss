@@ -1,4 +1,4 @@
-/* ===== Soft Rose - Utility Tool =====
+/* ===== Soft Rose - UtilityTool =====
  *
  * The app's single theme. See DESIGN.md for the token table this implements.
  *
@@ -12,6 +12,10 @@
  *   text           #18181b            primary
  *   text-muted     #52525b            secondary
  *   text-faint     #71717a            tertiary, hints, metadata
+ *   text-disabled  #a1a1aa            disabled controls ONLY -- deliberately
+ *                                     below the 4.5:1 body-text floor, and
+ *                                     exempt from it (WCAG 1.4.3). Never use
+ *                                     it for text the user has to read.
  *   accent         #a8354e            interaction only - focus, active nav,
  *                                     primary button, progress fill
  *   accent-hover   #bd3c58            accent, lifted
@@ -93,6 +97,22 @@ QMainWindow {
     border: none;
 }
 
+/* Keyboard focus on the sidebar. A ring rather than the hover fill on
+   purpose: Qt hands focus to the first nav button the moment the window
+   opens, so a fill would leave the app looking as if something were hovered
+   before the user has touched anything. The padding drops by 1px to absorb
+   the border, so focusing a button never nudges the nav. */
+#Sidebar QPushButton:focus {
+    border: 1px solid #a8354e;
+    padding: 11px 15px;
+}
+
+#Sidebar QPushButton:checked:focus {
+    background-color: #8e2c42;
+    border: 1px solid #8e2c42;
+    color: #ffffff;
+}
+
 /* ===== Cards & Panels ===== */
 QFrame#Card {
     background-color: #ffffff;
@@ -141,6 +161,34 @@ QLabel#FormLabel {
 
 QLabel#Hint {
     color: #71717a;
+}
+
+/* Group heading inside a panel -- section_header() in widgets/common.py.
+   A long form is grouped with these plus spacing, never with a bordered box
+   per group (a card inside #Card is a card within a card).
+
+   The margins are deliberately asymmetric: more space above a heading than
+   below it, so the heading reads as belonging to the fields under it rather
+   than floating between two groups. Do not even them out. */
+QLabel#SectionHeader {
+    font-size: 12px;
+    font-weight: 600;
+    color: #52525b;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    border-bottom: 1px solid rgba(24, 24, 27, 0.08);
+    padding-bottom: 6px;
+    margin: 16px 0px 4px 0px;
+}
+
+/* Hairline between repeated rows in a list -- divider() in
+   widgets/common.py. Fainter than --border: it separates rows of one table,
+   where the panel outline separates the table from the page. */
+QFrame#Divider {
+    background: rgba(24, 24, 27, 0.07);
+    border: none;
+    min-height: 1px;
+    max-height: 1px;
 }
 
 /* Small bordered status tag -- Duplicates' KEEP marker and its similarity
@@ -343,6 +391,10 @@ QSlider::handle:horizontal:hover {
     background: #a8354e;
 }
 
+QSlider::handle:horizontal:focus {
+    background: #a8354e;
+}
+
 /* ===== Checkboxes ===== */
 QCheckBox {
     background: transparent;
@@ -373,6 +425,36 @@ QCheckBox::indicator:checked:hover {
     border-color: #bd3c58;
 }
 
+/* The pseudo-state goes on the subcontrol, not on the widget:
+   `QCheckBox:focus::indicator` is silently ignored by Qt -- it applies no
+   rule and raises no error, so the checkbox simply keeps looking unfocused.
+   Verified by rendering the widget focused and unfocused and comparing the
+   pixels, which is the only thing that distinguishes a working selector from
+   a typo here. Same reason the slider handle's rule above is written
+   `::handle:horizontal:focus`. */
+QCheckBox::indicator:focus {
+    border: 2px solid #a8354e;
+}
+
+/* A checked box is already accent-filled with an accent border, so the ring
+   above would vanish on it -- it takes the darker pressed shade instead, the
+   same trick #Primary:focus uses. */
+QCheckBox::indicator:checked:focus {
+    border: 2px solid #8e2c42;
+}
+
+/* A disabled category checkbox (Cleanup: "nothing found", or the Recycle Bin
+   row, which is reported but not cleanable) looked identical to a live one
+   before this -- the row read as clickable and did nothing. */
+QCheckBox:disabled {
+    color: #a1a1aa;
+}
+
+QCheckBox::indicator:disabled {
+    background-color: #f0f0f1;
+    border-color: rgba(24, 24, 27, 0.08);
+}
+
 /* ===== Buttons ===== */
 QPushButton {
     background-color: #ffffff;
@@ -392,6 +474,18 @@ QPushButton:hover {
 
 QPushButton:pressed {
     background-color: #e4e4e7;
+}
+
+/* Keyboard focus. Qt stops drawing its own focus rectangle once a widget is
+   styled by QSS, so without these rules a Tab-only user has no idea where
+   they are -- every button looked identical focused and unfocused. QSS has
+   no outline or box-shadow, so the ring is the border, held at 1px so
+   focusing something never nudges the layout. The accent-filled buttons
+   below take their pressed shade instead, since an accent border on an
+   accent fill is invisible. */
+QPushButton:focus {
+    border-color: #a8354e;
+    background-color: rgba(168, 53, 78, 0.06);
 }
 
 QPushButton:disabled {
@@ -414,6 +508,11 @@ QPushButton#Primary:hover {
 }
 
 QPushButton#Primary:pressed {
+    background-color: #8e2c42;
+    border-color: #8e2c42;
+}
+
+QPushButton#Primary:focus {
     background-color: #8e2c42;
     border-color: #8e2c42;
 }
@@ -442,8 +541,18 @@ QPushButton#Secondary:pressed {
     background-color: rgba(168, 53, 78, 0.12);
 }
 
+QPushButton#Secondary:focus {
+    border-color: #a8354e;
+    color: #a8354e;
+    background-color: rgba(168, 53, 78, 0.06);
+}
+
+/* A #Secondary button has no fill, so its disabled state has only the text
+   and border to carry -- at #71717a it was near-indistinguishable from the
+   enabled #52525b, and Cleanup's "Show files" on an empty category read as
+   pressable. */
 QPushButton#Secondary:disabled {
-    color: #71717a;
+    color: #a1a1aa;
     border-color: rgba(24, 24, 27, 0.08);
     background-color: transparent;
 }
@@ -465,6 +574,11 @@ QPushButton#Danger:hover {
 }
 
 QPushButton#Danger:pressed {
+    background-color: #a83229;
+    border-color: #a83229;
+}
+
+QPushButton#Danger:focus {
     background-color: #a83229;
     border-color: #a83229;
 }

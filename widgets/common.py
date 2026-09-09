@@ -16,8 +16,82 @@ accent), #H2/#Hint for text. No inline stylesheets here beyond the drop
 shadow, which QSS cannot express (see apply_card_shadows() in main.py --
 this dialog applies the same effect itself since it is created ad hoc,
 outside the widget tree main.py walks at startup).
+
+It also holds the app's form-grouping vocabulary -- the spacing scale plus
+section_header()/divider()/form_layout()/field_pair(). Those exist because
+Image Tools and File Tools each grew to a dozen-plus fields in one flat
+list, which reads as a settings dump rather than a form; a screen splits
+that list into labelled groups instead of leaving it flat, and never by
+giving each group its own bordered card inside the screen's card.
 """
 from PySide6 import QtWidgets, QtCore, QtGui
+
+# The app's vertical spacing scale, in px. Two values, deliberately: fields
+# inside one group sit close together, and top-level blocks on a page get
+# noticeably more air. The third gap -- the one between two groups -- is not
+# here because it belongs to #SectionHeader's own margins in theme.qss, which
+# are asymmetric (more space above a heading than below it) so a heading binds
+# to the fields it introduces rather than to the group that just ended.
+SPACE_FIELD = 10
+SPACE_BLOCK = 16
+
+
+def section_header(text: str) -> QtWidgets.QLabel:
+    """A heading for one group of fields inside a panel.
+
+    Grouping a long form is spacing and a labelled hairline, not a card per
+    group: a bordered box inside #Card is a card within a card, which reads
+    as clutter and flattens the surface hierarchy the shadow already
+    establishes. All of the look -- size, weight, tracking, rule and the
+    asymmetric margins -- lives in #SectionHeader in styles/theme.qss.
+    """
+    label = QtWidgets.QLabel(text)
+    label.setObjectName("SectionHeader")
+    return label
+
+
+def divider() -> QtWidgets.QFrame:
+    """A hairline between repeated rows in a list (Cleanup's categories).
+
+    A QFrame rather than a styled plain QWidget on purpose: QSS paints a
+    background and a border on a QFrame without further ceremony, where a
+    bare QWidget subclass needs WA_StyledBackground before it paints either.
+    """
+    line = QtWidgets.QFrame()
+    line.setObjectName("Divider")
+    return line
+
+
+def form_layout() -> QtWidgets.QFormLayout:
+    """A label/field form for one group, on the app's spacing scale."""
+    form = QtWidgets.QFormLayout()
+    form.setContentsMargins(0, 0, 0, 0)
+    form.setVerticalSpacing(SPACE_FIELD)
+    form.setHorizontalSpacing(12)
+    form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+    form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+    return form
+
+
+def field_pair(first, label: str, second) -> QtWidgets.QWidget:
+    """Two short fields sharing one form row, the second carrying its label.
+
+    Several of this app's fields are a two-digit spin box or a four-item
+    enum. One per row turns a form into a tall column of mostly empty space,
+    which is most of why these screens read as cramped -- the rows were
+    close together *and* there were twice as many as the content needed.
+    """
+    host = QtWidgets.QWidget()
+    # Plain container inside a #Card: the base QWidget rule in the theme
+    # would otherwise paint the page ground over the card's surface.
+    host.setObjectName("CardBody")
+    h = QtWidgets.QHBoxLayout(host)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(10)
+    h.addWidget(first, 1)
+    h.addWidget(QtWidgets.QLabel(label))
+    h.addWidget(second, 1)
+    return host
 
 
 class ConfirmDialog(QtWidgets.QDialog):

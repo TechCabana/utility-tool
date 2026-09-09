@@ -5,7 +5,9 @@ from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
 from utils.file_utils import build_new_name, apply_renames, move_file, copy_file, delete_file
 from utils.presets import add_file_preset, get_file_presets, load_all
-from widgets.common import ConfirmDialog
+from widgets.common import (
+    ConfirmDialog, SPACE_BLOCK, SPACE_FIELD, field_pair, form_layout, section_header,
+)
 
 # Conflict-policy combo text -> the internal codes utils/file_utils.py
 # understands. "Ask" is not in this map -- it is resolved to one of the
@@ -108,7 +110,7 @@ class FileTab(QtWidgets.QWidget):
         self.setAcceptDrops(True)  # entire tab accepts drops
 
         v = QtWidgets.QVBoxLayout(self)
-        v.setSpacing(10)
+        v.setSpacing(SPACE_BLOCK)
 
         # Header
         header = QtWidgets.QLabel("File Tools")
@@ -118,9 +120,14 @@ class FileTab(QtWidgets.QWidget):
         # File list (drop zone)
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        # Bounded, and not the layout's stretch target: the drop zone is where
+        # a batch starts, but the specification form below is where the work
+        # happens, so the spare vertical space belongs to that.
+        self.listw.setMinimumHeight(120)
+        self.listw.setMaximumHeight(160)
         # Drop-zone styling comes from the QSS QListWidget rules, same as the
         # Image Tools list - no inline sheet, which would outrank the theme.
-        v.addWidget(self.listw, 1)
+        v.addWidget(self.listw)
 
         # Overlay placeholder
         self.placeholder = QtWidgets.QLabel("Drag and drop your files to begin", self.listw)
@@ -133,48 +140,82 @@ class FileTab(QtWidgets.QWidget):
             QtWidgets.QListWidget.resizeEvent(self.listw, e)
         )
 
-        # Buttons
+        # Buttons -- natural width, left aligned. Stretched to half the window
+        # each they read as a toolbar rather than as two small actions on the
+        # list above them.
         hb = QtWidgets.QHBoxLayout()
+        hb.setSpacing(8)
         add = QtWidgets.QPushButton("Add Files")
         add.clicked.connect(self.add_files)
         clear = QtWidgets.QPushButton("Clear")
         clear.clicked.connect(self.clear_files)
         hb.addWidget(add)
         hb.addWidget(clear)
+        hb.addStretch(1)
         v.addLayout(hb)
 
-        # Operation picker -- Specification stage, same Add/Specification/
-        # Processing flow as Image Tools (DESIGN.md). Swaps which of the
-        # field groups below are shown; Rename/Move/Copy/Delete all still
-        # run through the one FileWorker + progress/status UI beneath.
-        op_h = QtWidgets.QHBoxLayout()
-        op_h.addWidget(QtWidgets.QLabel("Operation:"))
+        # ----- Specification stage -------------------------------------
+        # Same Add/Specification/Processing flow as Image Tools (DESIGN.md).
+        # Rename alone has nine fields, which as one flat list read as a
+        # settings dump, so they are split into labelled groups by
+        # section_header() and put in a scroll area -- the window is not
+        # always tall enough for the whole form, and before this the rows
+        # were being squeezed until their text clipped.
+        spec_body = QtWidgets.QWidget()
+        spec_body.setObjectName("CardBody")
+        spec_body_v = QtWidgets.QVBoxLayout(spec_body)
+        # Margins so the card's drop shadow has room inside the viewport.
+        spec_body_v.setContentsMargins(2, 2, 2, 8)
+
+        spec_card = QtWidgets.QFrame()
+        spec_card.setObjectName("Card")
+        spec = QtWidgets.QVBoxLayout(spec_card)
+        spec.setSpacing(SPACE_FIELD)
+        spec_body_v.addWidget(spec_card)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(spec_body)
+        v.addWidget(scroll, 1)
+
+        # --- Operation: what runs, and where it writes -----------------
+        # The operation-specific fields are rows of this one form, shown and
+        # hidden by index, rather than a container widget each: that way every
+        # label in the group stays in one aligned column whichever operation is
+        # selected. Each index is read back from the form as its row is added,
+        # so reordering the rows can never leave the constants behind.
+        spec.addWidget(section_header("Operation"))
+        self.op_form = form_layout()
+        spec.addLayout(self.op_form)
+
         self.operation_combo = QtWidgets.QComboBox()
         self.operation_combo.addItems(["Rename", "Move", "Copy", "Delete"])
         self.operation_combo.currentIndexChanged.connect(self._on_operation_changed)
-        op_h.addWidget(self.operation_combo, 1)
-        v.addLayout(op_h)
+        self.op_form.addRow("Operation:", self.operation_combo)
 
-        # Destination chooser -- required for Move/Copy, optional for
-        # Rename (blank = rename in place), hidden for Delete.
-        self.dest_container = QtWidgets.QWidget()
-        dest_h = QtWidgets.QHBoxLayout(self.dest_container)
+        # Destination -- required for Move/Copy, optional for Rename (blank =
+        # rename in place), hidden for Delete.
+        dest_row = QtWidgets.QWidget()
+        dest_row.setObjectName("CardBody")
+        dest_h = QtWidgets.QHBoxLayout(dest_row)
         dest_h.setContentsMargins(0, 0, 0, 0)
+        dest_h.setSpacing(8)
         self.dest_edit = QtWidgets.QLineEdit()
-        dest_btn = QtWidgets.QPushButton("Choose Destination Folder")
+        self.dest_edit.setPlaceholderText("Leave blank to rename in place")
+        dest_btn = QtWidgets.QPushButton("Choose...")
         dest_btn.clicked.connect(self.choose_dest)
-        dest_h.addWidget(self.dest_edit)
+        dest_h.addWidget(self.dest_edit, 1)
         dest_h.addWidget(dest_btn)
-        v.addWidget(self.dest_container)
+        self.op_form.addRow("Destination folder:", dest_row)
+        self._row_destination = self.op_form.rowCount() - 1
 
         # Move/Copy-only: conflict policy.
-        self.conflict_container = QtWidgets.QWidget()
-        conflict_form = QtWidgets.QFormLayout(self.conflict_container)
-        conflict_form.setContentsMargins(0, 0, 0, 0)
         self.conflict_combo = QtWidgets.QComboBox()
         self.conflict_combo.addItems(["Ask", "Keep both", "Skip", "Overwrite"])
-        conflict_form.addRow("If a file already exists:", self.conflict_combo)
-        v.addWidget(self.conflict_container)
+        self.op_form.addRow("If a file already exists:", self.conflict_combo)
+        self._row_conflict = self.op_form.rowCount() - 1
 
         # Delete-only: warning (no extra fields -- confirmation happens on Apply).
         self.delete_warning = QtWidgets.QLabel(
@@ -183,46 +224,81 @@ class FileTab(QtWidgets.QWidget):
         )
         self.delete_warning.setObjectName("Hint")
         self.delete_warning.setWordWrap(True)
-        v.addWidget(self.delete_warning)
+        self.op_form.addRow(self.delete_warning)
+        self._row_delete_warning = self.op_form.rowCount() - 1
 
-        # Rename-only fields, grouped so the whole block shows/hides as one
-        # unit when the operation picker changes.
+        # --- Rename-only groups ----------------------------------------
+        # Both groups live in one container so the whole block shows/hides as
+        # a unit when the operation picker changes.
         self.rename_fields = QtWidgets.QWidget()
-        form = QtWidgets.QFormLayout(self.rename_fields)
-        form.setContentsMargins(0, 0, 0, 0)
+        self.rename_fields.setObjectName("CardBody")
+        rf = QtWidgets.QVBoxLayout(self.rename_fields)
+        rf.setContentsMargins(0, 0, 0, 0)
+        rf.setSpacing(SPACE_FIELD)
+        spec.addWidget(self.rename_fields)
+
+        rf.addWidget(section_header("Naming pattern"))
+        naming = form_layout()
+        rf.addLayout(naming)
 
         # Preset: applies pattern/prefix/suffix/number/regex/case/date fields
         # in one shot.
         self.preset_combo = QtWidgets.QComboBox()
-        form.addRow("Preset:", self.preset_combo)
+        naming.addRow("Preset:", self.preset_combo)
+
+        self.pattern = QtWidgets.QLineEdit("{name}")
+        naming.addRow("Pattern:", self.pattern)
 
         self.prefix = QtWidgets.QLineEdit()
         self.suffix = QtWidgets.QLineEdit()
-        self.pattern = QtWidgets.QLineEdit("{name}")
+        naming.addRow("Prefix:", field_pair(self.prefix, "Suffix:", self.suffix))
+
         self.start = QtWidgets.QSpinBox(); self.start.setRange(0, 1_000_000); self.start.setValue(1)
         self.pad = QtWidgets.QSpinBox(); self.pad.setRange(1, 10); self.pad.setValue(3)
+        naming.addRow("Number start:", field_pair(self.start, "Pad:", self.pad))
+
+        self.date_source = QtWidgets.QComboBox(); self.date_source.addItems(["now", "file_modified"])
+        naming.addRow("Date source:", self.date_source)
+
+        rf.addWidget(section_header("Find & replace"))
+        replace = form_layout()
+        rf.addLayout(replace)
+
         self.regex_find = QtWidgets.QLineEdit()
         self.regex_replace = QtWidgets.QLineEdit()
+        replace.addRow("Regex find:", self.regex_find)
+        replace.addRow("Regex replace:", self.regex_replace)
+
         self.case = QtWidgets.QComboBox(); self.case.addItems(["none", "lower", "upper", "title"])
-        self.date_source = QtWidgets.QComboBox(); self.date_source.addItems(["now", "file_modified"])
-        form.addRow("Prefix:", self.prefix)
-        form.addRow("Suffix:", self.suffix)
-        form.addRow("Pattern:", self.pattern)
-        form.addRow("Number start:", self.start)
-        form.addRow("Number pad:", self.pad)
-        form.addRow("Regex find:", self.regex_find)
-        form.addRow("Regex replace:", self.regex_replace)
-        form.addRow("Case:", self.case)
-        form.addRow("Date source:", self.date_source)
-        v.addWidget(self.rename_fields)
+        replace.addRow("Case:", self.case)
 
-        # Preview
-        v.addWidget(QtWidgets.QLabel("Preview:"))
+        # --- Preview: the last group of the specification ---------------
+        # In the scroll area with the fields, not in the footer: it is the
+        # result of the settings above it, and pinning it cost the form the
+        # vertical space it actually needed. The run controls below stay
+        # pinned, which is the part that has to be reachable at any scroll
+        # position.
+        spec.addWidget(section_header("Preview"))
         self.preview = QtWidgets.QTextEdit(); self.preview.setReadOnly(True)
-        v.addWidget(self.preview, 1)
+        # Capped: a QTextEdit's own size hint is generous, and left uncapped
+        # an empty box took a third of the page.
+        self.preview.setMinimumHeight(80)
+        self.preview.setMaximumHeight(140)
+        spec.addWidget(self.preview)
+        # Surplus height goes to the bottom of the card. Without this the
+        # layout hands it to whichever children can grow, which on a tall
+        # window meant the section headings stretching and their underlines
+        # drifting away from the text they belong to.
+        spec.addStretch(1)
 
-        # Run buttons (Processing stage)
+        # ----- Processing (footer) --------------------------------------
+        footer = QtWidgets.QFrame()
+        footer.setObjectName("Card")
+        fv = QtWidgets.QVBoxLayout(footer)
+        fv.setSpacing(SPACE_FIELD)
+
         run_h = QtWidgets.QHBoxLayout()
+        run_h.setSpacing(8)
         self.preview_btn = QtWidgets.QPushButton("Generate Preview")
         self.apply_btn = QtWidgets.QPushButton("Apply Rename")
         self.save_preset_btn = QtWidgets.QPushButton("Save Preset")
@@ -230,8 +306,10 @@ class FileTab(QtWidgets.QWidget):
         run_h.addWidget(self.preview_btn)
         run_h.addWidget(self.apply_btn)
         run_h.addWidget(self.save_preset_btn)
-        run_h.addWidget(self.progress)
-        v.addLayout(run_h)
+        run_h.addSpacing(8)
+        run_h.addWidget(self.progress, 1)
+        fv.addLayout(run_h)
+        v.addWidget(footer)
 
         # Signals
         self.preview_btn.clicked.connect(self.update_preview)
@@ -287,9 +365,9 @@ class FileTab(QtWidgets.QWidget):
         the Apply button's label/style change."""
         op = self.operation_combo.currentText()
         self.rename_fields.setVisible(op == "Rename")
-        self.conflict_container.setVisible(op in ("Move", "Copy"))
-        self.delete_warning.setVisible(op == "Delete")
-        self.dest_container.setVisible(op != "Delete")
+        self.op_form.setRowVisible(self._row_destination, op != "Delete")
+        self.op_form.setRowVisible(self._row_conflict, op in ("Move", "Copy"))
+        self.op_form.setRowVisible(self._row_delete_warning, op == "Delete")
 
         self.apply_btn.setText({
             "Rename": "Apply Rename",
@@ -299,8 +377,10 @@ class FileTab(QtWidgets.QWidget):
         }[op])
         # The one #Danger button hook (widgets/common.py's ConfirmDialog
         # confirm button reuses it too) so Delete reads distinctly from the
-        # app's rose interaction accent; every other operation stays plain.
-        self.apply_btn.setObjectName("Danger" if op == "Delete" else "")
+        # app's rose interaction accent. Everything else is #Primary: the
+        # screen's one accent-filled surface should be the action it exists
+        # to perform, not nothing at all (DESIGN.md, Materials & Components).
+        self.apply_btn.setObjectName("Danger" if op == "Delete" else "Primary")
         self.apply_btn.style().unpolish(self.apply_btn)
         self.apply_btn.style().polish(self.apply_btn)
 
