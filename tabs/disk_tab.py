@@ -1603,10 +1603,27 @@ class DiskTab(QtWidgets.QWidget):
             confirm_text="Remove job",
         ):
             return
-        backup_utils.unregister_task(job["id"])
+        task_ok, task_detail = backup_utils.unregister_task(job["id"])
         backup_utils.remove_job(job["id"])
         self._changes.pop(job["id"], None)
-        self._say(f"Removed job \"{job.get('name')}\" and its scheduled task.")
+        name = job.get("name")
+        if job.get("schedule") == "manual":
+            # A manual job never had a scheduled task to begin with, so
+            # unregister_task's result says nothing about a real failure --
+            # don't claim a task was removed that was never registered.
+            self._say(f"Removed job \"{name}\".")
+        elif task_ok:
+            self._say(f"Removed job \"{name}\" and its scheduled task.")
+        else:
+            # unregister_task's own "nothing to remove" case would also
+            # report False, but a scheduled job (checked above) should have
+            # had a task -- surface the failure instead of quietly claiming
+            # removal, so a stray Task Scheduler entry doesn't go unnoticed.
+            self._say(
+                f"Removed job \"{name}\", but its Windows scheduled task "
+                f"could not be removed: {task_detail}. Check Task Scheduler.",
+                ok=False,
+            )
         self.refresh_backup()
 
     def run_backup_job(self, job: dict):
