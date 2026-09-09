@@ -158,6 +158,24 @@ QLabel#Tag {
     letter-spacing: 0.4px;
 }
 
+/* Status text -- the three status tokens, used where a colour carries real
+   meaning and nowhere else (DESIGN.md: "colour as data, never decoration").
+   Backup's Restore column is the first user: a job whose source has drifted
+   since its last backup reads warn, a job whose last run failed reads error,
+   an up-to-date job reads success. Named here rather than written inline at
+   the call site so the tokens stay in this file, as the header requires. */
+QLabel#StatusOk {
+    color: #1f8a5c;
+}
+
+QLabel#StatusWarn {
+    color: #a66a0c;
+}
+
+QLabel#StatusError {
+    color: #c23b32;
+}
+
 QLabel:disabled {
     color: #71717a;
 }

@@ -1,12 +1,14 @@
 # tabs/disk_tab.py
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from PySide6 import QtWidgets, QtCore
+from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
 
+from utils import backup_utils
 from utils.disk_utils import (
     CleanupCategory, DuplicateGroup, cleanup_scan, duplicate_roots,
     find_duplicate_files, find_duplicate_images, human_size,
@@ -424,6 +426,444 @@ class DuplicateGroupSection(QtWidgets.QWidget):
                 if self._checked.get(path)]
 
 
+class BackupWorker(QtCore.QObject):
+    """Runs one long backup-related filesystem call off the UI thread.
+
+    One worker rather than three near-identical ones. Taking a backup,
+    restoring a version and measuring what has changed since the last backup
+    are all "walk and copy through utils/backup_utils, report (done, total),
+    hand back a result dict" -- they differ only in which function is called,
+    so the work is passed in as a callable taking `(on_progress,
+    should_abort)` instead of being three copies of this class.
+
+    Same shape as the scan workers above otherwise: a plain QObject moved onto
+    a QThread, started by `thread.started`, reporting only through signals.
+    Copying a real backup source is minutes of disk I/O, which is exactly the
+    kind of work CLAUDE.md §3 forbids on the UI thread.
+    """
+    progress = QtCore.Signal(int, int)   # done, total
+    finished = QtCore.Signal(dict)       # the result dict from backup_utils
+
+    def __init__(self, work):
+        super().__init__()
+        self.work = work
+        self._abort = False
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            result = self.work(self.progress.emit, lambda: self._abort)
+        except Exception as exc:
+            # backup_utils turns every filesystem failure it expects into an
+            # ok=False result, so reaching here means something genuinely
+            # unforeseen. It still must not take the app down mid-batch.
+            result = {"ok": False, "message": f"Unexpected failure: {exc}"}
+        self.finished.emit(result)
+
+    def abort(self):
+        self._abort = True
+
+
+class BackupJobDialog(QtWidgets.QDialog):
+    """The Add / Edit form for one backup job.
+
+    Source and Target are two separately labelled fields, never one combined
+    "source -> target" string -- a named requirement from DESIGN.md v4 rule 4.
+
+    Validation happens here, on the UI thread, before anything is written:
+    a job pointing at a folder that does not exist would register a scheduled
+    task that fails silently every night, which is worse than refusing to save
+    it. The target-inside-source check is the one non-obvious rule -- backing a
+    folder up into itself grows without limit, each run copying the previous
+    run's copies.
+    """
+
+    def __init__(self, parent, job=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit backup job" if job else "Add backup job")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+        self.job = dict(job) if job else None
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QtWidgets.QFrame()
+        card.setObjectName("Card")
+        outer.addWidget(card)
+
+        v = QtWidgets.QVBoxLayout(card)
+        v.setSpacing(10)
+
+        heading = QtWidgets.QLabel("Edit backup job" if job else "Add backup job")
+        heading.setObjectName("H2")
+        v.addWidget(heading)
+
+        form = QtWidgets.QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignLeft)
+
+        self.name_edit = QtWidgets.QLineEdit((job or {}).get("name", ""))
+        self.name_edit.setPlaceholderText("Documents nightly")
+        form.addRow(self._label("Name"), self.name_edit)
+
+        self.source_edit = QtWidgets.QLineEdit((job or {}).get("source", ""))
+        form.addRow(self._label("Source"),
+                    self._picker(self.source_edit, "Choose the folder to back up"))
+
+        self.target_edit = QtWidgets.QLineEdit((job or {}).get("target", ""))
+        form.addRow(self._label("Target"),
+                    self._picker(self.target_edit, "Choose where backups are stored"))
+
+        self.schedule = QtWidgets.QComboBox()
+        self.schedule.addItems(["Manual only", "Daily", "Weekly (Monday)"])
+        self.schedule.setCurrentIndex(
+            {"manual": 0, "daily": 1, "weekly": 2}.get(
+                (job or {}).get("schedule", "daily"), 1))
+        form.addRow(self._label("Schedule"), self.schedule)
+
+        # A plain masked QLineEdit rather than a QTimeEdit: the QSS styles
+        # QLineEdit and QSpinBox, and a QTimeEdit is neither, so it would be
+        # the one unthemed control on the screen.
+        self.at_edit = QtWidgets.QLineEdit()
+        self.at_edit.setInputMask("99:99")
+        self.at_edit.setText((job or {}).get("at", "20:00"))
+        self.at_edit.setMaximumWidth(90)
+        form.addRow(self._label("Run at"), self.at_edit)
+
+        self.retention = QtWidgets.QSpinBox()
+        self.retention.setRange(1, 50)
+        self.retention.setValue(int((job or {}).get(
+            "retention", backup_utils.DEFAULT_RETENTION)))
+        self.retention.setMaximumWidth(90)
+        form.addRow(self._label("Versions to keep"), self.retention)
+
+        v.addLayout(form)
+
+        hint = QtWidgets.QLabel(
+            "Each run copies the source into a new timestamped folder under "
+            "the target. Older versions beyond the number kept are deleted. A "
+            "scheduled job is registered with Windows Task Scheduler and runs "
+            "without opening this app.")
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        self.error = QtWidgets.QLabel()
+        self.error.setObjectName("StatusError")
+        self.error.setWordWrap(True)
+        self.error.setVisible(False)
+        v.addWidget(self.error)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.setObjectName("Secondary")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        save = QtWidgets.QPushButton("Save job")
+        save.setObjectName("Primary")
+        save.setDefault(True)
+        save.clicked.connect(self.on_save)
+        row.addWidget(save)
+        v.addLayout(row)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(16)
+        shadow.setOffset(0, 2)
+        shadow.setColor(QtGui.QColor(24, 24, 27, 28))
+        card.setGraphicsEffect(shadow)
+
+    def _label(self, text: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setObjectName("FormLabel")
+        return label
+
+    def _picker(self, edit: QtWidgets.QLineEdit, caption: str) -> QtWidgets.QWidget:
+        host = QtWidgets.QWidget()
+        host.setObjectName("CardBody")
+        h = QtWidgets.QHBoxLayout(host)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        h.addWidget(edit, 1)
+        browse = QtWidgets.QPushButton("Browse...")
+        browse.setObjectName("Secondary")
+        browse.clicked.connect(lambda: self._browse(edit, caption))
+        h.addWidget(browse)
+        return host
+
+    def _browse(self, edit: QtWidgets.QLineEdit, caption: str):
+        chosen = QtWidgets.QFileDialog.getExistingDirectory(
+            self, caption, edit.text() or str(Path.home()))
+        if chosen:
+            edit.setText(os.path.normpath(chosen))
+
+    def _fail(self, message: str) -> None:
+        self.error.setText(message)
+        self.error.setVisible(True)
+
+    def on_save(self):
+        name = self.name_edit.text().strip()
+        source = self.source_edit.text().strip()
+        target = self.target_edit.text().strip()
+        at = self.at_edit.text().strip()
+
+        if not name:
+            return self._fail("Give the job a name.")
+        if not os.path.isdir(source):
+            return self._fail("The source folder does not exist.")
+        if not target:
+            return self._fail("Choose a target folder for the backups.")
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", at):
+            return self._fail("Run at must be a 24-hour time, e.g. 20:00.")
+
+        # Backing a folder up into itself copies the previous run's copies on
+        # every run, so the target grows without bound and no error is ever
+        # raised. Compared with normcase/abspath because Windows paths differ
+        # in case and separators without differing at all.
+        source_norm = os.path.normcase(os.path.abspath(source))
+        target_norm = os.path.normcase(os.path.abspath(target))
+        if target_norm == source_norm or target_norm.startswith(source_norm + os.sep):
+            return self._fail("The target cannot be inside the source folder.")
+
+        schedule = ("manual", "daily", "weekly")[self.schedule.currentIndex()]
+        if self.job is None:
+            self.job = backup_utils.new_job(name, source, target, schedule, at,
+                                            self.retention.value())
+        else:
+            self.job.update({"name": name, "source": source, "target": target,
+                             "schedule": schedule, "at": at,
+                             "retention": self.retention.value()})
+        self.accept()
+
+
+# The Backup tables' columns, defined once as (label, stretch, minimum width)
+# and used to build both the header row and every data row. Two copies of a
+# column list drift the moment one of them is edited, and a header whose
+# columns no longer line up with its rows is exactly the complaint DESIGN.md
+# v4 rule 3 was raised about.
+#
+# The minimum widths are what stop a long path from crushing the other columns
+# to a single elided character. Their sum plus the action buttons is wider
+# than the page at the default window size, so the Backup page keeps its
+# horizontal scrollbar -- unlike Cleanup, where the wide content is a wrapping
+# label that should reflow rather than scroll.
+JOB_COLUMNS = (
+    ("Name", 3, 96), ("Source", 4, 104), ("Target", 4, 104),
+    ("Schedule", 3, 92), ("Status", 2, 62), ("Last run", 3, 100),
+)
+JOB_ACTION_WIDTH = 240
+
+RESTORE_COLUMNS = (
+    ("Job", 3, 120), ("Last backup", 3, 120), ("Changes since", 6, 240),
+)
+RESTORE_ACTION_WIDTH = 110
+
+
+def _tail(path: str, segments: int = 2) -> str:
+    """The last few segments of a path, for a narrow table column.
+
+    A backup path is identified by its leaf and its parent, not by the
+    fifteen directories above them, and those are what survive at this column
+    width. The full path is always the row's tooltip.
+    """
+    parts = [part for part in os.path.normpath(path).split(os.sep) if part]
+    if len(parts) <= segments:
+        return path
+    return "..." + os.sep + os.sep.join(parts[-segments:])
+
+
+class ElidedLabel(QtWidgets.QLabel):
+    """A label that shrinks: text too long for its column is elided to fit.
+
+    A word-wrapped QLabel cannot shrink below its longest unbreakable word,
+    and a filesystem path is one unbreakable word. In a full-width label --
+    which is every other place this app shows a path -- that never shows,
+    because the label is wider than any path. In a table column it does: one
+    deep source path sets the minimum width of its own column, which sets the
+    minimum width of the row, the card and the page, and pushes the Schedule,
+    Status and Last-run columns off the right-hand edge of a window whose
+    horizontal scrollbar is deliberately switched off. The result is columns
+    the user cannot reach at all.
+
+    Eliding in the middle keeps both the drive and the leaf visible, which is
+    what identifies a backup path; the whole thing stays one hover away in the
+    tooltip. The text is elided rather than the painting overridden so the
+    label keeps its ordinary QSS styling.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = text
+        self.setMinimumWidth(0)
+        # Ignored: the column's width comes from the layout's stretch factors,
+        # never from how long this particular path happens to be.
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                           QtWidgets.QSizePolicy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str):
+        self._full = text
+        self.setToolTip(text)
+        self._elide()
+
+    def full_text(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self):
+        width = max(0, self.width() - 2)
+        super().setText(self.fontMetrics().elidedText(
+            self._full, Qt.ElideMiddle, width) if width else self._full)
+
+
+class JobRow(QtWidgets.QWidget):
+    """One configured backup job: the six columns plus its three actions.
+
+    Source and Target elide rather than wrap -- see `ElidedLabel` for why a
+    wrapped path breaks this particular layout and no other in the app.
+    """
+    run_requested = QtCore.Signal(dict)
+    edit_requested = QtCore.Signal(dict)
+    remove_requested = QtCore.Signal(dict)
+
+    def __init__(self, job: dict):
+        super().__init__()
+        self.setObjectName("CardBody")
+        self.job = job
+
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(0, 6, 0, 6)
+        h.setSpacing(12)
+
+        status, style = self._status(job)
+        # Elided, not wrapped: a job name is user-supplied, so it can be one
+        # long unbroken string and blow the column out exactly as a path does.
+        cells = [
+            (ElidedLabel(job.get("name", "(unnamed)")), None),
+            (self._path(job.get("source", "")), None),
+            (self._path(job.get("target", "")), None),
+            (self._hint(backup_utils.schedule_label(job)), None),
+            (self._hint(status), style),
+            (self._hint(self._last_run(job)), None),
+        ]
+        for (widget, style_name), (_, stretch, minimum) in zip(cells, JOB_COLUMNS):
+            if style_name:
+                widget.setObjectName(style_name)
+            widget.setMinimumWidth(minimum)
+            h.addWidget(widget, stretch)
+
+        for text, name, signal in (
+            ("Run Now", "Secondary", self.run_requested),
+            ("Edit", "Secondary", self.edit_requested),
+            ("Remove", "Danger", self.remove_requested),
+        ):
+            button = QtWidgets.QPushButton(text)
+            button.setObjectName(name)
+            button.clicked.connect(lambda _=False, s=signal: s.emit(self.job))
+            h.addWidget(button)
+
+    def _text(self, value: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(value)
+        label.setWordWrap(True)
+        return label
+
+    def _hint(self, value: str) -> QtWidgets.QLabel:
+        label = self._text(value)
+        label.setObjectName("Hint")
+        return label
+
+    def _path(self, value: str) -> QtWidgets.QLabel:
+        label = ElidedLabel(_tail(value) if value else "(not set)")
+        label.setObjectName("Hint")
+        # The full path, never the tail -- the column is a glance, the tooltip
+        # is the answer to "which folder exactly".
+        label.setToolTip(value or "(not set)")
+        return label
+
+    def _status(self, job: dict):
+        """The Status column: what the last run did, or that none has run."""
+        result = job.get("last_result", "")
+        if not job.get("last_run"):
+            return "Never run", "Hint"
+        if result.startswith("ok"):
+            return "OK", "StatusOk"
+        return "Failed", "StatusError"
+
+    def _last_run(self, job: dict) -> str:
+        stamp = job.get("last_run", "")
+        if not stamp:
+            return "-"
+        # Stored as an ISO timestamp so it sorts and parses; shown short.
+        return stamp.replace("T", " ")[:16]
+
+
+class RestoreRow(QtWidgets.QWidget):
+    """One job's restore row: last backup, what has changed since, Restore.
+
+    One row per job, never a per-snapshot history -- DESIGN.md v4 rule 5
+    records the owner removing exactly that. Version browsing, if it is ever
+    wanted, is an action off this row rather than a second table.
+    """
+    restore_requested = QtCore.Signal(dict)
+
+    def __init__(self, job: dict, changes: dict):
+        super().__init__()
+        self.setObjectName("CardBody")
+        self.job = job
+
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(0, 6, 0, 6)
+        h.setSpacing(12)
+
+        when = changes.get("when") if changes.get("ok") else None
+        last = QtWidgets.QLabel(when or "Never backed up")
+        last.setObjectName("Hint")
+
+        text, style = self._changes(changes)
+        changed = QtWidgets.QLabel(text)
+        changed.setObjectName(style)
+        changed.setWordWrap(True)
+
+        cells = (ElidedLabel(job.get("name", "(unnamed)")), last, changed)
+        for widget, (_, stretch, minimum) in zip(cells, RESTORE_COLUMNS):
+            widget.setMinimumWidth(minimum)
+            h.addWidget(widget, stretch)
+
+        self.restore_btn = QtWidgets.QPushButton("Restore...")
+        self.restore_btn.setObjectName("Secondary")
+        # Nothing to restore from until a version exists on disk.
+        self.restore_btn.setEnabled(bool(changes.get("ok")))
+        self.restore_btn.clicked.connect(lambda: self.restore_requested.emit(self.job))
+        h.addWidget(self.restore_btn)
+
+    def _changes(self, changes: dict):
+        """The changes-since column, coloured by what it means.
+
+        Green for "nothing has changed", warn for real drift, error for a
+        source or a backup this app could not read -- colour as data, per
+        DESIGN.md, not decoration.
+        """
+        if not changes.get("ok"):
+            message = changes.get("message", "Not measured")
+            return message, ("Hint" if message == "Never backed up"
+                             else "StatusError")
+        count = changes.get("changed", 0)
+        if count == 0:
+            return "Up to date", "StatusOk"
+        parts = []
+        for key, word in (("added", "added"), ("modified", "modified"),
+                          ("removed", "removed")):
+            if changes.get(key):
+                parts.append(f"{changes[key]} {word}")
+        detail = ", ".join(parts)
+        size = human_size(changes.get("bytes", 0))
+        return f"{count} file(s) changed ({detail}) - {size} to copy", "StatusWarn"
+
+
 class BreakdownRow(QtWidgets.QWidget):
     """One folder in the Overview breakdown: name, proportional bar, size.
 
@@ -470,9 +910,10 @@ class BreakdownRow(QtWidgets.QWidget):
 class DiskTab(QtWidgets.QWidget):
     """The Disk pillar: Overview / Cleanup / Backup.
 
-    Overview and Cleanup have real content. Backup is a separate card; its
-    sub-tab carries an EmptyState rather than a half-built screen. Duplicates
-    is a further section inside Cleanup (DESIGN.md v4), not a fourth sub-tab.
+    Duplicates is a section inside Cleanup (DESIGN.md v4), not a fourth
+    sub-tab; Backup carries two tables of its own -- the jobs, and a separate
+    Restore table below them (DESIGN.md v4 rule 5), not a history nested in
+    each job.
     """
 
     # A messy Documents folder can produce hundreds of duplicate groups, and
@@ -504,6 +945,20 @@ class DiskTab(QtWidgets.QWidget):
         # rescan's own result line does not erase what just happened.
         self._dup_notice = ""
 
+        # One backup operation at a time -- taking a backup, restoring a
+        # version and measuring changes all read or write the same trees, and
+        # running two of them together would report against a moving target.
+        self.backup_thread: Optional[QtCore.QThread] = None
+        self.backup_worker: Optional[BackupWorker] = None
+        self.jobs: List[dict] = []
+        self._changes: dict = {}
+        self._backup_loaded = False
+        self._backup_done = None      # the handler for the run in flight
+        self._remeasure = False       # a backup just ran; its drift is stale
+        # Carries a run's result line across the remeasure that follows it,
+        # exactly as `_dup_notice` does for the Duplicates rescan.
+        self._backup_notice = ""
+
         v = QtWidgets.QVBoxLayout(self)
         # Margins leave room for the card drop shadows to render un-clipped
         v.setContentsMargins(8, 8, 8, 8)
@@ -521,15 +976,8 @@ class DiskTab(QtWidgets.QWidget):
         self.sub = QtWidgets.QTabWidget()
         self.sub.addTab(self._build_overview(), "Overview")
         self.sub.addTab(self._build_cleanup(), "Cleanup")
+        self.sub.addTab(self._build_backup(), "Backup")
         self.sub.currentChanged.connect(self.on_sub_changed)
-        self.sub.addTab(
-            EmptyState(
-                title="Backup isn't built yet",
-                hint="Scheduled source-to-target backup jobs and restore "
-                     "land in a later release.",
-            ),
-            "Backup",
-        )
         v.addWidget(self.sub, 1)
 
         # A scan started from __init__ would walk the home directory on every
@@ -897,6 +1345,394 @@ class DiskTab(QtWidgets.QWidget):
         self._update_dup_hint()
         return card
 
+    # ------------------------------
+    # Backup (jobs above, Restore below -- two tables, not one nested one)
+    # ------------------------------
+    def _build_backup(self) -> QtWidgets.QWidget:
+        """The Backup screen: a jobs card, then a separate Restore card.
+
+        Restore is its own table rather than an expandable history inside each
+        job row: managing jobs and getting a file back are two different
+        tasks, and DESIGN.md v4 rule 5 records the owner rejecting the nested
+        snapshot list explicitly.
+        """
+        page = QtWidgets.QWidget()
+        page.setObjectName("CardBody")
+        pv = QtWidgets.QVBoxLayout(page)
+        pv.setContentsMargins(2, 8, 2, 2)
+        pv.setSpacing(12)
+
+        # --- jobs ---------------------------------------------------------
+        jobs_card = QtWidgets.QFrame()
+        jobs_card.setObjectName("Card")
+        jv = QtWidgets.QVBoxLayout(jobs_card)
+        jv.setSpacing(8)
+
+        head = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Backup jobs")
+        title.setObjectName("H2")
+        head.addWidget(title)
+        head.addStretch(1)
+        self.job_add_btn = QtWidgets.QPushButton("Add job")
+        self.job_add_btn.setObjectName("Primary")
+        self.job_add_btn.clicked.connect(self.add_backup_job)
+        head.addWidget(self.job_add_btn)
+        jv.addLayout(head)
+
+        note = QtWidgets.QLabel(
+            "A job copies its source folder into a new timestamped folder "
+            "under its target every time it runs, keeping the most recent "
+            "versions and deleting the rest. Scheduled jobs are handed to "
+            "Windows Task Scheduler and run without this app being open.")
+        note.setObjectName("Hint")
+        note.setWordWrap(True)
+        jv.addWidget(note)
+
+        self.job_header = self._table_header(JOB_COLUMNS, JOB_ACTION_WIDTH)
+        jv.addWidget(self.job_header)
+
+        self.jobs_host = QtWidgets.QWidget()
+        self.jobs_host.setObjectName("CardBody")
+        self.jobs_layout = QtWidgets.QVBoxLayout(self.jobs_host)
+        self.jobs_layout.setContentsMargins(0, 0, 0, 0)
+        self.jobs_layout.setSpacing(2)
+        jv.addWidget(self.jobs_host)
+
+        self.jobs_empty = EmptyState(
+            title="No backup jobs yet",
+            hint="Add a job to copy a folder to another drive on a schedule, "
+                 "keeping the last few versions.",
+        )
+        jv.addWidget(self.jobs_empty)
+
+        self.backup_bar = QtWidgets.QProgressBar()
+        self.backup_bar.setVisible(False)
+        jv.addWidget(self.backup_bar)
+
+        self.backup_status = QtWidgets.QLabel()
+        self.backup_status.setObjectName("Hint")
+        self.backup_status.setWordWrap(True)
+        self.backup_status.setVisible(False)
+        jv.addWidget(self.backup_status)
+
+        pv.addWidget(jobs_card)
+
+        # --- restore ------------------------------------------------------
+        restore_card = QtWidgets.QFrame()
+        restore_card.setObjectName("Card")
+        rv = QtWidgets.QVBoxLayout(restore_card)
+        rv.setSpacing(8)
+
+        rhead = QtWidgets.QHBoxLayout()
+        rtitle = QtWidgets.QLabel("Restore")
+        rtitle.setObjectName("H2")
+        rhead.addWidget(rtitle)
+        rhead.addStretch(1)
+        self.restore_refresh_btn = QtWidgets.QPushButton("Refresh")
+        self.restore_refresh_btn.setObjectName("Secondary")
+        self.restore_refresh_btn.clicked.connect(self.refresh_changes)
+        rhead.addWidget(self.restore_refresh_btn)
+        rv.addLayout(rhead)
+
+        rnote = QtWidgets.QLabel(
+            "One row per job: when it was last backed up, and how much of the "
+            "source has changed since. Restoring copies a stored version into "
+            "a new folder you choose -- it never writes over the live source.")
+        rnote.setObjectName("Hint")
+        rnote.setWordWrap(True)
+        rv.addWidget(rnote)
+
+        self.restore_header = self._table_header(RESTORE_COLUMNS,
+                                                 RESTORE_ACTION_WIDTH)
+        rv.addWidget(self.restore_header)
+
+        self.restore_host = QtWidgets.QWidget()
+        self.restore_host.setObjectName("CardBody")
+        self.restore_layout = QtWidgets.QVBoxLayout(self.restore_host)
+        self.restore_layout.setContentsMargins(0, 0, 0, 0)
+        self.restore_layout.setSpacing(2)
+        rv.addWidget(self.restore_host)
+
+        self.restore_empty = EmptyState(
+            title="Nothing to restore yet",
+            hint="Once a job has run at least once, its last backup and what "
+                 "has changed since show up here.",
+        )
+        rv.addWidget(self.restore_empty)
+
+        pv.addWidget(restore_card)
+        pv.addStretch(1)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        # Unlike Cleanup, this page keeps its horizontal scrollbar. Cleanup's
+        # wide content is a wrapping label, which should reflow into the
+        # window; this is a six-column table whose columns have real minimum
+        # widths, and squeezing it into a narrow window elides every cell to a
+        # single character rather than making anything fit. A table that is
+        # wider than the window scrolls; it does not get destroyed.
+        scroll.setWidget(page)
+        return scroll
+
+    def _table_header(self, columns, action_width: int) -> QtWidgets.QWidget:
+        """A labelled header row over a repeated-row table.
+
+        DESIGN.md v4 rule 3 requires one over every such table, and was a
+        named complaint rather than a preference. It takes the same column
+        spec the rows do -- same stretch, same minimum width -- so the two
+        cannot drift apart, and `action_width` reserves the row's buttons.
+        """
+        header = QtWidgets.QWidget()
+        header.setObjectName("CardBody")
+        h = QtWidgets.QHBoxLayout(header)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(12)
+        for text, stretch, minimum in columns:
+            label = QtWidgets.QLabel(text)
+            label.setObjectName("FormLabel")
+            label.setMinimumWidth(minimum)
+            h.addWidget(label, stretch)
+        spacer = QtWidgets.QLabel("")
+        spacer.setMinimumWidth(action_width)
+        h.addWidget(spacer)
+        return header
+
+    def refresh_backup(self):
+        """Re-read the jobs file and rebuild both tables."""
+        self.jobs = backup_utils.load_jobs()
+        self._clear_layout(self.jobs_layout)
+        self._clear_layout(self.restore_layout)
+
+        self.jobs_empty.setVisible(not self.jobs)
+        self.job_header.setVisible(bool(self.jobs))
+        for job in self.jobs:
+            row = JobRow(job)
+            row.run_requested.connect(self.run_backup_job)
+            row.edit_requested.connect(self.edit_backup_job)
+            row.remove_requested.connect(self.remove_backup_job)
+            self.jobs_layout.addWidget(row)
+
+        self.restore_empty.setVisible(not self.jobs)
+        self.restore_header.setVisible(bool(self.jobs))
+        for job in self.jobs:
+            row = RestoreRow(job, self._changes.get(job["id"], {}))
+            row.restore_requested.connect(self.restore_backup_job)
+            self.restore_layout.addWidget(row)
+        self._set_backup_controls(enabled=self.backup_thread is None)
+
+    def _clear_layout(self, layout: QtWidgets.QLayout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def _set_backup_controls(self, enabled: bool):
+        """Lock the whole Backup screen while one operation is in flight.
+
+        Re-enabling is deliberately *not* the mirror of disabling: a Restore
+        button for a job that has never run is disabled on its own merits, and
+        a blanket re-enable would offer a restore from a backup that does not
+        exist. `refresh_backup()` rebuilds every row in its correct state
+        after each operation, so unlocking only has to release the two
+        screen-level buttons.
+        """
+        self.job_add_btn.setEnabled(enabled)
+        self.restore_refresh_btn.setEnabled(enabled)
+        if enabled:
+            return
+        for host in (self.jobs_host, self.restore_host):
+            for button in host.findChildren(QtWidgets.QPushButton):
+                button.setEnabled(False)
+
+    def _say(self, message: str, ok: bool = True):
+        self.backup_status.setObjectName("Hint" if ok else "StatusError")
+        # An objectName change after the sheet was applied needs the style
+        # re-polished, or the widget keeps the rules it was first matched by.
+        self.backup_status.style().unpolish(self.backup_status)
+        self.backup_status.style().polish(self.backup_status)
+        self.backup_status.setText(message)
+        self.backup_status.setVisible(True)
+
+    def add_backup_job(self):
+        dialog = BackupJobDialog(self)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._save_and_schedule(dialog.job, "Added")
+
+    def edit_backup_job(self, job: dict):
+        dialog = BackupJobDialog(self, job)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._save_and_schedule(dialog.job, "Updated")
+
+    def _save_and_schedule(self, job: dict, verb: str):
+        """Store the job, then make the OS scheduler match it.
+
+        Two steps reported separately on purpose: a job that saved but could
+        not be scheduled is still a usable job (Run Now works), and saying so
+        is more useful than one combined "failed".
+        """
+        backup_utils.save_job(job)
+        ok, detail = backup_utils.sync_task(job)
+        message = f"{verb} job \"{job['name']}\"."
+        if job.get("schedule") == "manual":
+            message += " It runs only when you press Run Now."
+        elif ok:
+            message += (" Registered with Windows Task Scheduler as "
+                        f"{backup_utils.task_name(job['id'])}.")
+        else:
+            message += f" It could not be scheduled: {detail}"
+        self._say(message, ok=ok or job.get("schedule") == "manual")
+        self.refresh_backup()
+        self.refresh_changes()
+
+    def remove_backup_job(self, job: dict):
+        """Confirm, then drop the job and its scheduled task together.
+
+        Leaving the task behind would run a backup for a job the user
+        believes they deleted, so the two are removed in one action.
+        """
+        if not ConfirmDialog.ask(
+            self,
+            "Remove this backup job?",
+            f"\"{job.get('name')}\" and its Windows scheduled task are "
+            "removed. Backups already written to the target folder are left "
+            "exactly where they are, so nothing you have backed up is lost.",
+            confirm_text="Remove job",
+        ):
+            return
+        backup_utils.unregister_task(job["id"])
+        backup_utils.remove_job(job["id"])
+        self._changes.pop(job["id"], None)
+        self._say(f"Removed job \"{job.get('name')}\" and its scheduled task.")
+        self.refresh_backup()
+
+    def run_backup_job(self, job: dict):
+        if self.backup_thread is not None:
+            return
+        self._start_backup(
+            f"Backing up \"{job.get('name')}\"...",
+            lambda progress, abort: backup_utils.run_job(job, progress, abort),
+            lambda result: self._finish_run(job, result),
+        )
+
+    def restore_backup_job(self, job: dict):
+        """Copy the job's latest version into a folder the user picks.
+
+        Restoring to a new location rather than over the live source: an
+        overwrite would silently replace every edit made since the backup and
+        there is no undo for it, and nothing in this feature asked for that.
+        The restored folder is named for the job and the version so it is
+        obvious what it is once it lands.
+        """
+        if self.backup_thread is not None:
+            return
+        version = backup_utils.latest_version(job)
+        if version is None:
+            self._say(f"\"{job.get('name')}\" has no backup to restore yet.",
+                      ok=False)
+            return
+        destination = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Restore into which folder?", self.home)
+        if not destination:
+            return
+        self._start_backup(
+            f"Restoring \"{job.get('name')}\" from {version}...",
+            lambda progress, abort: backup_utils.restore_version(
+                job, version, destination, progress, abort),
+            lambda result: self._say(result.get("message", ""),
+                                     ok=result.get("ok", False)),
+        )
+
+    def refresh_changes(self):
+        """Measure every job's drift since its last backup, off the UI thread.
+
+        One worker for all jobs rather than one each: each is a walk of two
+        whole trees, and running them together would mean several threads
+        competing for the same disk to fill in one table.
+        """
+        if self.backup_thread is not None:
+            return
+        jobs = backup_utils.load_jobs()
+        if not jobs:
+            self.refresh_backup()
+            return
+
+        def work(progress, abort):
+            measured = {}
+            for index, job in enumerate(jobs, 1):
+                if abort():
+                    break
+                progress(index, len(jobs))
+                measured[job["id"]] = backup_utils.changes_since(job, None, abort)
+            return {"ok": True, "message": "", "changes": measured}
+
+        self._start_backup("Checking what has changed since each backup...",
+                           work, self._finish_changes)
+
+    def _start_backup(self, status: str, work, done):
+        """Run one backup-related call on a QThread, locking the screen."""
+        self._say(status)
+        self.backup_bar.setRange(0, 0)  # indeterminate until a total arrives
+        self.backup_bar.setValue(0)
+        self.backup_bar.setVisible(True)
+        self._set_backup_controls(enabled=False)
+
+        self._backup_done = done
+        self.backup_thread = QtCore.QThread(self)
+        self.backup_worker = BackupWorker(work)
+        self.backup_worker.moveToThread(self.backup_thread)
+        self.backup_worker.progress.connect(self.on_backup_progress)
+        self.backup_worker.finished.connect(self.on_backup_finished)
+        self.backup_thread.started.connect(self.backup_worker.run)
+        self.backup_thread.start()
+
+    def on_backup_progress(self, done: int, total: int):
+        self.backup_bar.setRange(0, total)
+        self.backup_bar.setValue(done)
+
+    def on_backup_finished(self, result: dict):
+        self.backup_bar.setVisible(False)
+        if self.backup_thread:
+            self.backup_thread.quit()
+            self.backup_thread.wait()
+            self.backup_thread = None
+            self.backup_worker = None
+        handler, self._backup_done = self._backup_done, None
+        if handler is not None:
+            handler(result)
+        self.refresh_backup()
+        if self._remeasure:
+            self._remeasure = False
+            self.refresh_changes()
+
+    def _finish_run(self, job: dict, result: dict):
+        """Record the run, then queue a remeasure of what changed since it.
+
+        The remeasure is a second threaded pass, never a `changes_since` call
+        from here: this runs on the UI thread, and walking both trees on it is
+        the frozen window CLAUDE.md §3 exists to prevent. Its outcome rides in
+        `_backup_notice` so the pass that follows does not overwrite the
+        result line the user is reading -- same reason the Duplicates removal
+        carries `_dup_notice` across its rescan.
+        """
+        backup_utils.record_run(job["id"], result)
+        message = result.get("message", "")
+        self._say(message, ok=result.get("ok", False))
+        if result.get("ok"):
+            self._backup_notice = message
+            self._remeasure = True
+
+    def _finish_changes(self, result: dict):
+        self._changes.update(result.get("changes", {}))
+        notice, self._backup_notice = self._backup_notice, ""
+        if notice:
+            self._say(notice)
+        else:
+            self.backup_status.setVisible(False)
+
     def dup_mode_key(self) -> str:
         return "images" if self.dup_mode.currentIndex() == 1 else "files"
 
@@ -1118,6 +1954,12 @@ class DiskTab(QtWidgets.QWidget):
         if index == 1 and not self._cleanup_scanned:
             self._cleanup_scanned = True
             self.start_cleanup_scan()
+        elif index == 2 and not self._backup_loaded:
+            # Measuring drift walks every job's source and its last backup, so
+            # it waits until Backup is actually opened -- same reasoning.
+            self._backup_loaded = True
+            self.refresh_backup()
+            self.refresh_changes()
 
     def start_cleanup_scan(self):
         if self.cleanup_thread is not None or self.clean_thread is not None:
@@ -1333,6 +2175,7 @@ class DiskTab(QtWidgets.QWidget):
             (self.clean_worker, self.clean_thread),
             (self.dup_worker, self.dup_thread),
             (self.dup_clean_worker, self.dup_clean_thread),
+            (self.backup_worker, self.backup_thread),
         ):
             if worker:
                 worker.abort()
@@ -1344,6 +2187,7 @@ class DiskTab(QtWidgets.QWidget):
         self.clean_thread = self.clean_worker = None
         self.dup_thread = self.dup_worker = None
         self.dup_clean_thread = self.dup_clean_worker = None
+        self.backup_thread = self.backup_worker = None
 
     # ------------------------------
     # Rendering
