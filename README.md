@@ -173,8 +173,8 @@ invokes the right thing.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Window opens with no theme styling | `styles/theme.qss` failed to load | Paths are resolved next to `main.py`, so the working directory does not matter; check the console for a `[WARN] Could not load stylesheet` line and that `styles/` was not moved |
-| Text renders in a system font, not Geist | The bundled `.ttf` files under `assets/fonts/` are missing | Check the console for `[WARN] Could not load font`; restore `assets/fonts/` from the repo |
+| Window opens with no theme styling | `styles/theme.qss.tmpl` failed to load | Paths are resolved next to `main.py`, so the working directory does not matter; check the console for a `[WARN] Could not load stylesheet` line and that `styles/` was not moved |
+| Text renders in a system font, not Manrope | The bundled `.ttf` files under `assets/fonts/` are missing | Check the console for `[WARN] Could not load font`; restore `assets/fonts/` from the repo |
 | A packaged binary is missing its font, icon or theme | `pyinstaller --onefile` alone does not bundle `assets/`, `styles/` or `widgets/` (confirmed against a real build, which reported "Copying 0 resources to EXE") | Add `--add-data` flags (or a `.spec` file) for `assets`, `styles` and `widgets` before packaging for distribution; running from source is unaffected |
 | Rename, move, copy or a Cleanup/Duplicates removal stops partway through a batch | A destination folder is missing or not writable | Point the destination picker at a folder you have write access to |
 | Windows taskbar shows the Python interpreter icon, not the app icon | `setWindowIcon()` sets the title-bar icon only; Windows groups taskbar icons by process, which needs an explicit AppUserModelID or a packaged binary | Cosmetic only: package with PyInstaller, or set an AppUserModelID before opening the window, to fix the taskbar icon specifically |
@@ -233,7 +233,7 @@ flowchart LR
 
 ### End to end walk-through
 
-1. `main.py` builds `MainWindow`, registers the bundled Geist fonts, loads `styles/theme.qss`,
+1. `main.py` builds `MainWindow`, registers the bundled Manrope and Geist Mono fonts, builds the sheet from `styles/theme.qss.tmpl`,
    and mounts five tabs (Home, Image Tools, File Manager, Disk, Settings) into a
    `QStackedWidget` switched by the sidebar buttons.
 2. In `tabs/image_tab.py`, the user picks files and sets a format, a fixed size preset, and
@@ -334,9 +334,11 @@ utility-tool/
 ├── LICENSE                MIT
 ├── assets/
 │   ├── icon.png           window/taskbar app mark
-│   └── fonts/             Geist (SIL OFL 1.1), the bundled UI typeface + OFL.txt
+│   ├── fonts/             Manrope + Geist Mono (SIL OFL 1.1) + OFL texts
+│   └── icons/             Lucide SVG subset (ISC) + LICENSE
 ├── styles/
-│   └── theme.qss          Qt stylesheet for the Soft Rose light theme
+│   ├── tokens.py          Colour, type scale, spacing, motion - the one source
+│   └── theme.qss.tmpl     Stylesheet template, built from tokens.py per theme
 ├── tabs/                  one QWidget per sidebar page
 │   ├── home_tab.py         task-first dashboard: entry cards + recent activity
 │   ├── image_tab.py        image compress/resize/convert UI + worker thread
@@ -360,7 +362,7 @@ utility-tool/
 | Path | Role |
 | --- | --- |
 | `main.py` | Composes the window, sidebar and tabs; registers the bundled fonts, then loads the QSS theme |
-| `assets/` | App icon and the bundled Geist typeface. The app makes no network calls, so the UI font ships as `.ttf` files and is registered by `load_fonts()` before the stylesheet is applied. Naming a font in the QSS without a file here silently falls back to a system face. Not yet included in a PyInstaller `--onefile` build; see [If it does not work](#if-it-does-not-work) |
+| `assets/` | App icon, the bundled Manrope + Geist Mono typefaces and the Lucide icon set. The app makes no network calls, so the UI font ships as `.ttf` files and is registered by `load_fonts()` before the stylesheet is applied. Naming a font in the QSS without a file here silently falls back to a system face. Not yet included in a PyInstaller `--onefile` build; see [If it does not work](#if-it-does-not-work) |
 | `tabs/` | UI for each sidebar page, one file per tab |
 | `widgets/` | Shared Qt widgets (dialogs, placeholders) reused across tabs |
 | `utils/` | Framework-free helpers the tabs call into; safe to unit test in isolation |
@@ -403,7 +405,7 @@ code in this repository only.
 
 - Image processing via [Pillow](https://python-pillow.org/), MIT licensed.
 - UI built on [PySide6](https://doc.qt.io/qtforpython-6/), LGPLv3 licensed (Qt for Python).
-- UI typeface is [Geist](https://vercel.com/font), copyright 2024 The Geist Project Authors,
+- UI typeface is [Manrope](https://github.com/sharanda/manrope), copyright 2018 The Manrope Project Authors, and the data typeface is [Geist Mono](https://vercel.com/font), copyright 2024 The Geist Project Authors,
   used under the SIL Open Font License 1.1. The font files are redistributed in
   `assets/fonts/` with the licence text at
   [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt); the MIT licence above does not cover them.

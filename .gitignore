@@ -18,6 +18,7 @@ build_*/
 # Assistant design-tracking files - not needed to run the app (W11)
 DESIGN.md
 PRODUCT.md
+BRAND.md
 
 # VS Code settings
 .vscode/

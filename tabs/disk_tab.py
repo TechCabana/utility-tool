@@ -15,7 +15,15 @@ from utils.disk_utils import (
     top_level_breakdown,
 )
 from utils.file_utils import delete_file
-from widgets.common import ConfirmDialog, EmptyState, divider
+from widgets import icons
+from widgets.common import (ConfirmDialog, EmptyState, PageHeader, add_field, divider,
+                            form_layout, icon_button, section_header, table_header)
+
+
+def _palette() -> dict:
+    from main import active_palette
+
+    return active_palette()
 
 
 class ScanWorker(QtCore.QObject):
@@ -587,7 +595,7 @@ class BackupJobDialog(QtWidgets.QDialog):
 
     def _label(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
-        label.setObjectName("FormLabel")
+        label.setObjectName("FieldLabel")
         return label
 
     def _picker(self, edit: QtWidgets.QLineEdit, caption: str) -> QtWidgets.QWidget:
@@ -659,11 +667,16 @@ class BackupJobDialog(QtWidgets.QDialog):
 # than the page at the default window size, so the Backup page keeps its
 # horizontal scrollbar -- unlike Cleanup, where the wide content is a wrapping
 # label that should reflow rather than scroll.
+# Four columns, not six. Source and Target used to be columns of their own,
+# and their minimum widths plus three text buttons summed wider than the app's
+# own minimum window: the page grew a horizontal scrollbar, the last button
+# was cut off, and the prose above the table was clipped mid-sentence. The two
+# paths now sit on a second line inside the Job cell, where they have the full
+# row width to elide into, and the row's three actions are icon buttons.
 JOB_COLUMNS = (
-    ("Name", 3, 96), ("Source", 4, 104), ("Target", 4, 104),
-    ("Schedule", 3, 92), ("Status", 2, 62), ("Last run", 3, 100),
+    ("Job", 5, 180), ("Schedule", 3, 92), ("Status", 2, 62), ("Last run", 3, 126),
 )
-JOB_ACTION_WIDTH = 240
+JOB_ACTION_WIDTH = 108
 
 RESTORE_COLUMNS = (
     ("Job", 3, 120), ("Last backup", 3, 120), ("Changes since", 6, 240),
@@ -751,15 +764,11 @@ class JobRow(QtWidgets.QWidget):
         h.setSpacing(12)
 
         status, style = self._status(job)
-        # Elided, not wrapped: a job name is user-supplied, so it can be one
-        # long unbroken string and blow the column out exactly as a path does.
         cells = [
-            (ElidedLabel(job.get("name", "(unnamed)")), None),
-            (self._path(job.get("source", "")), None),
-            (self._path(job.get("target", "")), None),
+            (self._identity(job), None),
             (self._hint(backup_utils.schedule_label(job)), None),
             (self._hint(status), style),
-            (self._hint(self._last_run(job)), None),
+            (self._data(self._last_run(job)), None),
         ]
         for (widget, style_name), (_, stretch, minimum) in zip(cells, JOB_COLUMNS):
             if style_name:
@@ -767,13 +776,18 @@ class JobRow(QtWidgets.QWidget):
             widget.setMinimumWidth(minimum)
             h.addWidget(widget, stretch)
 
-        for text, name, signal in (
-            ("Run Now", "Secondary", self.run_requested),
-            ("Edit", "Secondary", self.edit_requested),
-            ("Remove", "Danger", self.remove_requested),
+        # Icon buttons, so three per-row actions cost 108px instead of 240 --
+        # each keeps a tooltip and an accessible name, which is what a text
+        # label was carrying.
+        for icon_name, tooltip, signal in (
+            ("play", "Run this job now", self.run_requested),
+            ("pencil", "Edit this job", self.edit_requested),
+            ("trash", "Remove this job", self.remove_requested),
         ):
-            button = QtWidgets.QPushButton(text)
-            button.setObjectName(name)
+            name = job.get("name", "this job")
+            button = icon_button(icon_name, tooltip, f"{tooltip}: {name}")
+            if icon_name == "trash":
+                button.setObjectName("GhostDanger")
             button.clicked.connect(lambda _=False, s=signal: s.emit(self.job))
             h.addWidget(button)
 
@@ -782,6 +796,45 @@ class JobRow(QtWidgets.QWidget):
         label.setWordWrap(True)
         return label
 
+    def _data(self, value: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(value)
+        label.setObjectName("DataMuted")
+        return label
+
+    def _identity(self, job: dict) -> QtWidgets.QWidget:
+        """The Job cell: the name, and under it where it reads and writes.
+
+        Source and Target keep their own labels rather than being joined into
+        one arrow string -- DESIGN.md v4 rule 4 records the owner asking for
+        two labelled values, and an arrow between two elided paths is
+        unreadable anyway.
+        """
+        host = QtWidgets.QWidget()
+        host.setObjectName("CardBody")
+        column = QtWidgets.QVBoxLayout(host)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(2)
+
+        # Elided, not wrapped: a job name is user-supplied, so it can be one
+        # long unbroken string and blow the column out exactly as a path does.
+        name = ElidedLabel(job.get("name", "(unnamed)"))
+        name.setToolTip(job.get("name", ""))
+        column.addWidget(name)
+
+        for caption, value in (("From", job.get("source", "")), ("To", job.get("target", ""))):
+            line = QtWidgets.QWidget()
+            line.setObjectName("CardBody")
+            row = QtWidgets.QHBoxLayout(line)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            label = QtWidgets.QLabel(caption)
+            label.setObjectName("Hint")
+            label.setMinimumWidth(30)
+            row.addWidget(label)
+            row.addWidget(self._path(value), 1)
+            column.addWidget(line)
+        return host
+
     def _hint(self, value: str) -> QtWidgets.QLabel:
         label = self._text(value)
         label.setObjectName("Hint")
@@ -789,7 +842,7 @@ class JobRow(QtWidgets.QWidget):
 
     def _path(self, value: str) -> QtWidgets.QLabel:
         label = ElidedLabel(_tail(value) if value else "(not set)")
-        label.setObjectName("Hint")
+        label.setObjectName("DataMuted")
         # The full path, never the tail -- the column is a glance, the tooltip
         # is the answer to "which folder exactly".
         label.setToolTip(value or "(not set)")
@@ -900,6 +953,7 @@ class BreakdownRow(QtWidgets.QWidget):
         h.addWidget(label, 2)
 
         bar = QtWidgets.QProgressBar()
+        bar.setObjectName("DataBar")
         bar.setRange(0, 1000)
         bar.setValue(int(1000 * size_bytes / largest) if largest else 0)
         bar.setTextVisible(False)
@@ -975,9 +1029,10 @@ class DiskTab(QtWidgets.QWidget):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(10)
 
-        header = QtWidgets.QLabel("Disk")
-        header.setObjectName("H1")
-        v.addWidget(header)
+        v.addWidget(PageHeader(
+            "Disk",
+            "See what is using space, reclaim what you do not need, and keep "
+            "folders backed up. Nothing is deleted without asking first."))
 
         # Sub-navigation is a plain QTabWidget. QTabBar is already fully
         # themed in styles/theme.qss (accent-filled selected tab) and unused
@@ -1019,8 +1074,16 @@ class DiskTab(QtWidgets.QWidget):
         self.drive_title.setObjectName("H2")
         uv.addWidget(self.drive_title)
 
+        # A measurement, not an interaction: how full a drive is has nothing
+        # to do with the accent colour, and a 44%-full drive drawn in the same
+        # red as the primary button reads as an alarm. The object name is
+        # reassigned by _refresh_usage() as the number crosses its thresholds.
         self.usage_bar = QtWidgets.QProgressBar()
+        self.usage_bar.setObjectName("DataBar")
         self.usage_bar.setRange(0, 100)
+        # The percentage reads in the line below, not inside an 8px bar: a
+        # measurement bar is a shape to compare, not a place to put text.
+        self.usage_bar.setTextVisible(False)
         uv.addWidget(self.usage_bar)
 
         self.usage_label = QtWidgets.QLabel()
@@ -1060,6 +1123,9 @@ class DiskTab(QtWidgets.QWidget):
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(6)
         self.scan_bar = QtWidgets.QProgressBar()
+        # Indeterminate: muted, so "working" never looks like progress
+        # that has reached the end.
+        self.scan_bar.setObjectName("BusyBar")
         self.scan_bar.setRange(0, 0)  # indeterminate: no total is known upfront
         self.scan_bar.setTextVisible(False)
         sv.addWidget(self.scan_bar)
@@ -1156,6 +1222,9 @@ class DiskTab(QtWidgets.QWidget):
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(6)
         self.cleanup_bar = QtWidgets.QProgressBar()
+        # Indeterminate: muted, so "working" never looks like progress
+        # that has reached the end.
+        self.cleanup_bar.setObjectName("BusyBar")
         self.cleanup_bar.setRange(0, 0)  # indeterminate: no file total upfront
         self.cleanup_bar.setTextVisible(False)
         sv.addWidget(self.cleanup_bar)
@@ -1181,7 +1250,7 @@ class DiskTab(QtWidgets.QWidget):
             ("Size", 1, Qt.AlignRight | Qt.AlignVCenter),
         ):
             label = QtWidgets.QLabel(text)
-            label.setObjectName("FormLabel")
+            label.setObjectName("FieldLabel")
             label.setAlignment(align)
             hh.addWidget(label, stretch)
         # A spacer matching the per-row expand button, so the columns line up.
@@ -1232,6 +1301,7 @@ class DiskTab(QtWidgets.QWidget):
         fv.addLayout(row)
 
         self.clean_bar = QtWidgets.QProgressBar()
+        self.clean_bar.setObjectName("WithText")
         self.clean_bar.setVisible(False)
         fv.addWidget(self.clean_bar)
 
@@ -1267,7 +1337,7 @@ class DiskTab(QtWidgets.QWidget):
         head.addStretch(1)
 
         mode_label = QtWidgets.QLabel("Mode")
-        mode_label.setObjectName("FormLabel")
+        mode_label.setObjectName("FieldLabel")
         head.addWidget(mode_label)
         # A QComboBox, matching File Manager's operation picker -- the app
         # already has one mode-picker idiom and does not need a second.
@@ -1293,6 +1363,9 @@ class DiskTab(QtWidgets.QWidget):
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(6)
         self.dup_bar = QtWidgets.QProgressBar()
+        # Indeterminate: muted, so "working" never looks like progress
+        # that has reached the end.
+        self.dup_bar.setObjectName("BusyBar")
         self.dup_bar.setRange(0, 0)  # indeterminate until the walk finishes
         self.dup_bar.setTextVisible(False)
         sv.addWidget(self.dup_bar)
@@ -1321,7 +1394,7 @@ class DiskTab(QtWidgets.QWidget):
             ("Reclaimable", 1, Qt.AlignRight | Qt.AlignVCenter),
         ):
             label = QtWidgets.QLabel(text)
-            label.setObjectName("FormLabel")
+            label.setObjectName("FieldLabel")
             label.setAlignment(align)
             hh.addWidget(label, stretch)
         spacer = QtWidgets.QLabel("")
@@ -1361,6 +1434,7 @@ class DiskTab(QtWidgets.QWidget):
         cv.addLayout(footer)
 
         self.dup_clean_bar = QtWidgets.QProgressBar()
+        self.dup_clean_bar.setObjectName("WithText")
         self.dup_clean_bar.setVisible(False)
         cv.addWidget(self.dup_clean_bar)
 
@@ -1436,6 +1510,7 @@ class DiskTab(QtWidgets.QWidget):
         jv.addWidget(self.jobs_empty)
 
         self.backup_bar = QtWidgets.QProgressBar()
+        self.backup_bar.setObjectName("WithText")
         self.backup_bar.setVisible(False)
         jv.addWidget(self.backup_bar)
 
@@ -1530,8 +1605,7 @@ class DiskTab(QtWidgets.QWidget):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(12)
         for text, stretch, minimum in columns:
-            label = QtWidgets.QLabel(text)
-            label.setObjectName("FormLabel")
+            label = table_header(text)
             label.setMinimumWidth(minimum)
             h.addWidget(label, stretch)
         spacer = QtWidgets.QLabel("")
@@ -2189,8 +2263,15 @@ class DiskTab(QtWidgets.QWidget):
         percent = int(round(100 * used / total)) if total else 0
         self.drive_title.setText(f"Drive {drive}")
         self.usage_bar.setValue(percent)
+        # Colour only where it carries meaning: neutral until the drive is
+        # actually filling up.
+        self.usage_bar.setObjectName(
+            "DataBarCritical" if percent >= 90 else
+            "DataBarWarn" if percent >= 75 else "DataBar")
+        self.usage_bar.style().unpolish(self.usage_bar)
+        self.usage_bar.style().polish(self.usage_bar)
         self.usage_label.setText(
-            f"{human_size(used)} used of {human_size(total)}  -  "
+            f"{percent}% used  -  {human_size(used)} of {human_size(total)}  -  "
             f"{human_size(free)} free"
         )
 

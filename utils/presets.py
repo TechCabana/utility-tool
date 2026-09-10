@@ -131,3 +131,57 @@ def update_preset(kind: str, index: int, new_preset: Dict[str, Any]) -> None:
     if kind in d and 0 <= index < len(d[kind]):
         d[kind][index] = new_preset
         save_all(d)
+
+
+def describe_preset(kind: str, preset: Dict[str, Any]) -> str:
+    """A one-line summary of what a preset actually does.
+
+    The preset list used to show names only, so "Web Upload" and "Email
+    Attachment" were indistinguishable without applying one and reading the
+    form -- the user had to remember what they had saved. This puts the
+    configuration on the row.
+
+    Qt-free on purpose (CLAUDE.md §8): it is a pure string function over the
+    stored dict, so tests/test_presets.py covers it without a widget.
+    """
+    parts: List[str] = []
+
+    if kind == "image":
+        fmt = str(preset.get("format", "ORIGINAL"))
+        parts.append("Keep format" if fmt.upper() == "ORIGINAL" else fmt.upper())
+
+        size = str(preset.get("size_key", "Original"))
+        if size and size != "Original":
+            parts.append(size)
+
+        # Quality is meaningless for a lossless format, so it is only shown
+        # where it changes the output.
+        if fmt.upper() in ("JPEG", "WEBP", "ORIGINAL"):
+            parts.append(f"quality {preset.get('quality', 85)}")
+
+        if not preset.get("keep_exif", True):
+            parts.append("EXIF stripped")
+
+    pattern = str(preset.get("pattern", "{name}"))
+    if pattern and pattern != "{name}":
+        parts.append(f"name {pattern}")
+
+    prefix, suffix = str(preset.get("prefix", "")), str(preset.get("suffix", ""))
+    if prefix:
+        parts.append(f"prefix {prefix!r}")
+    if suffix:
+        parts.append(f"suffix {suffix!r}")
+
+    if preset.get("regex_find"):
+        replacement = str(preset.get("regex_replace", ""))
+        target = f"to {replacement!r}" if replacement else "removed"
+        parts.append(f"{preset['regex_find']!r} {target}")
+
+    case = str(preset.get("case", "none"))
+    if case != "none":
+        parts.append(f"{case}case")
+
+    if "{num}" in pattern:
+        parts.append(f"numbered from {preset.get('start', 1)}, {preset.get('pad', 3)} digits")
+
+    return " · ".join(parts) if parts else "Keeps every file as it is"
