@@ -13,6 +13,11 @@ from widgets.common import (
 )
 from widgets.pattern import PatternField
 
+
+# See Image Tools: a placeholder does not need a full list's height.
+LIST_HEIGHT_EMPTY = 116
+LIST_HEIGHT_FULL = 150
+
 # Conflict-policy combo text -> the internal codes utils/file_utils.py
 # understands. "Ask" is not in this map -- it is resolved to one of the
 # other three, once, for the whole batch, in FileTab.apply() before the
@@ -119,8 +124,7 @@ class FileTab(QtWidgets.QWidget):
 
         v.addWidget(PageHeader(
             "File Tools",
-            "Rename, move, copy or delete a batch of files. Deletes go to the "
-            "Recycle Bin, and every batch is previewed before it runs."))
+            "Rename, move, copy or delete a batch of files. Deletes are recoverable."))
 
         files_card, files_body = card()
         head = QtWidgets.QHBoxLayout()
@@ -152,8 +156,10 @@ class FileTab(QtWidgets.QWidget):
         # happens, so the spare vertical space belongs to that.
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.listw.setMinimumHeight(104)
-        self.listw.setMaximumHeight(150)
+        # Same reasoning as Image Tools: an empty list is a placeholder and
+        # should not hold the height of a full one at the minimum window.
+        self.listw.setMinimumHeight(LIST_HEIGHT_EMPTY)
+        self.listw.setMaximumHeight(LIST_HEIGHT_EMPTY)
         files_body.addWidget(self.listw)
         v.addWidget(files_card)
 
@@ -165,6 +171,7 @@ class FileTab(QtWidgets.QWidget):
             hint="Drag files here, or use Add files.",
             icon="file-text",
             parent=self.listw,
+            compact=True,
         )
         self.placeholder.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.placeholder.resize(self.listw.size())
@@ -433,6 +440,9 @@ class FileTab(QtWidgets.QWidget):
         count = self.listw.count()
         running = self.thread is not None
         self.placeholder.setVisible(count == 0)
+        height = LIST_HEIGHT_EMPTY if count == 0 else LIST_HEIGHT_FULL
+        self.listw.setMinimumHeight(height)
+        self.listw.setMaximumHeight(height)
         self.files_count.setText("" if not count else f"{count} file{'s' if count != 1 else ''}")
         self.apply_btn.setEnabled(count > 0 and not running)
         self.clear_btn.setEnabled(count > 0 and not running)

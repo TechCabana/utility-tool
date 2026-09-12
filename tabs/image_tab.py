@@ -20,6 +20,13 @@ from widgets.common import (
 from widgets.pattern import PatternField
 
 
+# The file list's two heights: a placeholder does not need the room a real
+# list does, and at the app's minimum window the difference is most of the
+# specification form's viewport.
+LIST_HEIGHT_EMPTY = 116
+LIST_HEIGHT_FULL = 150
+
+
 def human_size(num_bytes: float) -> str:
     """Bytes as the smallest unit that keeps the number readable."""
     for unit in ("B", "KB", "MB", "GB"):
@@ -144,8 +151,7 @@ class ImageTab(QtWidgets.QWidget):
 
         root.addWidget(PageHeader(
             "Image Tools",
-            "Compress, resize or convert a batch of images. Originals are left "
-            "alone unless you send the output to the same folder."))
+            "Compress, resize or convert a batch of images. Originals are untouched."))
 
         root.addWidget(self._build_files_card())
         root.addWidget(self._build_spec_area(), 1)
@@ -208,8 +214,12 @@ class ImageTab(QtWidgets.QWidget):
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.listw.setAcceptDrops(True)
-        self.listw.setMinimumHeight(104)
-        self.listw.setMaximumHeight(150)
+        # Sized by what it holds. An empty list is a placeholder and should
+        # not reserve the height of a full one: at the app's 620px minimum
+        # window that reservation left the fourteen-field form below it about
+        # one field of viewport. `_resize_list()` grows it once files arrive.
+        self.listw.setMinimumHeight(LIST_HEIGHT_EMPTY)
+        self.listw.setMaximumHeight(LIST_HEIGHT_EMPTY)
         self.listw.dragEnterEvent = self._drag_enter
         self.listw.dropEvent = self._drop
         body.addWidget(self.listw)
@@ -221,6 +231,7 @@ class ImageTab(QtWidgets.QWidget):
             hint="Drag images here, or use Add images.",
             icon="file-image",
             parent=self.listw,
+            compact=True,
         )
         self.empty_state.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.listw.resizeEvent = lambda e: (
@@ -477,9 +488,16 @@ class ImageTab(QtWidgets.QWidget):
         else:
             self.start_btn.setToolTip(f"Process {self.listw.count()} file(s)")
 
+    def _resize_list(self):
+        """Compact while empty, taller once there is something to show."""
+        height = LIST_HEIGHT_EMPTY if self.listw.count() == 0 else LIST_HEIGHT_FULL
+        self.listw.setMinimumHeight(height)
+        self.listw.setMaximumHeight(height)
+
     def _update_empty_state(self):
         count = self.listw.count()
         self.empty_state.setVisible(count == 0)
+        self._resize_list()
         self.files_count.setText("" if not count else f"{count} file{'s' if count != 1 else ''}")
         if hasattr(self, "start_btn"):
             self._set_running(self.thread is not None)
