@@ -217,6 +217,51 @@ def icon_button(icon_name: str, tooltip: str, accessible_name: str = "") -> QtWi
     return button
 
 
+class ElidedLabel(QtWidgets.QLabel):
+    """A label that shrinks: text too long for its space is elided to fit.
+
+    A word-wrapped QLabel cannot shrink below its longest unbreakable word,
+    and a filesystem path is one unbreakable word. In a full-width label that
+    never shows, because the label is wider than any path. In a table column
+    or a narrow card it does: one deep path sets the minimum width of its own
+    column, which sets the minimum width of the row, the card and the page,
+    and pushes everything to its right off the edge of a window whose
+    horizontal scrollbar is deliberately switched off.
+
+    Eliding in the middle keeps both the drive and the leaf visible, which is
+    what identifies a path; the whole thing stays one hover away in the
+    tooltip. The text is elided rather than the painting overridden, so the
+    label keeps its ordinary QSS styling.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full = text
+        self.setMinimumWidth(0)
+        # Ignored: the width comes from the layout, never from how long this
+        # particular path happens to be.
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                           QtWidgets.QSizePolicy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str):
+        self._full = text
+        self.setToolTip(text)
+        self._elide()
+
+    def full_text(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self):
+        width = max(0, self.width() - 2)
+        super().setText(self.fontMetrics().elidedText(
+            self._full, QtCore.Qt.ElideMiddle, width) if width else self._full)
+
+
 class ConfirmDialog(QtWidgets.QDialog):
     """A shared confirm dialog for destructive actions.
 

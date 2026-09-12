@@ -1,4 +1,5 @@
 # tabs/disk_tab.py
+import datetime
 import os
 import re
 import shutil
@@ -15,7 +16,8 @@ from utils.disk_utils import (
     top_level_breakdown,
 )
 from utils.file_utils import delete_file
-from widgets.common import ConfirmDialog, EmptyState, PageHeader, divider, icon_button, table_header
+from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
+                            divider, icon_button, table_header)
 
 
 class ScanWorker(QtCore.QObject):
@@ -672,12 +674,12 @@ class BackupJobDialog(QtWidgets.QDialog):
 # paths now sit on a second line inside the Job cell, where they have the full
 # row width to elide into, and the row's three actions are icon buttons.
 JOB_COLUMNS = (
-    ("Job", 5, 180), ("Schedule", 3, 92), ("Status", 2, 62), ("Last run", 3, 126),
+    ("Job", 5, 180), ("Schedule", 3, 92), ("Status", 2, 62), ("Last run", 3, 96),
 )
 JOB_ACTION_WIDTH = 108
 
 RESTORE_COLUMNS = (
-    ("Job", 3, 120), ("Last backup", 3, 120), ("Changes since", 6, 240),
+    ("Job", 3, 120), ("Last backup", 3, 104), ("Changes since", 6, 190),
 )
 RESTORE_ACTION_WIDTH = 110
 
@@ -693,53 +695,6 @@ def _tail(path: str, segments: int = 2) -> str:
     if len(parts) <= segments:
         return path
     return "..." + os.sep + os.sep.join(parts[-segments:])
-
-
-class ElidedLabel(QtWidgets.QLabel):
-    """A label that shrinks: text too long for its column is elided to fit.
-
-    A word-wrapped QLabel cannot shrink below its longest unbreakable word,
-    and a filesystem path is one unbreakable word. In a full-width label --
-    which is every other place this app shows a path -- that never shows,
-    because the label is wider than any path. In a table column it does: one
-    deep source path sets the minimum width of its own column, which sets the
-    minimum width of the row, the card and the page, and pushes the Schedule,
-    Status and Last-run columns off the right-hand edge of a window whose
-    horizontal scrollbar is deliberately switched off. The result is columns
-    the user cannot reach at all.
-
-    Eliding in the middle keeps both the drive and the leaf visible, which is
-    what identifies a backup path; the whole thing stays one hover away in the
-    tooltip. The text is elided rather than the painting overridden so the
-    label keeps its ordinary QSS styling.
-    """
-
-    def __init__(self, text: str = "", parent=None):
-        super().__init__(parent)
-        self._full = text
-        self.setMinimumWidth(0)
-        # Ignored: the column's width comes from the layout's stretch factors,
-        # never from how long this particular path happens to be.
-        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
-                           QtWidgets.QSizePolicy.Preferred)
-        self.setText(text)
-
-    def setText(self, text: str):
-        self._full = text
-        self.setToolTip(text)
-        self._elide()
-
-    def full_text(self) -> str:
-        return self._full
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._elide()
-
-    def _elide(self):
-        width = max(0, self.width() - 2)
-        super().setText(self.fontMetrics().elidedText(
-            self._full, Qt.ElideMiddle, width) if width else self._full)
 
 
 class JobRow(QtWidgets.QWidget):
@@ -863,11 +818,30 @@ class JobRow(QtWidgets.QWidget):
         return "Failed", "StatusError"
 
     def _last_run(self, job: dict) -> str:
+        """When this job last ran, short enough to fit its column.
+
+        Stored as an ISO timestamp so it sorts and parses. Shown as
+        "09 Sep 08:49" rather than "2026-09-09 08:49": the year is almost
+        never the thing being read here, and the sixteen-character form set
+        the column's minimum width, which was what pushed the whole table
+        past the app's 940px minimum window. Dropping it is the one saving
+        available that costs no information anyone is actually using and
+        touches no shared token.
+
+        A run from a previous year keeps its year, since that is exactly the
+        case where the year IS the point.
+        """
         stamp = job.get("last_run", "")
         if not stamp:
             return "-"
-        # Stored as an ISO timestamp so it sorts and parses; shown short.
-        return stamp.replace("T", " ")[:16]
+        try:
+            moment = datetime.datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            # Never let an unparseable stored value break the row.
+            return stamp.replace("T", " ")[:16]
+        if moment.year != datetime.datetime.now().year:
+            return moment.strftime("%d %b %Y")
+        return moment.strftime("%d %b %H:%M")
 
 
 class RestoreRow(QtWidgets.QWidget):

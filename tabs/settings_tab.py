@@ -2,8 +2,8 @@ from PySide6 import QtCore, QtWidgets
 
 from styles import tokens
 from utils.presets import load_all, delete_preset, describe_preset
-from widgets.common import (ConfirmDialog, EmptyState, PageHeader, card,
-                            divider, icon_button, section_header)
+from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
+                            card, divider, icon_button, section_header)
 
 THEME_CHOICES = (
     ("Match the system", "system"),
@@ -207,9 +207,12 @@ class SettingsTab(QtWidgets.QWidget):
             caption.setMinimumWidth(120)
             line.addWidget(caption)
 
-            data = QtWidgets.QLabel(value)
+            # Elided, not plain: the presets path is one unbreakable word,
+            # and at the app's minimum window it set a minimum width wider
+            # than the card, pushing this screen's content off its own
+            # viewport. The full path stays in the tooltip.
+            data = ElidedLabel(value)
             data.setObjectName("DataMuted")
-            data.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             line.addWidget(data, 1)
             body.addWidget(row)
 
