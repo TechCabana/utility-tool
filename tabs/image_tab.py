@@ -14,16 +14,10 @@ from utils.image_utils import (
 from utils.presets import add_image_preset, get_image_presets
 from widgets import icons
 from widgets.common import (
-    ConfirmDialog, EmptyState, PageHeader, SPACE_BLOCK, SPACE_FIELD, add_field,
+    ConfirmDialog, EmptyState, PageHeader, SPACE_FIELD, add_field,
     card, data_label, field_pair, form_layout, section_header,
 )
 from widgets.pattern import PatternField
-
-
-def _palette() -> dict:
-    from main import active_palette
-
-    return active_palette()
 
 
 def human_size(num_bytes: float) -> str:
@@ -190,14 +184,14 @@ class ImageTab(QtWidgets.QWidget):
         head.addStretch(1)
 
         add_files = QtWidgets.QPushButton("  Add images")
-        add_files.setIcon(icons.icon("plus", _palette()["text"], 15))
+        icons.set_icon(add_files, "plus", "text", 15)
         add_files.setToolTip("Add image files to the batch  (Ctrl+O)")
         add_files.clicked.connect(self._choose_files)
         head.addWidget(add_files)
 
         add_folder = QtWidgets.QPushButton("  Add folder")
         add_folder.setObjectName("Secondary")
-        add_folder.setIcon(icons.icon("folder-open", _palette()["text_muted"], 15))
+        icons.set_icon(add_folder, "folder-open", "text_muted", 15)
         add_folder.setToolTip("Add every supported image in a folder")
         add_folder.clicked.connect(self._choose_folder)
         head.addWidget(add_folder)
@@ -420,7 +414,7 @@ class ImageTab(QtWidgets.QWidget):
 
         self.start_btn = QtWidgets.QPushButton("  Start")
         self.start_btn.setObjectName("Primary")
-        self.start_btn.setIcon(icons.icon("play", _palette()["accent_text"], 15))
+        icons.set_icon(self.start_btn, "play", "accent_text", 15)
         self.start_btn.setToolTip("Process every file in the list")
         self.start_btn.clicked.connect(self.start)
         row.addWidget(self.start_btn)
@@ -432,7 +426,7 @@ class ImageTab(QtWidgets.QWidget):
 
         self.save_preset_btn = QtWidgets.QPushButton("  Save preset")
         self.save_preset_btn.setObjectName("Ghost")
-        self.save_preset_btn.setIcon(icons.icon("bookmark", _palette()["text_muted"], 15))
+        icons.set_icon(self.save_preset_btn, "bookmark", "text_muted", 15)
         self.save_preset_btn.setToolTip("Save every setting on this screen under a name")
         self.save_preset_btn.clicked.connect(self.save_current_preset)
         row.addWidget(self.save_preset_btn)
@@ -457,7 +451,7 @@ class ImageTab(QtWidgets.QWidget):
 
         self.open_output_btn = QtWidgets.QPushButton("  Open output folder")
         self.open_output_btn.setObjectName("Secondary")
-        self.open_output_btn.setIcon(icons.icon("folder-open", _palette()["text_muted"], 15))
+        icons.set_icon(self.open_output_btn, "folder-open", "text_muted", 15)
         self.open_output_btn.clicked.connect(self._open_output)
         self.open_output_btn.setVisible(False)
         layout.addWidget(self.open_output_btn, 0, Qt.AlignLeft)

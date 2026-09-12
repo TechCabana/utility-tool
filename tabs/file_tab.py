@@ -3,21 +3,15 @@ import os, time
 from typing import List
 from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
-from utils.file_utils import build_new_name, apply_renames, move_file, copy_file, delete_file
+from utils.file_utils import build_new_name, move_file, copy_file, delete_file
 from utils.presets import add_file_preset, get_file_presets, load_all
 from utils import activity
 from widgets import icons
 from widgets.common import (
-    ConfirmDialog, EmptyState, PageHeader, SPACE_BLOCK, SPACE_FIELD, add_field,
+    ConfirmDialog, EmptyState, PageHeader, SPACE_FIELD, add_field,
     card, data_label, field_pair, form_layout, section_header,
 )
 from widgets.pattern import PatternField
-
-
-def _palette() -> dict:
-    from main import active_palette
-
-    return active_palette()
 
 # Conflict-policy combo text -> the internal codes utils/file_utils.py
 # understands. "Ask" is not in this map -- it is resolved to one of the
@@ -141,7 +135,7 @@ class FileTab(QtWidgets.QWidget):
         head.addStretch(1)
 
         add = QtWidgets.QPushButton("  Add files")
-        add.setIcon(icons.icon("plus", _palette()["text"], 15))
+        icons.set_icon(add, "plus", "text", 15)
         add.setToolTip("Add files to the batch")
         add.clicked.connect(self.add_files)
         head.addWidget(add)
@@ -345,10 +339,10 @@ class FileTab(QtWidgets.QWidget):
         run_h.setSpacing(8)
         self.apply_btn = QtWidgets.QPushButton("  Apply rename")
         self.apply_btn.setObjectName("Primary")
-        self.apply_btn.setIcon(icons.icon("play", _palette()["accent_text"], 15))
+        icons.set_icon(self.apply_btn, "play", "accent_text", 15)
         self.save_preset_btn = QtWidgets.QPushButton("  Save preset")
         self.save_preset_btn.setObjectName("Ghost")
-        self.save_preset_btn.setIcon(icons.icon("bookmark", _palette()["text_muted"], 15))
+        icons.set_icon(self.save_preset_btn, "bookmark", "text_muted", 15)
         self.save_preset_btn.setToolTip("Save every naming setting on this screen under a name")
         run_h.addWidget(self.apply_btn)
         run_h.addWidget(self.save_preset_btn)
@@ -484,9 +478,9 @@ class FileTab(QtWidgets.QWidget):
             "Copy": "  Copy files",
             "Delete": "  Delete files",
         }[op])
-        self.apply_btn.setIcon(icons.icon(
-            "trash" if op == "Delete" else "play",
-            _palette()["danger_text" if op == "Delete" else "accent_text"], 15))
+        icons.set_icon(self.apply_btn,
+                       "trash" if op == "Delete" else "play",
+                       "danger_text" if op == "Delete" else "accent_text", 15)
         # The one #Danger button hook (widgets/common.py's ConfirmDialog
         # confirm button reuses it too) so Delete reads distinctly from the
         # app's rose interaction accent. Everything else is #Primary: the

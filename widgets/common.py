@@ -205,11 +205,10 @@ def field_pair(first, label: str, second) -> QtWidgets.QWidget:
 def icon_button(icon_name: str, tooltip: str, accessible_name: str = "") -> QtWidgets.QPushButton:
     """A square, borderless button carrying one glyph and no text."""
     from widgets import icons
-    from main import active_palette
 
     button = QtWidgets.QPushButton()
     button.setObjectName("IconButton")
-    button.setIcon(icons.icon(icon_name, active_palette()["text_muted"], 16))
+    icons.set_icon(button, icon_name, "text_muted", 16)
     button.setToolTip(tooltip)
     # An icon-only control is unlabelled to a screen reader unless it is told
     # what it is, which is why this argument is not optional in practice.
@@ -331,11 +330,10 @@ class EmptyState(QtWidgets.QWidget):
 
         if icon:
             from widgets import icons as icon_set
-            from main import active_palette
 
             glyph = QtWidgets.QLabel()
             glyph.setAlignment(QtCore.Qt.AlignCenter)
-            glyph.setPixmap(icon_set.pixmap(icon, active_palette()["text_faint"], 28))
+            icon_set.set_pixmap(glyph, icon, "text_faint", 28)
             layout.addWidget(glyph)
 
         title_label = QtWidgets.QLabel(title)

@@ -170,6 +170,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.setValue("ui/theme", choice)
         apply_theme(QtWidgets.QApplication.instance(), choice)
         self.refresh_icons()
+        # Sidebar icons re-stroke through refresh_icons() above; every other
+        # icon-carrying widget (row actions, empty states, entry cards) was
+        # registered through widgets.icons.set_icon()/set_pixmap() when it
+        # was built, so this is what makes them track a *runtime* switch
+        # instead of only the colour a fresh construction would pick up.
+        icons.refresh_theme()
         apply_card_shadows(self.centralWidget(), active_palette())
 
     # -- lifecycle -------------------------------------------------------

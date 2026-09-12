@@ -6,12 +6,6 @@ from widgets import icons
 from widgets.common import EmptyState, PageHeader, card, divider
 
 
-def _palette() -> dict:
-    from main import active_palette
-
-    return active_palette()
-
-
 class EntryCard(QtWidgets.QFrame):
     """A clickable dashboard card that requests a page switch.
 
@@ -36,7 +30,7 @@ class EntryCard(QtWidgets.QFrame):
         layout.setSpacing(8)
 
         self.glyph = QtWidgets.QLabel()
-        self.glyph.setPixmap(icons.pixmap(icon_name, _palette()["accent"], 22))
+        icons.set_pixmap(self.glyph, icon_name, "accent", 22)
         layout.addWidget(self.glyph)
 
         name = QtWidgets.QLabel(title)
@@ -142,8 +136,7 @@ class HomeTab(QtWidgets.QWidget):
         layout.setSpacing(10)
 
         glyph = QtWidgets.QLabel()
-        glyph.setPixmap(icons.pixmap(entry.get("kind") or "clock",
-                                     _palette()["text_faint"], 16))
+        icons.set_pixmap(glyph, entry.get("kind") or "clock", "text_faint", 16)
         layout.addWidget(glyph, 0, QtCore.Qt.AlignTop)
 
         text = QtWidgets.QLabel(entry.get("text", ""))

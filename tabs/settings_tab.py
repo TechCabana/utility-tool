@@ -2,9 +2,8 @@ from PySide6 import QtCore, QtWidgets
 
 from styles import tokens
 from utils.presets import load_all, delete_preset, describe_preset
-from widgets import icons
 from widgets.common import (ConfirmDialog, EmptyState, PageHeader, card,
-                            divider, section_header)
+                            divider, icon_button, section_header)
 
 THEME_CHOICES = (
     ("Match the system", "system"),
@@ -166,12 +165,8 @@ class SettingsTab(QtWidgets.QWidget):
         # A row action, not an alarm: filled red is reserved for the confirm
         # button of the dialog this opens. A list of eleven filled red
         # buttons teaches people to stop reading red.
-        remove = QtWidgets.QPushButton()
-        remove.setObjectName("IconButton")
-        remove.setIcon(icons.icon("trash", _palette()["text_muted"], 16))
-        remove.setToolTip(f"Delete the preset \"{preset.get('name', '')}\"")
-        remove.setAccessibleName(f"Delete preset {preset.get('name', '')}")
-        remove.setCursor(QtCore.Qt.PointingHandCursor)
+        remove = icon_button("trash", f"Delete the preset \"{preset.get('name', '')}\"",
+                             f"Delete preset {preset.get('name', '')}")
         remove.clicked.connect(
             lambda _checked=False, k=kind, i=index, n=preset.get("name", ""): self._delete(k, i, n))
         layout.addWidget(remove, 0, QtCore.Qt.AlignTop)
@@ -242,9 +237,3 @@ def _presets_location() -> str:
     from utils.presets import PRESETS_FILE
 
     return PRESETS_FILE
-
-
-def _palette() -> dict:
-    from main import active_palette
-
-    return active_palette()

@@ -27,8 +27,9 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import weakref
 
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from utils.presets import app_dir
 
@@ -74,6 +75,73 @@ def pixmap(name: str, colour: str, size: int = 20) -> QtGui.QPixmap:
 def icon(name: str, colour: str, size: int = 20) -> QtGui.QIcon:
     """A QIcon for `name`, stroked in `colour`."""
     return QtGui.QIcon(pixmap(name, colour, size))
+
+
+# Every icon set through `set_icon`/`set_pixmap`, so a runtime theme switch
+# (Settings > Appearance) can re-stroke it. `icon()`/`pixmap()` above capture
+# a colour once and are fine for anything that gets rebuilt from scratch on
+# every show (e.g. Home's activity rows); everything built once in a
+# constructor -- row actions, empty states, nav-adjacent glyphs -- needs to
+# be told about a theme change explicitly, since Qt has no signal for it and
+# an icon is a coloured asset, not a stylesheet-driven glyph.
+_REGISTRY: list[tuple] = []  # (weakref, "icon" | "pixmap", name, role, size)
+
+
+def _register(widget, kind: str, name: str, role: str, size: int) -> None:
+    # Replace any earlier entry for this widget rather than piling up: a
+    # button whose icon changes more than once in its life (e.g. Delete vs.
+    # Rename swapping icon+colour on every selection change) must not have
+    # a stale entry outlive the current one and win a later refresh.
+    _REGISTRY[:] = [entry for entry in _REGISTRY if entry[0]() is not widget]
+    _REGISTRY.append((weakref.ref(widget), kind, name, role, size))
+
+
+def set_icon(widget: QtWidgets.QAbstractButton, name: str, role: str, size: int = 20) -> None:
+    """Set `widget`'s icon from the active palette's `role`, and remember it
+    so `refresh_theme()` can re-stroke it after a theme switch."""
+    from main import active_palette
+
+    widget.setIcon(icon(name, active_palette()[role], size))
+    _register(widget, "icon", name, role, size)
+
+
+def set_pixmap(label: QtWidgets.QLabel, name: str, role: str, size: int = 20) -> None:
+    """Same as `set_icon`, for a bare glyph QLabel (empty states, entry
+    cards)."""
+    from main import active_palette
+
+    label.setPixmap(pixmap(name, active_palette()[role], size))
+    _register(label, "pixmap", name, role, size)
+
+
+def refresh_theme() -> None:
+    """Re-stroke every icon registered through `set_icon`/`set_pixmap`.
+
+    Call once after `apply_theme()` runs for a runtime switch. A dead
+    reference (its widget was since deleted -- a removed row) is dropped
+    when found; there is no delete signal to hook, so this is the point a
+    stale entry is discovered rather than tracked separately.
+    """
+    from main import active_palette
+
+    palette = active_palette()
+    alive = []
+    for ref, kind, name, role, size in _REGISTRY:
+        widget = ref()
+        if widget is None:
+            continue
+        try:
+            colour = palette[role]
+            if kind == "icon":
+                widget.setIcon(icon(name, colour, size))
+            else:
+                widget.setPixmap(pixmap(name, colour, size))
+        except RuntimeError:
+            # The underlying Qt C++ object was already deleted; the Python
+            # wrapper can briefly outlive it.
+            continue
+        alive.append((ref, kind, name, role, size))
+    _REGISTRY[:] = alive
 
 
 def qss_icon_path(name: str, colour: str) -> str:
