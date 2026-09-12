@@ -663,10 +663,16 @@ class BackupJobDialog(QtWidgets.QDialog):
 # v4 rule 3 was raised about.
 #
 # The minimum widths are what stop a long path from crushing the other columns
-# to a single elided character. Their sum plus the action buttons is wider
-# than the page at the default window size, so the Backup page keeps its
-# horizontal scrollbar -- unlike Cleanup, where the wide content is a wrapping
-# label that should reflow rather than scroll.
+# to a single elided character. The page's QScrollArea keeps its horizontal
+# scrollbar policy at the Qt default (as-needed) rather than switching it off
+# outright -- unlike Cleanup, where the wide content is a wrapping label that
+# should reflow rather than scroll -- because at the app's documented minimum
+# window (940x620) this table's real minimum still runs a few px past the
+# viewport even with four columns and tightened row spacing (measured
+# 2026-09-12: ~8px). Closing that outright means shrinking a column below
+# this table, or the shared Card/IconButton padding used everywhere in the
+# app; both are real tradeoffs an owner should make, not a layout tweak.
+#
 # Four columns, not six. Source and Target used to be columns of their own,
 # and their minimum widths plus three text buttons summed wider than the app's
 # own minimum window: the page grew a horizontal scrollbar, the last button
@@ -761,7 +767,14 @@ class JobRow(QtWidgets.QWidget):
 
         h = QtWidgets.QHBoxLayout(self)
         h.setContentsMargins(0, 10, 0, 10)
-        h.setSpacing(12)
+        # 4, not the app's usual 12, for a row like this: at 940px (the
+        # app's minimum) four columns plus three action buttons plus six
+        # gaps doesn't fit at 12 -- see the JOB_COLUMNS comment above. This
+        # narrows the horizontal-scroll overflow from 32px to ~8px but does
+        # not close it outright; the rest would mean shrinking a column
+        # below its documented minimum or the shared Card/IconButton
+        # padding, both real tradeoffs, not a layout-only fix.
+        h.setSpacing(4)
 
         status, style = self._status(job)
         cells = [
@@ -881,7 +894,7 @@ class RestoreRow(QtWidgets.QWidget):
 
         h = QtWidgets.QHBoxLayout(self)
         h.setContentsMargins(0, 10, 0, 10)
-        h.setSpacing(12)
+        h.setSpacing(4)  # matches JobRow -- see the note there
 
         when = changes.get("when") if changes.get("ok") else None
         last = QtWidgets.QLabel(when or "Never backed up")
@@ -1603,7 +1616,7 @@ class DiskTab(QtWidgets.QWidget):
         row.setObjectName("CardBody")
         h = QtWidgets.QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(12)
+        h.setSpacing(4)  # must match JobRow/RestoreRow or columns misalign
         for text, stretch, minimum in columns:
             label = table_header(text)
             label.setMinimumWidth(minimum)
