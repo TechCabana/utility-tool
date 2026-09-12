@@ -391,3 +391,80 @@ def test_schedule_label_reads_for_each_schedule():
     assert backup_utils.schedule_label(daily) == "Daily at 06:00"
     assert backup_utils.schedule_label(weekly) == "Weekly, Mon at 06:00"
     assert backup_utils.schedule_label(manual) == "Manual only"
+
+
+# ---------------------------------------------------------------------------
+# launchd: the half that can be tested without a Mac
+# ---------------------------------------------------------------------------
+# Loading a plist with launchctl needs macOS and is not tested here. What
+# gets WRITTEN is testable anywhere, and is where the mistakes live: a wrong
+# weekday, an unescaped path, a schedule that silently becomes 20:00.
+
+def test_launchd_plist_is_none_for_a_manual_job():
+    assert backup_utils.launchd_plist({"id": "abc", "schedule": "manual"}) is None
+
+
+def test_launchd_plist_carries_the_scheduled_time():
+    plist = backup_utils.launchd_plist(
+        {"id": "abc", "schedule": "daily", "at": "07:05"})
+    assert "<key>Hour</key><integer>7</integer>" in plist
+    assert "<key>Minute</key><integer>5</integer>" in plist
+    # A daily job must not pin itself to a weekday.
+    assert "Weekday" not in plist
+
+
+def test_launchd_weekly_pins_the_same_day_windows_does():
+    plist = backup_utils.launchd_plist(
+        {"id": "abc", "schedule": "weekly", "at": "20:00"})
+    # schtasks_args uses MON; launchd numbers Monday as 1. The two platforms
+    # disagreeing about which day "weekly" means would be a silent bug.
+    assert f"<key>Weekday</key><integer>{backup_utils.LAUNCHD_MONDAY}</integer>" in plist
+    assert backup_utils.LAUNCHD_MONDAY == 1
+
+
+def test_launchd_plist_falls_back_on_an_unparseable_time():
+    plist = backup_utils.launchd_plist(
+        {"id": "abc", "schedule": "daily", "at": "not-a-time"})
+    assert "<key>Hour</key><integer>20</integer>" in plist
+
+
+def test_launchd_plist_runs_the_headless_cli_for_this_job():
+    plist = backup_utils.launchd_plist({"id": "xyz9", "schedule": "daily"})
+    assert "--run-backup-job" in plist
+    assert "<string>xyz9</string>" in plist
+    # RunAtLoad would fire a backup every login, which is not what a
+    # scheduled job means.
+    assert "<key>RunAtLoad</key>" in plist and "<false/>" in plist
+
+
+def test_launchd_plist_escapes_xml_in_a_path(monkeypatch):
+    # A path containing & or < would otherwise produce a plist macOS refuses
+    # to parse, and the failure would arrive as "job not scheduled" with no
+    # explanation.
+    monkeypatch.setattr(backup_utils, "job_argv",
+                        lambda job_id: ["/Apps/Tom & Jerry/python", "--run-backup-job", job_id])
+    plist = backup_utils.launchd_plist({"id": "abc", "schedule": "daily"})
+    assert "Tom &amp; Jerry" in plist
+    assert "Tom & Jerry" not in plist
+
+
+def test_launchd_label_and_path_are_per_job():
+    assert backup_utils.launchd_label("abc").endswith(".abc")
+    path = backup_utils.launchd_plist_path("abc")
+    assert path.endswith(".plist")
+    assert "LaunchAgents" in path
+
+
+def test_job_argv_and_job_command_describe_the_same_run():
+    argv = backup_utils.job_argv("abc")
+    assert argv[-2:] == ["--run-backup-job", "abc"]
+    command = backup_utils.job_command("abc")
+    for part in argv:
+        assert part in command
+
+
+def test_scheduler_name_matches_the_platform():
+    # User-facing copy: the Backup screen used to say "Windows Task
+    # Scheduler" on every platform, including the one where it is not true.
+    name = backup_utils.scheduler_name()
+    assert name in ("Windows Task Scheduler", "launchd", "the system scheduler")

@@ -556,8 +556,8 @@ class BackupJobDialog(QtWidgets.QDialog):
         hint = QtWidgets.QLabel(
             "Each run copies the source into a new timestamped folder under "
             "the target. Older versions beyond the number kept are deleted. A "
-            "scheduled job is registered with Windows Task Scheduler and runs "
-            "without opening this app.")
+            f"scheduled job is registered with {backup_utils.scheduler_name()} "
+            "and runs without opening this app.")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         v.addWidget(hint)
@@ -1485,7 +1485,8 @@ class DiskTab(QtWidgets.QWidget):
             "A job copies its source folder into a new timestamped folder "
             "under its target every time it runs, keeping the most recent "
             "versions and deleting the rest. Scheduled jobs are handed to "
-            "Windows Task Scheduler and run without this app being open.")
+            f"{backup_utils.scheduler_name()} and run without this app "
+            "being open.")
         note.setObjectName("Hint")
         note.setWordWrap(True)
         jv.addWidget(note)
@@ -1698,8 +1699,7 @@ class DiskTab(QtWidgets.QWidget):
         if job.get("schedule") == "manual":
             message += " It runs only when you press Run Now."
         elif ok:
-            message += (" Registered with Windows Task Scheduler as "
-                        f"{backup_utils.task_name(job['id'])}.")
+            message += f" Registered with {backup_utils.scheduler_name()}."
         else:
             message += f" It could not be scheduled: {detail}"
         self._say(message, ok=ok or job.get("schedule") == "manual")
