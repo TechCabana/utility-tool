@@ -89,6 +89,43 @@ def section_header(text: str) -> QtWidgets.QLabel:
     return label
 
 
+def section(title: str, *actions: QtWidgets.QWidget) -> QtWidgets.QWidget:
+    """A group heading with optional actions on its right, over a hairline.
+
+    `section_header()` covers the common case of a heading with nothing
+    beside it. This is the other case: a section that owns a control, like
+    Cleanup's Rescan or the Duplicates mode picker. Both exist so a screen
+    can be one surface divided by headings rather than a column of separate
+    cards -- a card inside a card flattens the hierarchy the elevation
+    already establishes.
+
+    The label uses #SectionLabel rather than #SectionHeader: the composite
+    draws its own divider and owns its own margins, so borrowing the other
+    style would draw the rule twice.
+    """
+    host = QtWidgets.QWidget()
+    host.setObjectName("CardBody")
+    column = QtWidgets.QVBoxLayout(host)
+    # Asymmetric, for the same reason #SectionHeader's margins are: more air
+    # above a heading than below it, so it binds to what follows rather than
+    # floating between two groups.
+    column.setContentsMargins(0, 14, 0, 0)
+    column.setSpacing(6)
+
+    row = QtWidgets.QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(8)
+    label = QtWidgets.QLabel(title)
+    label.setObjectName("SectionLabel")
+    row.addWidget(label)
+    row.addStretch(1)
+    for widget in actions:
+        row.addWidget(widget)
+    column.addLayout(row)
+    column.addWidget(divider())
+    return host
+
+
 def table_header(text: str) -> QtWidgets.QLabel:
     """A column heading in a repeated-row table.
 
@@ -159,8 +196,7 @@ def add_field(form: QtWidgets.QFormLayout, label: str, widget: QtWidgets.QWidget
     if tooltip:
         caption.setToolTip(tooltip)
         widget.setToolTip(tooltip)
-    if not widget.accessibleName():
-        widget.setAccessibleName(label)
+    _name_control(widget, label)
 
     if hint:
         host = QtWidgets.QWidget()
@@ -178,6 +214,30 @@ def add_field(form: QtWidgets.QFormLayout, label: str, widget: QtWidgets.QWidget
 
     form.addRow(caption, widget)
     return widget
+
+
+def _name_control(widget: QtWidgets.QWidget, label: str) -> None:
+    """Give `widget` an accessible name, following it into a layout host.
+
+    Several fields are a control wrapped in a plain QWidget so a button can
+    sit beside it - the destination picker, the quality slider, a pair of
+    short inputs. Naming the host is useless: the host cannot take focus, so
+    a screen reader never reads it, and the control inside is announced with
+    nothing but its type. This names the first thing that can actually be
+    focused, which is what the label is labelling.
+    """
+    if not label:
+        return
+    if widget.focusPolicy() != QtCore.Qt.NoFocus:
+        if not widget.accessibleName():
+            widget.setAccessibleName(label)
+        return
+    for child in widget.findChildren(QtWidgets.QWidget):
+        if child.focusPolicy() == QtCore.Qt.NoFocus:
+            continue
+        if not child.accessibleName():
+            child.setAccessibleName(label)
+        return
 
 
 def field_pair(first, label: str, second) -> QtWidgets.QWidget:
@@ -199,6 +259,9 @@ def field_pair(first, label: str, second) -> QtWidgets.QWidget:
     caption.setBuddy(second)
     layout.addWidget(caption)
     layout.addWidget(second, 1)
+    # The second control carries its own label; the first is named by the
+    # add_field() row this pair sits in.
+    _name_control(second, label)
     return host
 
 
@@ -365,13 +428,20 @@ class EmptyState(QtWidgets.QWidget):
     """
 
     def __init__(self, title: str, hint: str = "", icon: str = "",
-                 cta_text: str = "", parent=None):
+                 cta_text: str = "", parent=None, compact: bool = False):
         super().__init__(parent)
         self.setObjectName("EmptyState")
 
+        self._hint_label = None
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setAlignment(QtCore.Qt.AlignCenter)
-        layout.setSpacing(8)
+        # `compact` is for an empty state living inside a control rather than
+        # filling a panel -- the placeholder over a file list, where every
+        # pixel it asks for comes straight out of the form below it.
+        layout.setSpacing(4 if compact else 8)
+        if compact:
+            layout.setContentsMargins(0, 0, 0, 0)
 
         if icon:
             from widgets import icons as icon_set
@@ -393,12 +463,17 @@ class EmptyState(QtWidgets.QWidget):
             hint_label.setWordWrap(True)
             # A wrapped QLabel inside a centre-aligned box reports the height
             # of ONE line unless its width is pinned, so the layout gives it a
-            # single line and the second one is clipped. Capping the width is
-            # what makes heightForWidth resolve -- and a centred sentence
-            # should not run the full width of a card anyway.
+            # single line and the rest is clipped. Capping the width is what
+            # makes heightForWidth resolve -- and a centred sentence should
+            # not run the full width of a card anyway.
             hint_label.setMaximumWidth(HINT_WIDTH)
-            hint_label.setMinimumHeight(hint_label.heightForWidth(HINT_WIDTH))
             layout.addWidget(hint_label, 0, QtCore.Qt.AlignHCenter)
+            # The height itself is set in showEvent, not here: at construction
+            # the stylesheet has not been applied, so heightForWidth measures
+            # the default font rather than the one this label will render in,
+            # and underestimates. That is what clipped the last line of this
+            # hint on two screens after it had already been "fixed" once.
+            self._hint_label = hint_label
 
         # Exposed so a caller can connect a real action (e.g. open a file
         # browser). None when no cta_text is given.
@@ -411,3 +486,17 @@ class EmptyState(QtWidgets.QWidget):
             row.addWidget(self.cta)
             row.addStretch(1)
             layout.addLayout(row)
+
+    def showEvent(self, event):
+        """Give the wrapped hint the height its real font actually needs.
+
+        Measured on show rather than at construction because the stylesheet -
+        and therefore the font - is applied in between. Re-measured on every
+        show rather than once, since a theme switch can change the font
+        metrics under it.
+        """
+        super().showEvent(event)
+        if self._hint_label is not None:
+            width = min(HINT_WIDTH, self._hint_label.width() or HINT_WIDTH)
+            self._hint_label.setMinimumHeight(
+                self._hint_label.heightForWidth(width))

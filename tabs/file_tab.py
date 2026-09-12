@@ -13,6 +13,11 @@ from widgets.common import (
 )
 from widgets.pattern import PatternField
 
+
+# See Image Tools: a placeholder does not need a full list's height.
+LIST_HEIGHT_EMPTY = 116
+LIST_HEIGHT_FULL = 150
+
 # Conflict-policy combo text -> the internal codes utils/file_utils.py
 # understands. "Ask" is not in this map -- it is resolved to one of the
 # other three, once, for the whole batch, in FileTab.apply() before the
@@ -119,8 +124,7 @@ class FileTab(QtWidgets.QWidget):
 
         v.addWidget(PageHeader(
             "File Tools",
-            "Rename, move, copy or delete a batch of files. Deletes go to the "
-            "Recycle Bin, and every batch is previewed before it runs."))
+            "Rename, move, copy or delete a batch of files. Deletes are recoverable."))
 
         files_card, files_body = card()
         head = QtWidgets.QHBoxLayout()
@@ -152,8 +156,13 @@ class FileTab(QtWidgets.QWidget):
         # happens, so the spare vertical space belongs to that.
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.listw.setMinimumHeight(104)
-        self.listw.setMaximumHeight(150)
+        self.listw.setAccessibleName("Files in this batch")
+        self.listw.setAccessibleDescription(
+            "Drop files here, or use the Add files button above.")
+        # Same reasoning as Image Tools: an empty list is a placeholder and
+        # should not hold the height of a full one at the minimum window.
+        self.listw.setMinimumHeight(LIST_HEIGHT_EMPTY)
+        self.listw.setMaximumHeight(LIST_HEIGHT_EMPTY)
         files_body.addWidget(self.listw)
         v.addWidget(files_card)
 
@@ -165,6 +174,7 @@ class FileTab(QtWidgets.QWidget):
             hint="Drag files here, or use Add files.",
             icon="file-text",
             parent=self.listw,
+            compact=True,
         )
         self.placeholder.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.placeholder.resize(self.listw.size())
@@ -314,6 +324,7 @@ class FileTab(QtWidgets.QWidget):
         # Old name and new name have to line up down the column to be
         # comparable at a glance, which a proportional face will not do.
         self.preview.setObjectName("Mono")
+        self.preview.setAccessibleName("Preview of what this operation will do")
         # Capped: a QTextEdit's own size hint is generous, and left uncapped
         # an empty box took a third of the page.
         self.preview.setMinimumHeight(80)
@@ -362,6 +373,18 @@ class FileTab(QtWidgets.QWidget):
         self.status.setObjectName("Hint")
         self.status.setWordWrap(True)
         fv.addWidget(self.status)
+
+        # Offered only after a batch that actually failed something. A
+        # failure is usually about one file - a permission, a lock, a name
+        # that collides - and losing the rest of the batch's setup to get at
+        # it is the kind of thing that makes a tool feel hostile.
+        self.retry_btn = QtWidgets.QPushButton("  Retry failed")
+        self.retry_btn.setObjectName("Secondary")
+        icons.set_icon(self.retry_btn, "rotate-ccw", "text_muted", 15)
+        self.retry_btn.setToolTip("Run this operation again on only the files that failed")
+        self.retry_btn.clicked.connect(self.retry_failed)
+        self.retry_btn.setVisible(False)
+        fv.addWidget(self.retry_btn, 0, Qt.AlignLeft)
         v.addWidget(footer)
 
         # Signals
@@ -389,6 +412,8 @@ class FileTab(QtWidgets.QWidget):
 
         self._failures = 0
         self._total = 0
+        self._failed_indices = []
+        self._batch_paths = []
         self._on_operation_changed()  # apply initial (Rename) field visibility
         self._refresh_state()
 
@@ -423,6 +448,19 @@ class FileTab(QtWidgets.QWidget):
         self.status.setText("Add files to get started.")
         self._refresh_state()
 
+    def retry_failed(self):
+        """Rebuild the list from the files that failed and run it again."""
+        failed = [self._batch_paths[i] for i in self._failed_indices
+                  if 0 <= i < len(self._batch_paths)]
+        if not failed:
+            return
+        self.listw.clear()
+        self.listw.addItems(failed)
+        self.retry_btn.setVisible(False)
+        self.status.setText(f"Retrying {len(failed)} file(s) that failed.")
+        self._refresh_state()
+        self.apply()
+
     def _refresh_state(self):
         """One place decides what is pressable and what the counts say.
 
@@ -433,6 +471,9 @@ class FileTab(QtWidgets.QWidget):
         count = self.listw.count()
         running = self.thread is not None
         self.placeholder.setVisible(count == 0)
+        height = LIST_HEIGHT_EMPTY if count == 0 else LIST_HEIGHT_FULL
+        self.listw.setMinimumHeight(height)
+        self.listw.setMaximumHeight(height)
         self.files_count.setText("" if not count else f"{count} file{'s' if count != 1 else ''}")
         self.apply_btn.setEnabled(count > 0 and not running)
         self.clear_btn.setEnabled(count > 0 and not running)
@@ -625,6 +666,11 @@ class FileTab(QtWidgets.QWidget):
         self.thread.start()
         self._start_time = time.time()
         self._failures = 0
+        self._failed_indices = []
+        # The paths as they were before the operation ran: the list items are
+        # rewritten in place with their outcome, so their text is no longer a
+        # path once a batch has finished.
+        self._batch_paths = list(paths)
         self._total = len(paths)
         self.progress.setValue(0)
         self.progress.setVisible(True)
@@ -660,6 +706,7 @@ class FileTab(QtWidgets.QWidget):
         # up as a modal per failure: a batch of thirty files with three bad
         # ones used to mean three dialogs to dismiss, mid-run.
         self._failures = getattr(self, "_failures", 0) + 1
+        self._failed_indices.append(idx)
         if 0 <= idx < self.listw.count():
             item = self.listw.item(idx)
             item.setText(f"{item.text()}  \u2014  failed: {msg}")
@@ -678,6 +725,7 @@ class FileTab(QtWidgets.QWidget):
         self._restyle_status()
         self.status.setText(summary)
         self.progress.setValue(100)
+        self.retry_btn.setVisible(bool(failures))
         activity.record(summary, kind="files")
         if self.thread:
             self.thread.quit()

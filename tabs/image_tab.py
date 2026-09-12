@@ -20,6 +20,13 @@ from widgets.common import (
 from widgets.pattern import PatternField
 
 
+# The file list's two heights: a placeholder does not need the room a real
+# list does, and at the app's minimum window the difference is most of the
+# specification form's viewport.
+LIST_HEIGHT_EMPTY = 116
+LIST_HEIGHT_FULL = 150
+
+
 def human_size(num_bytes: float) -> str:
     """Bytes as the smallest unit that keeps the number readable."""
     for unit in ("B", "KB", "MB", "GB"):
@@ -35,6 +42,7 @@ class ImageRow(QtWidgets.QWidget):
     def __init__(self, path: str):
         super().__init__()
         self.path = path
+        self.failed = False
         self.setObjectName("CardBody")
 
         layout = QtWidgets.QHBoxLayout(self)
@@ -52,6 +60,7 @@ class ImageRow(QtWidgets.QWidget):
         layout.addWidget(self.result, 1)
 
     def mark_error(self, message: str):
+        self.failed = True
         # The colour lives in the stylesheet, not in an inline sheet here: a
         # widget-level stylesheet outranks the app sheet and pins a literal
         # colour that the dark theme then cannot change.
@@ -144,8 +153,7 @@ class ImageTab(QtWidgets.QWidget):
 
         root.addWidget(PageHeader(
             "Image Tools",
-            "Compress, resize or convert a batch of images. Originals are left "
-            "alone unless you send the output to the same folder."))
+            "Compress, resize or convert a batch of images. Originals are untouched."))
 
         root.addWidget(self._build_files_card())
         root.addWidget(self._build_spec_area(), 1)
@@ -208,8 +216,15 @@ class ImageTab(QtWidgets.QWidget):
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.listw.setAcceptDrops(True)
-        self.listw.setMinimumHeight(104)
-        self.listw.setMaximumHeight(150)
+        self.listw.setAccessibleName("Images in this batch")
+        self.listw.setAccessibleDescription(
+            "Drop image files here, or use the Add images button above.")
+        # Sized by what it holds. An empty list is a placeholder and should
+        # not reserve the height of a full one: at the app's 620px minimum
+        # window that reservation left the fourteen-field form below it about
+        # one field of viewport. `_resize_list()` grows it once files arrive.
+        self.listw.setMinimumHeight(LIST_HEIGHT_EMPTY)
+        self.listw.setMaximumHeight(LIST_HEIGHT_EMPTY)
         self.listw.dragEnterEvent = self._drag_enter
         self.listw.dropEvent = self._drop
         body.addWidget(self.listw)
@@ -221,6 +236,7 @@ class ImageTab(QtWidgets.QWidget):
             hint="Drag images here, or use Add images.",
             icon="file-image",
             parent=self.listw,
+            compact=True,
         )
         self.empty_state.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.listw.resizeEvent = lambda e: (
@@ -449,6 +465,15 @@ class ImageTab(QtWidgets.QWidget):
         self.status.setObjectName("Hint")
         layout.addWidget(self.status)
 
+        self.retry_btn = QtWidgets.QPushButton("  Retry failed")
+        self.retry_btn.setObjectName("Secondary")
+        icons.set_icon(self.retry_btn, "rotate-ccw", "text_muted", 15)
+        self.retry_btn.setToolTip(
+            "Run the batch again with only the files that failed")
+        self.retry_btn.clicked.connect(self.retry_failed)
+        self.retry_btn.setVisible(False)
+        layout.addWidget(self.retry_btn, 0, Qt.AlignLeft)
+
         self.open_output_btn = QtWidgets.QPushButton("  Open output folder")
         self.open_output_btn.setObjectName("Secondary")
         icons.set_icon(self.open_output_btn, "folder-open", "text_muted", 15)
@@ -477,9 +502,16 @@ class ImageTab(QtWidgets.QWidget):
         else:
             self.start_btn.setToolTip(f"Process {self.listw.count()} file(s)")
 
+    def _resize_list(self):
+        """Compact while empty, taller once there is something to show."""
+        height = LIST_HEIGHT_EMPTY if self.listw.count() == 0 else LIST_HEIGHT_FULL
+        self.listw.setMinimumHeight(height)
+        self.listw.setMaximumHeight(height)
+
     def _update_empty_state(self):
         count = self.listw.count()
         self.empty_state.setVisible(count == 0)
+        self._resize_list()
         self.files_count.setText("" if not count else f"{count} file{'s' if count != 1 else ''}")
         if hasattr(self, "start_btn"):
             self._set_running(self.thread is not None)
@@ -654,6 +686,7 @@ class ImageTab(QtWidgets.QWidget):
         self._out_dir_used = out_dir
         self._failures = 0
         self.open_output_btn.setVisible(False)
+        self.retry_btn.setVisible(False)
 
         self._inflate_rows(files)
         self.overall.setValue(0)
@@ -678,6 +711,23 @@ class ImageTab(QtWidgets.QWidget):
         self._start_time = time.time()
         self._count = len(files)
         self._set_running(True)
+
+    def retry_failed(self):
+        """Rebuild the list from the files that failed, and run it again.
+
+        A failure is usually about one file - a permission, a truncated
+        image - and losing the other forty-nine files' worth of setup to get
+        at it is the kind of thing that makes a tool feel hostile.
+        """
+        failed = [row.path for row in self.rows if row.failed]
+        if not failed:
+            return
+        self.listw.clear()
+        self.rows.clear()
+        for path in failed:
+            self._add_file(path)
+        self.status.setText(f"Retrying {len(failed)} file(s) that failed.")
+        self.start()
 
     def stop(self):
         if self.worker:
@@ -720,6 +770,7 @@ class ImageTab(QtWidgets.QWidget):
         self.status.style().polish(self.status)
 
         self.open_output_btn.setVisible(bool(self._out_dir_used))
+        self.retry_btn.setVisible(bool(self._failures))
         activity.record(summary, kind="image")
 
         if self.thread:
