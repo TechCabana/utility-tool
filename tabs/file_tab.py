@@ -369,6 +369,18 @@ class FileTab(QtWidgets.QWidget):
         self.status.setObjectName("Hint")
         self.status.setWordWrap(True)
         fv.addWidget(self.status)
+
+        # Offered only after a batch that actually failed something. A
+        # failure is usually about one file - a permission, a lock, a name
+        # that collides - and losing the rest of the batch's setup to get at
+        # it is the kind of thing that makes a tool feel hostile.
+        self.retry_btn = QtWidgets.QPushButton("  Retry failed")
+        self.retry_btn.setObjectName("Secondary")
+        icons.set_icon(self.retry_btn, "rotate-ccw", "text_muted", 15)
+        self.retry_btn.setToolTip("Run this operation again on only the files that failed")
+        self.retry_btn.clicked.connect(self.retry_failed)
+        self.retry_btn.setVisible(False)
+        fv.addWidget(self.retry_btn, 0, Qt.AlignLeft)
         v.addWidget(footer)
 
         # Signals
@@ -396,6 +408,8 @@ class FileTab(QtWidgets.QWidget):
 
         self._failures = 0
         self._total = 0
+        self._failed_indices = []
+        self._batch_paths = []
         self._on_operation_changed()  # apply initial (Rename) field visibility
         self._refresh_state()
 
@@ -429,6 +443,19 @@ class FileTab(QtWidgets.QWidget):
         self.progress.setVisible(False)
         self.status.setText("Add files to get started.")
         self._refresh_state()
+
+    def retry_failed(self):
+        """Rebuild the list from the files that failed and run it again."""
+        failed = [self._batch_paths[i] for i in self._failed_indices
+                  if 0 <= i < len(self._batch_paths)]
+        if not failed:
+            return
+        self.listw.clear()
+        self.listw.addItems(failed)
+        self.retry_btn.setVisible(False)
+        self.status.setText(f"Retrying {len(failed)} file(s) that failed.")
+        self._refresh_state()
+        self.apply()
 
     def _refresh_state(self):
         """One place decides what is pressable and what the counts say.
@@ -635,6 +662,11 @@ class FileTab(QtWidgets.QWidget):
         self.thread.start()
         self._start_time = time.time()
         self._failures = 0
+        self._failed_indices = []
+        # The paths as they were before the operation ran: the list items are
+        # rewritten in place with their outcome, so their text is no longer a
+        # path once a batch has finished.
+        self._batch_paths = list(paths)
         self._total = len(paths)
         self.progress.setValue(0)
         self.progress.setVisible(True)
@@ -670,6 +702,7 @@ class FileTab(QtWidgets.QWidget):
         # up as a modal per failure: a batch of thirty files with three bad
         # ones used to mean three dialogs to dismiss, mid-run.
         self._failures = getattr(self, "_failures", 0) + 1
+        self._failed_indices.append(idx)
         if 0 <= idx < self.listw.count():
             item = self.listw.item(idx)
             item.setText(f"{item.text()}  \u2014  failed: {msg}")
@@ -688,6 +721,7 @@ class FileTab(QtWidgets.QWidget):
         self._restyle_status()
         self.status.setText(summary)
         self.progress.setValue(100)
+        self.retry_btn.setVisible(bool(failures))
         activity.record(summary, kind="files")
         if self.thread:
             self.thread.quit()

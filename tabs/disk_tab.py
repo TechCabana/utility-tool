@@ -852,6 +852,7 @@ class RestoreRow(QtWidgets.QWidget):
     wanted, is an action off this row rather than a second table.
     """
     restore_requested = QtCore.Signal(dict)
+    edit_requested = QtCore.Signal(dict)
 
     def __init__(self, job: dict, changes: dict):
         super().__init__()
@@ -876,12 +877,41 @@ class RestoreRow(QtWidgets.QWidget):
             widget.setMinimumWidth(minimum)
             h.addWidget(widget, stretch)
 
+        # A row whose folders cannot be read offers the thing that fixes it -
+        # the job's own Edit dialog - instead of a Restore button that is
+        # disabled for a reason the row does not explain. Where the message is
+        # merely "never backed up" there is nothing to fix, so the ordinary
+        # (disabled) Restore stays.
+        if self._is_broken(changes):
+            self.fix_btn = QtWidgets.QPushButton("Fix job...")
+            self.fix_btn.setObjectName("Secondary")
+            self.fix_btn.setToolTip(
+                "Open this job and correct its Source or Target folder")
+            self.fix_btn.setAccessibleName(
+                f"Fix the folders for {job.get('name', 'this job')}")
+            self.fix_btn.clicked.connect(lambda: self.edit_requested.emit(self.job))
+            h.addWidget(self.fix_btn)
+            self.restore_btn = self.fix_btn
+            return
+
         self.restore_btn = QtWidgets.QPushButton("Restore...")
         self.restore_btn.setObjectName("Secondary")
         # Nothing to restore from until a version exists on disk.
         self.restore_btn.setEnabled(bool(changes.get("ok")))
         self.restore_btn.clicked.connect(lambda: self.restore_requested.emit(self.job))
         h.addWidget(self.restore_btn)
+
+    @staticmethod
+    def _is_broken(changes: dict) -> bool:
+        """True when the failure is something editing the job would fix.
+
+        A job that has simply never run is not broken, and offering to "fix"
+        it would be an invented remedy for a state that is entirely normal.
+        """
+        if changes.get("ok"):
+            return False
+        message = changes.get("message", "")
+        return message != "Never backed up"
 
     def _changes(self, changes: dict):
         """The changes-since column, coloured by what it means.
@@ -1603,6 +1633,9 @@ class DiskTab(QtWidgets.QWidget):
                 self.restore_layout.addWidget(divider())
             row = RestoreRow(job, self._changes.get(job["id"], {}))
             row.restore_requested.connect(self.restore_backup_job)
+            # A broken row offers Fix job..., which is the same Edit dialog
+            # the jobs table above opens.
+            row.edit_requested.connect(self.edit_backup_job)
             self.restore_layout.addWidget(row)
         self._set_backup_controls(enabled=self.backup_thread is None)
 

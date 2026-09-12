@@ -42,6 +42,7 @@ class ImageRow(QtWidgets.QWidget):
     def __init__(self, path: str):
         super().__init__()
         self.path = path
+        self.failed = False
         self.setObjectName("CardBody")
 
         layout = QtWidgets.QHBoxLayout(self)
@@ -59,6 +60,7 @@ class ImageRow(QtWidgets.QWidget):
         layout.addWidget(self.result, 1)
 
     def mark_error(self, message: str):
+        self.failed = True
         # The colour lives in the stylesheet, not in an inline sheet here: a
         # widget-level stylesheet outranks the app sheet and pins a literal
         # colour that the dark theme then cannot change.
@@ -460,6 +462,15 @@ class ImageTab(QtWidgets.QWidget):
         self.status.setObjectName("Hint")
         layout.addWidget(self.status)
 
+        self.retry_btn = QtWidgets.QPushButton("  Retry failed")
+        self.retry_btn.setObjectName("Secondary")
+        icons.set_icon(self.retry_btn, "rotate-ccw", "text_muted", 15)
+        self.retry_btn.setToolTip(
+            "Run the batch again with only the files that failed")
+        self.retry_btn.clicked.connect(self.retry_failed)
+        self.retry_btn.setVisible(False)
+        layout.addWidget(self.retry_btn, 0, Qt.AlignLeft)
+
         self.open_output_btn = QtWidgets.QPushButton("  Open output folder")
         self.open_output_btn.setObjectName("Secondary")
         icons.set_icon(self.open_output_btn, "folder-open", "text_muted", 15)
@@ -672,6 +683,7 @@ class ImageTab(QtWidgets.QWidget):
         self._out_dir_used = out_dir
         self._failures = 0
         self.open_output_btn.setVisible(False)
+        self.retry_btn.setVisible(False)
 
         self._inflate_rows(files)
         self.overall.setValue(0)
@@ -696,6 +708,23 @@ class ImageTab(QtWidgets.QWidget):
         self._start_time = time.time()
         self._count = len(files)
         self._set_running(True)
+
+    def retry_failed(self):
+        """Rebuild the list from the files that failed, and run it again.
+
+        A failure is usually about one file - a permission, a truncated
+        image - and losing the other forty-nine files' worth of setup to get
+        at it is the kind of thing that makes a tool feel hostile.
+        """
+        failed = [row.path for row in self.rows if row.failed]
+        if not failed:
+            return
+        self.listw.clear()
+        self.rows.clear()
+        for path in failed:
+            self._add_file(path)
+        self.status.setText(f"Retrying {len(failed)} file(s) that failed.")
+        self.start()
 
     def stop(self):
         if self.worker:
@@ -738,6 +767,7 @@ class ImageTab(QtWidgets.QWidget):
         self.status.style().polish(self.status)
 
         self.open_output_btn.setVisible(bool(self._out_dir_used))
+        self.retry_btn.setVisible(bool(self._failures))
         activity.record(summary, kind="image")
 
         if self.thread:
