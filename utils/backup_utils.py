@@ -403,7 +403,12 @@ def changes_since(job: Dict,
     """
     source = job.get("source", "")
     if not source or not os.path.isdir(source):
-        return {"ok": False, "message": "Source folder not found", "changed": 0}
+        # `fixable` says the failure is one editing the job would resolve,
+        # so the UI does not have to infer that from the message text. The
+        # other two failures here are not: "never backed up" is a normal
+        # state, and a cancelled comparison says nothing about the job.
+        return {"ok": False, "message": "Source folder not found",
+                "changed": 0, "fixable": True}
 
     version = latest_version(job)
     if version is None:

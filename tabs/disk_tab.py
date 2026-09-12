@@ -905,13 +905,13 @@ class RestoreRow(QtWidgets.QWidget):
     def _is_broken(changes: dict) -> bool:
         """True when the failure is something editing the job would fix.
 
-        A job that has simply never run is not broken, and offering to "fix"
-        it would be an invented remedy for a state that is entirely normal.
+        Reads the flag `changes_since` sets rather than matching on message
+        text. The first version of this asked "is the message anything other
+        than 'Never backed up'", which also caught "Cancelled" - so a healthy
+        job whose comparison had simply not finished was offered a Fix button
+        for a problem it did not have.
         """
-        if changes.get("ok"):
-            return False
-        message = changes.get("message", "")
-        return message != "Never backed up"
+        return bool(changes.get("fixable"))
 
     def _changes(self, changes: dict):
         """The changes-since column, coloured by what it means.

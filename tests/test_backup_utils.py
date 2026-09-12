@@ -468,3 +468,25 @@ def test_scheduler_name_matches_the_platform():
     # Scheduler" on every platform, including the one where it is not true.
     name = backup_utils.scheduler_name()
     assert name in ("Windows Task Scheduler", "launchd", "the system scheduler")
+
+
+def test_only_a_missing_source_is_marked_fixable(tmp_path):
+    """The Restore row offers "Fix job..." from this flag, so it has to mean
+    "editing the job would resolve this" and nothing looser. A first version
+    inferred it from the message text and caught "Cancelled" as well, which
+    offered a fix for a job that had nothing wrong with it."""
+    job = {"id": "j1", "name": "J", "source": str(tmp_path / "gone"),
+           "target": str(tmp_path / "dst"), "retention": 2}
+    missing = backup_utils.changes_since(job)
+    assert missing["ok"] is False
+    assert missing["message"] == "Source folder not found"
+    assert missing.get("fixable") is True
+
+    # A real source with no backup yet is a normal state, not a fault.
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "a.txt").write_text("a", encoding="utf-8")
+    job["source"] = str(source)
+    never = backup_utils.changes_since(job)
+    assert never["message"] == "Never backed up"
+    assert not never.get("fixable")
