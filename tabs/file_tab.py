@@ -156,6 +156,9 @@ class FileTab(QtWidgets.QWidget):
         # happens, so the spare vertical space belongs to that.
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.listw.setAccessibleName("Files in this batch")
+        self.listw.setAccessibleDescription(
+            "Drop files here, or use the Add files button above.")
         # Same reasoning as Image Tools: an empty list is a placeholder and
         # should not hold the height of a full one at the minimum window.
         self.listw.setMinimumHeight(LIST_HEIGHT_EMPTY)
@@ -321,6 +324,7 @@ class FileTab(QtWidgets.QWidget):
         # Old name and new name have to line up down the column to be
         # comparable at a glance, which a proportional face will not do.
         self.preview.setObjectName("Mono")
+        self.preview.setAccessibleName("Preview of what this operation will do")
         # Capped: a QTextEdit's own size hint is generous, and left uncapped
         # an empty box took a third of the page.
         self.preview.setMinimumHeight(80)

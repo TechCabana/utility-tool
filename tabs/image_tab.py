@@ -216,6 +216,9 @@ class ImageTab(QtWidgets.QWidget):
         self.listw = QtWidgets.QListWidget()
         self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.listw.setAcceptDrops(True)
+        self.listw.setAccessibleName("Images in this batch")
+        self.listw.setAccessibleDescription(
+            "Drop image files here, or use the Add images button above.")
         # Sized by what it holds. An empty list is a placeholder and should
         # not reserve the height of a full one: at the app's 620px minimum
         # window that reservation left the fourteen-field form below it about

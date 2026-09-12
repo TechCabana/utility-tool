@@ -647,7 +647,17 @@ QProgressBar#BusyBar::chunk { background-color: @@text_faint@@; }
  * Overlay style, no arrows, transparent trough. The previous sheet left the
  * trough and the corner unstyled, so a scrolling card showed a grey block
  * sitting on top of its own border. */
-QAbstractScrollArea { background: transparent; }
+/* A scroll area is a tab stop - that is how a keyboard user scrolls a long
+   form without moving focus into it - so it has to show that it has focus.
+   The border is always present and merely changes colour, so gaining focus
+   never nudges the layout. */
+QAbstractScrollArea {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: @@radius_m@@;
+}
+
+QAbstractScrollArea:focus { border-color: @@accent@@; }
 QAbstractScrollArea::corner { background: transparent; border: none; }
 
 QScrollBar:vertical {

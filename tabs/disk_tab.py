@@ -1049,6 +1049,9 @@ class DiskTab(QtWidgets.QWidget):
         # chrome for free -- no new QSS, and no custom segmented control to
         # maintain alongside the sidebar's existing nav paradigm.
         self.sub = QtWidgets.QTabWidget()
+        # The bar itself, not its tabs: a screen reader announces each tab by
+        # its text but reads the bar as an unnamed tab list without this.
+        self.sub.tabBar().setAccessibleName("Disk sections")
         self.sub.addTab(self._build_overview(), "Overview")
         self.sub.addTab(self._build_cleanup(), "Cleanup")
         self.sub.addTab(self._build_backup(), "Backup")
@@ -1349,6 +1352,7 @@ class DiskTab(QtWidgets.QWidget):
         # already has one mode-picker idiom and does not need a second.
         self.dup_mode = QtWidgets.QComboBox()
         self.dup_mode.addItems(["Files (exact match)", "Images (visual match)"])
+        self.dup_mode.setAccessibleName("Duplicate matching mode")
         self.dup_mode.currentIndexChanged.connect(self.on_dup_mode_changed)
 
         self.dup_scan_btn = QtWidgets.QPushButton("Scan")

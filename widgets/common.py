@@ -196,8 +196,7 @@ def add_field(form: QtWidgets.QFormLayout, label: str, widget: QtWidgets.QWidget
     if tooltip:
         caption.setToolTip(tooltip)
         widget.setToolTip(tooltip)
-    if not widget.accessibleName():
-        widget.setAccessibleName(label)
+    _name_control(widget, label)
 
     if hint:
         host = QtWidgets.QWidget()
@@ -215,6 +214,30 @@ def add_field(form: QtWidgets.QFormLayout, label: str, widget: QtWidgets.QWidget
 
     form.addRow(caption, widget)
     return widget
+
+
+def _name_control(widget: QtWidgets.QWidget, label: str) -> None:
+    """Give `widget` an accessible name, following it into a layout host.
+
+    Several fields are a control wrapped in a plain QWidget so a button can
+    sit beside it - the destination picker, the quality slider, a pair of
+    short inputs. Naming the host is useless: the host cannot take focus, so
+    a screen reader never reads it, and the control inside is announced with
+    nothing but its type. This names the first thing that can actually be
+    focused, which is what the label is labelling.
+    """
+    if not label:
+        return
+    if widget.focusPolicy() != QtCore.Qt.NoFocus:
+        if not widget.accessibleName():
+            widget.setAccessibleName(label)
+        return
+    for child in widget.findChildren(QtWidgets.QWidget):
+        if child.focusPolicy() == QtCore.Qt.NoFocus:
+            continue
+        if not child.accessibleName():
+            child.setAccessibleName(label)
+        return
 
 
 def field_pair(first, label: str, second) -> QtWidgets.QWidget:
@@ -236,6 +259,9 @@ def field_pair(first, label: str, second) -> QtWidgets.QWidget:
     caption.setBuddy(second)
     layout.addWidget(caption)
     layout.addWidget(second, 1)
+    # The second control carries its own label; the first is named by the
+    # add_field() row this pair sits in.
+    _name_control(second, label)
     return host
 
 
