@@ -1,48 +1,47 @@
-from PySide6 import QtWidgets, QtCore
+from PySide6 import QtCore, QtWidgets
+
+from styles import tokens
+from utils import activity
+from widgets import icons
+from widgets.common import EmptyState, PageHeader, card, divider
 
 
 class EntryCard(QtWidgets.QFrame):
-    """A clickable dashboard card that requests a tab switch.
+    """A clickable dashboard card that requests a page switch.
 
-    Uses the existing "#Card" objectName so it picks up the Soft Rose panel
-    styling and drop shadow for free (see apply_card_shadows() in main.py) --
-    no new QSS needed beyond the #Card:focus rule in styles/theme.qss.
-
-    DESIGN.md's Operate mode requires "every component is a real, working
-    control ... the world is a skin over standard Qt affordances, not a
-    replacement for them" -- a QFrame with only a mouse handler fails that:
-    it is invisible to Tab and unusable from the keyboard. StrongFocus plus
-    a Return/Space keyPressEvent makes it behave like the real button it
-    visually reads as.
+    A card that behaves like a button has to *be* one: a QFrame with only a
+    mouse handler is invisible to Tab and unusable from the keyboard.
+    StrongFocus plus a Return/Space handler makes it behave like the control
+    it visually reads as, and the hover state in the sheet is what tells a
+    mouse user it is pressable at all.
     """
     clicked = QtCore.Signal()
 
-    def __init__(self, title: str, description: str, badge: str = ""):
+    def __init__(self, title: str, description: str, icon_name: str):
         super().__init__()
-        self.setObjectName("Card")
+        self.setObjectName("EntryCard")
+        self.icon_name = icon_name
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setAccessibleName(title)
         self.setAccessibleDescription(description)
 
-        v = QtWidgets.QVBoxLayout(self)
-        v.setSpacing(6)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(8)
 
-        head = QtWidgets.QHBoxLayout()
+        self.glyph = QtWidgets.QLabel()
+        icons.set_pixmap(self.glyph, icon_name, "accent", 22)
+        layout.addWidget(self.glyph)
+
         name = QtWidgets.QLabel(title)
         name.setObjectName("H2")
-        head.addWidget(name)
-        head.addStretch(1)
-        if badge:
-            tag = QtWidgets.QLabel(badge)
-            tag.setObjectName("FormLabel")
-            head.addWidget(tag)
-        v.addLayout(head)
+        layout.addWidget(name)
 
-        desc = QtWidgets.QLabel(description)
-        desc.setObjectName("Hint")
-        desc.setWordWrap(True)
-        v.addWidget(desc)
+        detail = QtWidgets.QLabel(description)
+        detail.setObjectName("Hint")
+        detail.setWordWrap(True)
+        layout.addWidget(detail)
+        layout.addStretch(1)
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
@@ -50,9 +49,8 @@ class EntryCard(QtWidgets.QFrame):
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event):
-        # Activate the same as a click on Return/Enter/Space -- the standard
-        # QAbstractButton keyboard-activation keys -- so a Tab-focused card
-        # is actually usable, not just visually a button.
+        # The standard QAbstractButton activation keys, so a Tab-focused card
+        # is actually usable rather than merely focusable.
         if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Space):
             self.clicked.emit()
             return
@@ -60,88 +58,92 @@ class EntryCard(QtWidgets.QFrame):
 
 
 class HomeTab(QtWidgets.QWidget):
-    # Emitted with the target QStackedWidget index; MainWindow wires this to
-    # the same tab-switch path the sidebar buttons use (see main.py).
+    # Emitted with the target page index; MainWindow wires this to the same
+    # path the sidebar buttons use.
     switch_requested = QtCore.Signal(int)
+
+    ENTRIES = (
+        ("Image Tools", "Compress, resize and convert a batch of images.", "image", 1),
+        ("File Tools", "Rename, move, copy or delete a batch of files.", "files", 2),
+        ("Disk", "See what is using space, clean up, and back folders up.", "hard-drive", 3),
+    )
 
     def __init__(self):
         super().__init__()
 
         layout = QtWidgets.QVBoxLayout(self)
-        # Margins leave room for the card drop shadows to render un-clipped
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(16)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(tokens.SPACE_BLOCK)
 
-        header = QtWidgets.QLabel("UtilityTool")
-        header.setObjectName("H1")
-        layout.addWidget(header)
+        layout.addWidget(PageHeader(
+            "UtilityTool",
+            "Batch tools for the files already on this machine. Nothing is uploaded."))
 
-        sub = QtWidgets.QLabel("Pick a tool to get started.")
-        sub.setObjectName("Hint")
-        layout.addWidget(sub)
-
-        # Entry cards: Image Tools / File Manager / Disk
         cards = QtWidgets.QHBoxLayout()
-        cards.setSpacing(12)
+        cards.setSpacing(tokens.SPACE_FIELD)
         layout.addLayout(cards)
 
-        image_card = EntryCard("Image Tools", "Batch compress, resize and convert images.")
-        image_card.clicked.connect(lambda: self.switch_requested.emit(1))
-        cards.addWidget(image_card, 1)
+        for title, description, icon_name, index in self.ENTRIES:
+            entry = EntryCard(title, description, icon_name)
+            entry.clicked.connect(lambda i=index: self.switch_requested.emit(i))
+            cards.addWidget(entry, 1)
 
-        file_card = EntryCard("File Manager", "Batch rename, move, copy or delete files.")
-        file_card.clicked.connect(lambda: self.switch_requested.emit(2))
-        cards.addWidget(file_card, 1)
+        self._activity_card, self._activity_body = card(
+            "Recent activity", "The last batches this app ran, newest first.")
+        layout.addWidget(self._activity_card, 1)
 
-        # Disk (Overview / Cleanup / Backup, see DESIGN.md). Only Overview is
-        # built so far; the card routes to the real tab, which carries its own
-        # placeholders for the two sub-areas that aren't.
-        disk_card = EntryCard("Disk", "Usage overview, cleanup and backup.")
-        disk_card.clicked.connect(lambda: self.switch_requested.emit(3))
-        cards.addWidget(disk_card, 1)
+        self._rows = QtWidgets.QVBoxLayout()
+        self._rows.setSpacing(0)
+        self._activity_body.addLayout(self._rows)
 
-        # Recent Activity
-        activity_header = QtWidgets.QLabel("Recent Activity")
-        activity_header.setObjectName("H2")
-        layout.addWidget(activity_header)
+        self._empty = EmptyState(
+            title="Nothing run yet",
+            hint="Batches you run from Image Tools, File Tools or Disk are listed here.",
+            icon="clock",
+        )
+        self._activity_body.addWidget(self._empty)
+        self._activity_body.addStretch(1)
 
-        self._activity_card = QtWidgets.QFrame()
-        self._activity_card.setObjectName("Card")
-        self._activity_layout = QtWidgets.QVBoxLayout(self._activity_card)
-        self._activity_layout.setSpacing(6)
-        layout.addWidget(self._activity_card)
+        self.refresh()
 
-        self._activity_entries = []
-        self._render_activity()
+    def showEvent(self, event):
+        # Refreshed on show rather than pushed from the tool tabs: the log is
+        # a file, so reading it when the screen appears keeps Home correct
+        # even after a batch that ran before this widget existed.
+        self.refresh()
+        super().showEvent(event)
 
-        layout.addStretch(1)
+    def refresh(self):
+        while self._rows.count():
+            item = self._rows.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
 
-    def add_activity(self, text):
-        """Record a batch-operation summary at the top of Recent Activity.
+        entries = activity.load()[:6]
+        self._empty.setVisible(not entries)
 
-        ponytail: in-memory only, cleared on restart -- no batch in the app
-        calls this yet (nothing logs history today), so a persistence layer
-        would be speculative. Add one (e.g. a small JSON file next to
-        presets.json) if a real activity log is ever wanted.
-        """
-        stamp = QtCore.QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
-        self._activity_entries.insert(0, f"{stamp}  -  {text}")
-        self._render_activity()
+        for position, entry in enumerate(entries):
+            if position:
+                self._rows.addWidget(divider())
+            self._rows.addWidget(self._row(entry))
 
-    def _render_activity(self):
-        while self._activity_layout.count():
-            item = self._activity_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
+    def _row(self, entry: dict) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        row.setObjectName("CardBody")
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 9, 0, 9)
+        layout.setSpacing(10)
 
-        if not self._activity_entries:
-            empty = QtWidgets.QLabel("No recent activity yet - batches you run will show up here.")
-            empty.setObjectName("Hint")
-            empty.setWordWrap(True)
-            self._activity_layout.addWidget(empty)
-            return
+        glyph = QtWidgets.QLabel()
+        icons.set_pixmap(glyph, entry.get("kind") or "clock", "text_faint", 16)
+        layout.addWidget(glyph, 0, QtCore.Qt.AlignTop)
 
-        for entry in self._activity_entries[:5]:
-            row = QtWidgets.QLabel(entry)
-            self._activity_layout.addWidget(row)
+        text = QtWidgets.QLabel(entry.get("text", ""))
+        text.setWordWrap(True)
+        layout.addWidget(text, 1)
+
+        when = QtWidgets.QLabel(activity.relative_time(entry.get("at", "")))
+        when.setObjectName("DataMuted")
+        layout.addWidget(when, 0, QtCore.Qt.AlignTop)
+        return row

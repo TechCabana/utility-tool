@@ -1,0 +1,740 @@
+/* ===================================================================
+ * UtilityTool - stylesheet template
+ *
+ * NOT valid QSS on its own. Every doubled-at placeholder below is
+ * substituted from styles/tokens.py by build_stylesheet(), which raises
+ * on an unknown name rather than leaving the placeholder in the sheet for
+ * Qt to drop the whole rule silently. One template, two themes: never
+ * write a colour literal here.
+ *
+ * Typeface: Manrope (UI) + Geist Mono (data), both bundled as static .ttf
+ * in assets/fonts/ and registered by load_fonts() before this sheet is
+ * applied. A family that is merely named here and not bundled resolves to
+ * whatever the OS happens to have, with no warning.
+ *
+ * Card elevation is a drop shadow, which QSS cannot express; it is applied
+ * by apply_card_shadows() in main.py to every QFrame named Card or Sidebar.
+ * =================================================================== */
+
+/* ===== Base ===== */
+QWidget {
+    background-color: @@bg@@;
+    color: @@text@@;
+    font-family: "@@font_ui@@", @@fallback@@;
+    font-size: @@size_body@@;
+    font-weight: @@weight_body@@;
+}
+
+QMainWindow, QDialog {
+    background-color: @@bg@@;
+}
+
+/* Plain container widgets sitting inside a Card. The base rule above gives
+   every widget the page ground, which paints a grey block over the card's
+   surface -- every row/host widget inside a card needs this name. */
+#CardBody, #EmptyState {
+    background: transparent;
+}
+
+/* ===== Sidebar ===== */
+#Sidebar {
+    background-color: @@bg_elev@@;
+    border: 1px solid @@border@@;
+    border-radius: @@radius_m@@;
+}
+
+#AppTitle {
+    background: transparent;
+    font-size: 19px;
+    font-weight: @@weight_display@@;
+    color: @@text@@;
+    letter-spacing: -0.4px;
+    padding: 2px 6px 0px 6px;
+}
+
+#AppVersion {
+    background: transparent;
+    font-family: "@@font_mono@@", @@fallback_mono@@;
+    font-size: 11px;
+    color: @@text_faint@@;
+    padding: 0px 6px 10px 6px;
+}
+
+#Sidebar QPushButton {
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: @@radius_s@@;
+    padding: 10px 12px;
+    color: @@text_muted@@;
+    text-align: left;
+    font-size: @@size_nav@@;
+    font-weight: @@weight_nav@@;
+    letter-spacing: @@track_nav@@;
+    margin: 0px 0px 4px 0px;
+}
+
+#Sidebar QPushButton:hover {
+    background-color: @@bg_elev_2@@;
+    color: @@text@@;
+}
+
+#Sidebar QPushButton:checked {
+    background-color: @@accent@@;
+    color: @@accent_text@@;
+}
+
+/* A ring rather than a fill: Qt focuses the first nav button as the window
+   opens, and a fill would leave the app looking hovered before the user has
+   touched anything. The border replaces the transparent one above, so
+   focusing a button never nudges the nav. */
+#Sidebar QPushButton:focus {
+    border: 1px solid @@accent@@;
+}
+
+#Sidebar QPushButton:checked:focus {
+    background-color: @@accent_press@@;
+    border: 1px solid @@accent_press@@;
+}
+
+#SidebarFooter {
+    background: transparent;
+    color: @@text_faint@@;
+    font-size: @@size_caption@@;
+}
+
+/* ===== Cards ===== */
+QFrame#Card {
+    background-color: @@bg_elev@@;
+    border: 1px solid @@border@@;
+    border-radius: @@radius_m@@;
+    padding: 20px;
+}
+
+QFrame#Card:focus {
+    border: 1px solid @@accent@@;
+}
+
+/* A Card that is a clickable entry point (Home). Hover has to be visible or
+   nothing on the surface says it is pressable. */
+QFrame#EntryCard {
+    background-color: @@bg_elev@@;
+    border: 1px solid @@border@@;
+    border-radius: @@radius_m@@;
+    padding: 18px;
+}
+
+QFrame#EntryCard:hover {
+    border-color: @@accent@@;
+    background-color: @@accent_soft@@;
+}
+
+QFrame#EntryCard:focus {
+    border: 1px solid @@accent@@;
+    background-color: @@accent_soft@@;
+}
+
+/* The run controls of a tool screen. A bar, not a card: it holds four
+   controls and a status line, and giving it a card's 20px padding made the
+   footer taller than the form it was operating on. */
+QFrame#ActionBar {
+    background-color: @@bg_elev@@;
+    border: 1px solid @@border@@;
+    border-radius: @@radius_m@@;
+}
+
+/* ===== Typography ===== */
+QLabel {
+    background: transparent;
+    color: @@text@@;
+}
+
+QLabel#H1 {
+    font-size: @@size_display@@;
+    font-weight: @@weight_display@@;
+    letter-spacing: @@track_display@@;
+    color: @@text@@;
+    padding: 0px;
+    margin: 0px;
+}
+
+QLabel#PageLede {
+    color: @@text_muted@@;
+    font-size: @@size_body@@;
+    margin: 0px 0px 4px 0px;
+}
+
+QLabel#H2 {
+    font-size: @@size_title@@;
+    font-weight: @@weight_title@@;
+    letter-spacing: @@track_title@@;
+    color: @@text@@;
+    margin: 0px;
+    padding: 0px;
+}
+
+/* The only uppercase text in the app: a group heading over a hairline. */
+QLabel#SectionHeader {
+    font-size: @@size_group@@;
+    font-weight: @@weight_group@@;
+    color: @@text_muted@@;
+    text-transform: uppercase;
+    letter-spacing: @@track_group@@;
+    border-bottom: 1px solid @@border@@;
+    padding-bottom: 6px;
+    margin: 14px 0px 4px 0px;
+}
+
+/* Field label. Sentence case, no trailing colon, no tracking -- a form is
+   not a 1995 dialog box. Deliberately distinct from SectionHeader, which it
+   used to be near-identical to, so a field label and a group heading no
+   longer read as the same thing. */
+QLabel#FieldLabel {
+    font-size: @@size_label@@;
+    font-weight: @@weight_label@@;
+    color: @@text_muted@@;
+}
+
+/* Column header inside a repeated-row table. Its own name rather than
+   reusing the field-label style, which is a different role. */
+QLabel#TableHeader {
+    font-size: @@size_group@@;
+    font-weight: @@weight_group@@;
+    color: @@text_faint@@;
+    text-transform: uppercase;
+    letter-spacing: @@track_group@@;
+}
+
+QLabel#Hint {
+    color: @@text_faint@@;
+    font-size: @@size_caption@@;
+}
+
+/* Numbers, sizes, percentages, paths and timestamps. A proportional face
+   renders these with drifting columns; this role is why a mono is bundled. */
+QLabel#Data {
+    font-family: "@@font_mono@@", @@fallback_mono@@;
+    font-size: @@size_data@@;
+    font-weight: @@weight_data@@;
+    color: @@text@@;
+}
+
+QLabel#DataMuted {
+    font-family: "@@font_mono@@", @@fallback_mono@@;
+    font-size: @@size_data@@;
+    font-weight: @@weight_body@@;
+    color: @@text_muted@@;
+}
+
+QLabel#StatusOk    { color: @@success@@; font-weight: @@weight_label@@; }
+QLabel#StatusWarn  { color: @@warn@@;    font-weight: @@weight_label@@; }
+QLabel#StatusError { color: @@error@@;   font-weight: @@weight_label@@; }
+
+QLabel:disabled { color: @@text_disabled@@; }
+
+QFrame#Divider {
+    background: @@border@@;
+    border: none;
+    min-height: 1px;
+    max-height: 1px;
+}
+
+QLabel#Tag {
+    color: @@text_muted@@;
+    border: 1px solid @@border_strong@@;
+    border-radius: @@radius_s@@;
+    padding: 1px 7px;
+    font-size: @@size_group@@;
+    font-weight: @@weight_group@@;
+    letter-spacing: @@track_group@@;
+}
+
+/* ===== Inputs ===== */
+QLineEdit, QTextEdit, QPlainTextEdit {
+    background-color: @@bg_elev@@;
+    color: @@text@@;
+    border: 1px solid @@border_strong@@;
+    border-radius: @@radius_s@@;
+    padding: 8px 11px;
+    font-size: @@size_body@@;
+    selection-background-color: @@accent@@;
+    selection-color: @@accent_text@@;
+}
+
+QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover {
+    border-color: @@border_hover@@;
+}
+
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+    border: 1px solid @@accent@@;
+    background-color: @@bg_elev@@;
+}
+
+QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled {
+    background-color: @@bg_elev_2@@;
+    color: @@text_disabled@@;
+}
+
+QLineEdit#Mono, QTextEdit#Mono {
+    font-family: "@@font_mono@@", @@fallback_mono@@;
+    font-size: @@size_data@@;
+}
+
+/* ===== Combo box ===== */
+QComboBox {
+    background-color: @@bg_elev@@;
+    color: @@text@@;
+    border: 1px solid @@border_strong@@;
+    border-radius: @@radius_s@@;
+    padding: 8px 11px;
+    font-size: @@size_body@@;
+    min-height: 20px;
+}
+
+QComboBox:hover  { border-color: @@border_hover@@; }
+QComboBox:focus  { border: 1px solid @@accent@@; }
+QComboBox:disabled {
+    background-color: @@bg_elev_2@@;
+    color: @@text_disabled@@;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 28px;
+}
+
+/* A real chevron, not two CSS border triangles pretending to be one -- the
+   border trick renders as a flat grey dash. The file is a recoloured copy of
+   assets/icons/chevron-down.svg, written per theme at startup by
+   widgets/icons.py. */
+QComboBox::down-arrow {
+    image: url("@@icon_chevron_down@@");
+    width: 14px;
+    height: 14px;
+}
+
+QComboBox::down-arrow:disabled {
+    image: url("@@icon_chevron_down_disabled@@");
+}
+
+QComboBox QAbstractItemView {
+    background-color: @@bg_elev@@;
+    border: 1px solid @@border@@;
+    border-radius: @@radius_s@@;
+    color: @@text@@;
+    selection-background-color: @@accent@@;
+    selection-color: @@accent_text@@;
+    padding: 4px;
+    outline: none;
+}
+
+QComboBox QAbstractItemView::item {
+    padding: 7px 10px;
+    border-radius: 4px;
+    min-height: 22px;
+}
+
+QComboBox QAbstractItemView::item:hover    { background-color: @@bg_elev_2@@; }
+QComboBox QAbstractItemView::item:selected { background-color: @@accent@@; color: @@accent_text@@; }
+
+/* ===== Spin boxes ===== */
+QSpinBox, QDoubleSpinBox {
+    background-color: @@bg_elev@@;
+    color: @@text@@;
+    border: 1px solid @@border_strong@@;
+    border-radius: @@radius_s@@;
+    padding: 8px 11px;
+    font-size: @@size_body@@;
+}
+
+QSpinBox:hover, QDoubleSpinBox:hover { border-color: @@border_hover@@; }
+QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid @@accent@@; }
+
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    background-color: transparent;
+    border: none;
+    width: 22px;
+    margin: 1px;
+}
+
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: @@bg_elev_2@@;
+    border-radius: 4px;
+}
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: url("@@icon_chevron_up@@");
+    width: 12px;
+    height: 12px;
+}
+
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url("@@icon_chevron_down@@");
+    width: 12px;
+    height: 12px;
+}
+
+/* ===== Slider ===== */
+QSlider::groove:horizontal {
+    background: @@data_track@@;
+    height: 4px;
+    border-radius: 2px;
+    border: none;
+}
+
+QSlider::sub-page:horizontal {
+    background: @@accent@@;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    background: @@bg_elev@@;
+    width: 14px;
+    height: 14px;
+    margin: -6px 0;
+    border-radius: 8px;
+    border: 2px solid @@accent@@;
+}
+
+QSlider::handle:horizontal:hover  { background: @@accent_soft_2@@; }
+QSlider::handle:horizontal:focus  { border: 3px solid @@accent@@; }
+
+/* ===== Check boxes ===== */
+QCheckBox {
+    background: transparent;
+    color: @@text@@;
+    spacing: 8px;
+    font-size: @@size_body@@;
+}
+
+QCheckBox::indicator {
+    width: 17px;
+    height: 17px;
+    border-radius: 5px;
+    border: 1px solid @@border_strong@@;
+    background-color: @@bg_elev@@;
+}
+
+QCheckBox::indicator:hover           { border-color: @@border_hover@@; }
+QCheckBox::indicator:checked         { background-color: @@accent@@; border-color: @@accent@@; image: url("@@icon_check@@"); }
+QCheckBox::indicator:checked:hover   { background-color: @@accent_hover@@; border-color: @@accent_hover@@; }
+
+/* The pseudo-state goes on the subcontrol, not on the widget:
+   `QCheckBox:focus::indicator` is silently ignored by Qt -- it applies no
+   rule and raises no error, so the checkbox simply keeps looking unfocused. */
+QCheckBox::indicator:focus           { border: 2px solid @@accent@@; }
+QCheckBox::indicator:checked:focus   { border: 2px solid @@accent_press@@; }
+
+QCheckBox:disabled                   { color: @@text_disabled@@; }
+QCheckBox::indicator:disabled        { background-color: @@bg_elev_2@@; border-color: @@border@@; }
+
+/* ===== Buttons ===== */
+QPushButton {
+    background-color: @@bg_elev@@;
+    color: @@text@@;
+    border: 1px solid @@border_strong@@;
+    border-radius: @@radius_s@@;
+    padding: 8px 14px;
+    font-size: @@size_button@@;
+    font-weight: @@weight_button@@;
+    min-height: 20px;
+}
+
+QPushButton:hover   { background-color: @@bg_elev_2@@; border-color: @@border_hover@@; }
+QPushButton:pressed { background-color: @@bg_sunken@@; }
+
+/* Qt stops drawing its own focus rectangle once a widget is styled by QSS,
+   so without this a keyboard user has no idea where they are. QSS has no
+   outline or box-shadow, so the ring is the border, held at 1px so focusing
+   something never nudges the layout. */
+QPushButton:focus {
+    border-color: @@accent@@;
+    background-color: @@accent_soft@@;
+}
+
+QPushButton:disabled {
+    background-color: @@bg_elev_2@@;
+    color: @@text_disabled@@;
+    border-color: @@border@@;
+}
+
+/* The one accent-filled surface on a screen. */
+QPushButton#Primary {
+    background-color: @@accent@@;
+    color: @@accent_text@@;
+    border: 1px solid @@accent@@;
+}
+
+QPushButton#Primary:hover   { background-color: @@accent_hover@@; border-color: @@accent_hover@@; }
+QPushButton#Primary:pressed { background-color: @@accent_press@@; border-color: @@accent_press@@; }
+QPushButton#Primary:focus   { background-color: @@accent_press@@; border-color: @@accent_press@@; }
+QPushButton#Primary:disabled {
+    background-color: @@bg_elev_2@@;
+    color: @@text_disabled@@;
+    border-color: @@border@@;
+}
+
+QPushButton#Secondary {
+    background-color: transparent;
+    border: 1px solid @@border_strong@@;
+    color: @@text_muted@@;
+}
+
+QPushButton#Secondary:hover   { border-color: @@accent@@; color: @@accent@@; background-color: @@accent_soft@@; }
+QPushButton#Secondary:pressed { background-color: @@accent_soft_2@@; }
+QPushButton#Secondary:focus   { border-color: @@accent@@; color: @@accent@@; background-color: @@accent_soft@@; }
+QPushButton#Secondary:disabled {
+    color: @@text_disabled@@;
+    border-color: @@border@@;
+    background-color: transparent;
+}
+
+/* A borderless action for a row: the least visual weight in the system.
+   Row-level destructive actions use GhostDanger, not a filled red button --
+   eleven filled red buttons in a list teach the user to ignore red. */
+QPushButton#Ghost {
+    background-color: transparent;
+    border: 1px solid transparent;
+    color: @@text_muted@@;
+    padding: 6px 8px;
+    font-weight: @@weight_label@@;
+}
+
+QPushButton#Ghost:hover    { background-color: @@bg_elev_2@@; color: @@text@@; }
+QPushButton#Ghost:focus    { border-color: @@accent@@; color: @@text@@; }
+QPushButton#Ghost:pressed  { background-color: @@bg_sunken@@; }
+QPushButton#Ghost:disabled { color: @@text_disabled@@; }
+
+QPushButton#GhostDanger {
+    background-color: transparent;
+    border: 1px solid transparent;
+    color: @@text_muted@@;
+    padding: 6px 8px;
+    font-weight: @@weight_label@@;
+}
+
+QPushButton#GhostDanger:hover    { background-color: @@accent_soft@@; color: @@error@@; }
+QPushButton#GhostDanger:focus    { border-color: @@error@@; color: @@error@@; }
+QPushButton#GhostDanger:disabled { color: @@text_disabled@@; }
+
+/* Filled red exists in exactly one place: the confirm button of a modal that
+   is already asking "are you sure". */
+QPushButton#Danger {
+    background-color: @@danger_fill@@;
+    color: @@danger_text@@;
+    border: 1px solid @@danger_fill@@;
+}
+
+QPushButton#Danger:hover   { background-color: @@danger_hover@@; border-color: @@danger_hover@@; }
+QPushButton#Danger:pressed { background-color: @@danger_press@@; border-color: @@danger_press@@; }
+QPushButton#Danger:focus   { background-color: @@danger_press@@; border-color: @@danger_press@@; }
+QPushButton#Danger:disabled {
+    background-color: @@bg_elev_2@@;
+    color: @@text_disabled@@;
+    border-color: @@border@@;
+}
+
+/* Icon-only button (row overflow, theme switch). Square, so the icon is not
+   sitting in a text-shaped box. */
+QPushButton#IconButton {
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: @@radius_s@@;
+    padding: 6px;
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 30px;
+    max-height: 30px;
+}
+
+QPushButton#IconButton:hover   { background-color: @@bg_elev_2@@; }
+QPushButton#IconButton:focus   { border-color: @@accent@@; }
+QPushButton#IconButton:pressed { background-color: @@bg_sunken@@; }
+
+/* ===== Lists / drop targets ===== */
+QListWidget {
+    background-color: @@bg_elev@@;
+    border: 1px dashed @@border_strong@@;
+    border-radius: @@radius_m@@;
+    color: @@text@@;
+    outline: none;
+    padding: 6px;
+}
+
+QListWidget:focus { border-color: @@accent@@; }
+
+QListWidget::item {
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: @@radius_s@@;
+    padding: 8px 12px;
+    margin: 2px 0px;
+    color: @@text@@;
+}
+
+QListWidget::item:hover    { background-color: @@bg_elev_2@@; }
+QListWidget::item:selected { background-color: @@accent_soft_2@@; border-color: @@accent@@; color: @@text@@; }
+
+QFrame#dropZone {
+    background-color: @@bg_elev@@;
+    border: 1px dashed @@border_strong@@;
+    border-radius: @@radius_m@@;
+}
+
+QFrame#dropZone:hover {
+    border-color: @@accent@@;
+    background-color: @@accent_soft@@;
+}
+
+QLabel#dropLabel {
+    color: @@text_faint@@;
+    font-size: @@size_body@@;
+}
+
+/* ===== Progress and measurement =====
+ * Three different meanings shared one appearance before this: batch
+ * progress, an indeterminate busy state, and how full a disk is. Only the
+ * first is an interaction, so only the first is accent-coloured. */
+QProgressBar {
+    background-color: @@data_track@@;
+    border: none;
+    border-radius: 4px;
+    text-align: center;
+    color: @@text_muted@@;
+    font-family: "@@font_mono@@", @@fallback_mono@@;
+    font-size: @@size_data@@;
+    max-height: 8px;
+    min-height: 8px;
+}
+
+QProgressBar::chunk {
+    background-color: @@accent@@;
+    border-radius: 4px;
+}
+
+/* Batch progress that shows its percentage needs room for the text. */
+QProgressBar#WithText {
+    max-height: 20px;
+    min-height: 20px;
+    border-radius: @@radius_s@@;
+}
+
+QProgressBar#WithText::chunk { border-radius: @@radius_s@@; }
+
+/* A measurement, not an interaction: neutral until it means something. */
+QProgressBar#DataBar::chunk         { background-color: @@data_fill@@; }
+QProgressBar#DataBarWarn::chunk     { background-color: @@data_warn@@; }
+QProgressBar#DataBarCritical::chunk { background-color: @@data_critical@@; }
+
+/* Indeterminate "working" bar. Muted, so a busy state never looks like
+   progress that has reached the end. */
+QProgressBar#BusyBar::chunk { background-color: @@text_faint@@; }
+
+/* ===== Scrollbars =====
+ * Overlay style, no arrows, transparent trough. The previous sheet left the
+ * trough and the corner unstyled, so a scrolling card showed a grey block
+ * sitting on top of its own border. */
+QAbstractScrollArea { background: transparent; }
+QAbstractScrollArea::corner { background: transparent; border: none; }
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px 0px 2px 0px;
+    border: none;
+}
+
+QScrollBar::handle:vertical {
+    background: @@scrollbar@@;
+    min-height: 32px;
+    border-radius: 3px;
+    margin: 0px 3px 0px 3px;
+}
+
+QScrollBar::handle:vertical:hover { background: @@scrollbar_hover@@; }
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 0px 2px 0px 2px;
+    border: none;
+}
+
+QScrollBar::handle:horizontal {
+    background: @@scrollbar@@;
+    min-width: 32px;
+    border-radius: 3px;
+    margin: 3px 0px 3px 0px;
+}
+
+QScrollBar::handle:horizontal:hover { background: @@scrollbar_hover@@; }
+
+QScrollBar::add-line, QScrollBar::sub-line {
+    width: 0px;
+    height: 0px;
+    background: transparent;
+    border: none;
+}
+
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+/* ===== Sub-tabs (Disk) =====
+ * Underline, not a filled pill: a filled accent pill for navigation competes
+ * with the primary action for the one accent-filled surface on the screen. */
+QTabWidget::pane {
+    border: none;
+    border-top: 1px solid @@border@@;
+    background: transparent;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background: transparent;
+    color: @@text_muted@@;
+    padding: 8px 2px;
+    margin-right: 20px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    font-weight: @@weight_label@@;
+}
+
+QTabBar::tab:hover     { color: @@text@@; }
+QTabBar::tab:selected  { color: @@text@@; border-bottom: 2px solid @@accent@@; font-weight: @@weight_button@@; }
+QTabBar::tab:focus     { color: @@accent@@; }
+
+/* ===== Tooltips, menus, status bar ===== */
+QToolTip {
+    background-color: @@bg_elev@@;
+    color: @@text@@;
+    border: 1px solid @@border_strong@@;
+    border-radius: @@radius_s@@;
+    padding: 6px 9px;
+    font-size: @@size_caption@@;
+}
+
+QMenu {
+    background-color: @@bg_elev@@;
+    border: 1px solid @@border@@;
+    border-radius: @@radius_s@@;
+    color: @@text@@;
+    padding: 5px;
+}
+
+QMenu::item           { padding: 7px 22px 7px 10px; border-radius: 4px; }
+QMenu::item:selected  { background-color: @@bg_elev_2@@; color: @@text@@; }
+QMenu::separator      { height: 1px; background: @@border@@; margin: 5px 8px; }
+
+QStatusBar {
+    background-color: @@bg_elev@@;
+    color: @@text_muted@@;
+    border-top: 1px solid @@border@@;
+}
+
+QMessageBox, QFileDialog { background-color: @@bg@@; }
+QMessageBox QLabel       { color: @@text@@; }
+
+QSplitter::handle             { background: @@border@@; }
+QSplitter::handle:hover       { background: @@accent@@; }
+QSplitter::handle:horizontal  { width: 2px; }
+QSplitter::handle:vertical    { height: 2px; }

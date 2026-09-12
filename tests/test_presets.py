@@ -74,3 +74,51 @@ def test_image_naming_defaults_present_on_every_default_image_preset():
         assert p["pattern"] == "{name}" or "pattern" in p
         for key in ("prefix", "suffix", "start", "pad", "case", "date_source"):
             assert key in p
+
+
+# ---------------------------------------------------------------------------
+# describe_preset: the one-line summary shown on each row in Settings
+# ---------------------------------------------------------------------------
+# The preset list showed names only, so "Web Upload" and "Email Attachment"
+# were indistinguishable without applying one. These pin the wording so a
+# summary can never silently become empty or misleading.
+
+def test_describe_image_preset_names_format_size_and_quality():
+    preset = presets.DEFAULT["image"][0]  # Web Upload
+    summary = presets.describe_preset("image", preset)
+    assert "JPEG" in summary
+    assert "1920px long edge" in summary
+    assert "quality 85" in summary
+
+
+def test_describe_image_preset_hides_quality_for_a_lossless_format():
+    preset = presets._image_preset("Archive", "PNG", 100, "Original")
+    summary = presets.describe_preset("image", preset)
+    assert "PNG" in summary
+    assert "quality" not in summary
+
+
+def test_describe_image_preset_says_when_the_format_is_untouched():
+    preset = presets._image_preset("As is", "ORIGINAL", 85, "Original")
+    assert presets.describe_preset("image", preset).startswith("Keep format")
+
+
+def test_describe_file_preset_reports_numbering():
+    preset = presets.DEFAULT["file"][1]  # Sequential Numbering
+    summary = presets.describe_preset("file", preset)
+    assert "{name}_{num}" in summary
+    assert "numbered from 1" in summary
+    assert "3 digits" in summary
+
+
+def test_describe_file_preset_reports_a_regex_deletion():
+    preset = presets.DEFAULT["file"][2]  # Strip "copy N" Suffix
+    summary = presets.describe_preset("file", preset)
+    assert "removed" in summary
+
+
+def test_describe_preset_never_returns_an_empty_row():
+    # A row with no summary reads as a rendering bug; a preset that really
+    # changes nothing should say so.
+    assert presets.describe_preset("file", {"name": "Untouched"}) == \
+        "Keeps every file as it is"
