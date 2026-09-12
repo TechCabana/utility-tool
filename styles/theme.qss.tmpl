@@ -194,6 +194,18 @@ QLabel#FieldLabel {
     color: @@text_muted@@;
 }
 
+/* The label half of a section heading that carries actions on its right --
+   `section()` in widgets/common.py. Same type role as SectionHeader, without
+   the rule and the margins, because the composite draws its own divider and
+   owns its own spacing. */
+QLabel#SectionLabel {
+    font-size: @@size_group@@;
+    font-weight: @@weight_group@@;
+    color: @@text_muted@@;
+    text-transform: uppercase;
+    letter-spacing: @@track_group@@;
+}
+
 /* Column header inside a repeated-row table. Its own name rather than
    reusing the field-label style, which is a different role. */
 QLabel#TableHeader {

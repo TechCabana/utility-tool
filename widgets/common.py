@@ -89,6 +89,43 @@ def section_header(text: str) -> QtWidgets.QLabel:
     return label
 
 
+def section(title: str, *actions: QtWidgets.QWidget) -> QtWidgets.QWidget:
+    """A group heading with optional actions on its right, over a hairline.
+
+    `section_header()` covers the common case of a heading with nothing
+    beside it. This is the other case: a section that owns a control, like
+    Cleanup's Rescan or the Duplicates mode picker. Both exist so a screen
+    can be one surface divided by headings rather than a column of separate
+    cards -- a card inside a card flattens the hierarchy the elevation
+    already establishes.
+
+    The label uses #SectionLabel rather than #SectionHeader: the composite
+    draws its own divider and owns its own margins, so borrowing the other
+    style would draw the rule twice.
+    """
+    host = QtWidgets.QWidget()
+    host.setObjectName("CardBody")
+    column = QtWidgets.QVBoxLayout(host)
+    # Asymmetric, for the same reason #SectionHeader's margins are: more air
+    # above a heading than below it, so it binds to what follows rather than
+    # floating between two groups.
+    column.setContentsMargins(0, 14, 0, 0)
+    column.setSpacing(6)
+
+    row = QtWidgets.QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(8)
+    label = QtWidgets.QLabel(title)
+    label.setObjectName("SectionLabel")
+    row.addWidget(label)
+    row.addStretch(1)
+    for widget in actions:
+        row.addWidget(widget)
+    column.addLayout(row)
+    column.addWidget(divider())
+    return host
+
+
 def table_header(text: str) -> QtWidgets.QLabel:
     """A column heading in a repeated-row table.
 

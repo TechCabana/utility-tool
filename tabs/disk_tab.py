@@ -17,7 +17,7 @@ from utils.disk_utils import (
 )
 from utils.file_utils import delete_file
 from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
-                            divider, icon_button, table_header)
+                            divider, icon_button, section, table_header)
 
 
 class ScanWorker(QtCore.QObject):
@@ -1167,24 +1167,24 @@ class DiskTab(QtWidgets.QWidget):
         body = QtWidgets.QWidget()
         body.setObjectName("CardBody")
         bv = QtWidgets.QVBoxLayout(body)
-        bv.setContentsMargins(2, 8, 2, 2)
-        bv.setSpacing(12)
+        # Margins so the surface's drop shadow has room inside the viewport.
+        bv.setContentsMargins(2, 2, 8, 8)
+        bv.setSpacing(0)
 
-        card = QtWidgets.QFrame()
-        card.setObjectName("Card")
-        cv = QtWidgets.QVBoxLayout(card)
+        # One surface for the whole screen. Quick scan and Duplicates are
+        # sections of it, divided by a labelled hairline, rather than two
+        # cards stacked in a column: a card inside a card column gives the
+        # page, its sections and its rows all the same visual weight.
+        surface = QtWidgets.QFrame()
+        surface.setObjectName("Card")
+        cv = QtWidgets.QVBoxLayout(surface)
         cv.setSpacing(8)
+        bv.addWidget(surface)
 
-        head = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("Quick scan")
-        title.setObjectName("H2")
-        head.addWidget(title)
-        head.addStretch(1)
         self.cleanup_rescan_btn = QtWidgets.QPushButton("Rescan")
         self.cleanup_rescan_btn.setObjectName("Secondary")
         self.cleanup_rescan_btn.clicked.connect(self.start_cleanup_scan)
-        head.addWidget(self.cleanup_rescan_btn)
-        cv.addLayout(head)
+        cv.addWidget(section("Quick scan", self.cleanup_rescan_btn))
 
         safety = QtWidgets.QLabel(
             "Checked items are moved to the Recycle Bin, never deleted "
@@ -1248,9 +1248,8 @@ class DiskTab(QtWidgets.QWidget):
         self.sections_layout.setSpacing(0)
         cv.addWidget(self.sections_host)
 
-        bv.addWidget(card)
-        bv.addWidget(self._build_duplicates())
-        bv.addStretch(1)
+        self._build_duplicates(cv)
+        cv.addStretch(1)
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1262,10 +1261,14 @@ class DiskTab(QtWidgets.QWidget):
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
 
-        # --- footer -----------------------------------------------------
+        # --- action bar -------------------------------------------------
+        # A bar, not a card: it holds a count, one button and a result line,
+        # and a card's padding made the footer taller than it needs to be.
+        # Same component the two tool screens use for their run controls.
         footer = QtWidgets.QFrame()
-        footer.setObjectName("Card")
+        footer.setObjectName("ActionBar")
         fv = QtWidgets.QVBoxLayout(footer)
+        fv.setContentsMargins(14, 10, 14, 10)
         fv.setSpacing(8)
 
         row = QtWidgets.QHBoxLayout()
@@ -1296,40 +1299,32 @@ class DiskTab(QtWidgets.QWidget):
     # ------------------------------
     # Duplicates (a section inside Cleanup, not a fourth sub-tab)
     # ------------------------------
-    def _build_duplicates(self) -> QtWidgets.QWidget:
-        """The Duplicates card, below Quick scan on the Cleanup screen.
+    def _build_duplicates(self, cv: QtWidgets.QVBoxLayout) -> None:
+        """Duplicates, as the second section of the Cleanup surface.
 
-        Its own footer sits inside the card rather than in the screen's fixed
-        footer: the two scans are separate decisions over separate files, and
-        one "Clean Selected" button that mixed browser cache with the user's
-        photographs would be a bad thing to click by accident.
+        Appends into the caller's layout rather than returning a card of its
+        own: Quick scan and Duplicates are two sections of one screen, and
+        giving each its own bordered surface was what made this page read as
+        three stacked boxes.
+
+        Its own action row stays inside the section rather than moving to the
+        screen's action bar: the two scans are separate decisions over
+        separate files, and one "Clean Selected" button that mixed browser
+        cache with the user's photographs would be a bad thing to click by
+        accident.
         """
-        card = QtWidgets.QFrame()
-        card.setObjectName("Card")
-        cv = QtWidgets.QVBoxLayout(card)
-        cv.setSpacing(8)
-
-        head = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("Duplicates")
-        title.setObjectName("H2")
-        head.addWidget(title)
-        head.addStretch(1)
-
         mode_label = QtWidgets.QLabel("Mode")
         mode_label.setObjectName("FieldLabel")
-        head.addWidget(mode_label)
         # A QComboBox, matching File Manager's operation picker -- the app
         # already has one mode-picker idiom and does not need a second.
         self.dup_mode = QtWidgets.QComboBox()
         self.dup_mode.addItems(["Files (exact match)", "Images (visual match)"])
         self.dup_mode.currentIndexChanged.connect(self.on_dup_mode_changed)
-        head.addWidget(self.dup_mode)
 
         self.dup_scan_btn = QtWidgets.QPushButton("Scan")
         self.dup_scan_btn.setObjectName("Secondary")
         self.dup_scan_btn.clicked.connect(self.start_duplicate_scan)
-        head.addWidget(self.dup_scan_btn)
-        cv.addLayout(head)
+        cv.addWidget(section("Duplicates", mode_label, self.dup_mode, self.dup_scan_btn))
 
         self.dup_hint = QtWidgets.QLabel()
         self.dup_hint.setObjectName("Hint")
@@ -1424,41 +1419,37 @@ class DiskTab(QtWidgets.QWidget):
         cv.addWidget(self.dup_result)
 
         self._update_dup_hint()
-        return card
 
     # ------------------------------
     # Backup (jobs above, Restore below -- two tables, not one nested one)
     # ------------------------------
     def _build_backup(self) -> QtWidgets.QWidget:
-        """The Backup screen: a jobs card, then a separate Restore card.
+        """The Backup screen: one surface, Jobs then Restore as its sections.
 
-        Restore is its own table rather than an expandable history inside each
-        job row: managing jobs and getting a file back are two different
-        tasks, and DESIGN.md v4 rule 5 records the owner rejecting the nested
-        snapshot list explicitly.
+        Restore stays a table of its own rather than an expandable history
+        inside each job row: managing jobs and getting a file back are two
+        different tasks, and DESIGN.md v4 rule 5 records the owner rejecting
+        the nested snapshot list explicitly. Two sections of one surface is
+        that separation without giving each its own bordered card.
         """
         page = QtWidgets.QWidget()
         page.setObjectName("CardBody")
         pv = QtWidgets.QVBoxLayout(page)
-        pv.setContentsMargins(2, 8, 2, 2)
-        pv.setSpacing(12)
+        # Margins so the surface's drop shadow has room inside the viewport.
+        pv.setContentsMargins(2, 2, 8, 8)
+        pv.setSpacing(0)
+
+        surface = QtWidgets.QFrame()
+        surface.setObjectName("Card")
+        jv = QtWidgets.QVBoxLayout(surface)
+        jv.setSpacing(8)
+        pv.addWidget(surface)
 
         # --- jobs ---------------------------------------------------------
-        jobs_card = QtWidgets.QFrame()
-        jobs_card.setObjectName("Card")
-        jv = QtWidgets.QVBoxLayout(jobs_card)
-        jv.setSpacing(8)
-
-        head = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("Backup jobs")
-        title.setObjectName("H2")
-        head.addWidget(title)
-        head.addStretch(1)
         self.job_add_btn = QtWidgets.QPushButton("Add job")
         self.job_add_btn.setObjectName("Primary")
         self.job_add_btn.clicked.connect(self.add_backup_job)
-        head.addWidget(self.job_add_btn)
-        jv.addLayout(head)
+        jv.addWidget(section("Backup jobs", self.job_add_btn))
 
         note = QtWidgets.QLabel(
             "A job copies its source folder into a new timestamped folder "
@@ -1499,24 +1490,14 @@ class DiskTab(QtWidgets.QWidget):
         self.backup_status.setVisible(False)
         jv.addWidget(self.backup_status)
 
-        pv.addWidget(jobs_card)
-
         # --- restore ------------------------------------------------------
-        restore_card = QtWidgets.QFrame()
-        restore_card.setObjectName("Card")
-        rv = QtWidgets.QVBoxLayout(restore_card)
-        rv.setSpacing(8)
-
-        rhead = QtWidgets.QHBoxLayout()
-        rtitle = QtWidgets.QLabel("Restore")
-        rtitle.setObjectName("H2")
-        rhead.addWidget(rtitle)
-        rhead.addStretch(1)
+        # Same surface, second section. `rv` stays a separate name so the two
+        # halves of this method remain easy to read apart.
+        rv = jv
         self.restore_refresh_btn = QtWidgets.QPushButton("Refresh")
         self.restore_refresh_btn.setObjectName("Secondary")
         self.restore_refresh_btn.clicked.connect(self.refresh_changes)
-        rhead.addWidget(self.restore_refresh_btn)
-        rv.addLayout(rhead)
+        rv.addWidget(section("Restore", self.restore_refresh_btn))
 
         rnote = QtWidgets.QLabel(
             "One row per job: when it was last backed up, and how much of the "
@@ -1546,18 +1527,19 @@ class DiskTab(QtWidgets.QWidget):
         )
         rv.addWidget(self.restore_empty)
 
-        pv.addWidget(restore_card)
         pv.addStretch(1)
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        # Unlike Cleanup, this page keeps its horizontal scrollbar. Cleanup's
-        # wide content is a wrapping label, which should reflow into the
-        # window; this is a six-column table whose columns have real minimum
-        # widths, and squeezing it into a narrow window elides every cell to a
-        # single character rather than making anything fit. A table that is
-        # wider than the window scrolls; it does not get destroyed.
+        # No horizontal scrollbar here either, as of the table reshape: four
+        # columns with the paths on a second line fit inside the app's own
+        # 940px minimum, so nothing needs to scroll sideways. The column
+        # minimums still exist, and still stop one deep path from eliding
+        # every other cell to a single character - they are just small enough
+        # now to fit. If a future column pushes the total back over the
+        # window, reshape the table again rather than restoring the scrollbar.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(page)
         return scroll
 
@@ -1985,8 +1967,8 @@ class DiskTab(QtWidgets.QWidget):
         which fails on the second attempt -- structurally impossible.
         """
         seen = {}
-        for section in self.dup_sections:
-            for path, size in section.selected_items():
+        for group in self.dup_sections:
+            for path, size in group.selected_items():
                 seen.setdefault(os.path.normcase(path), (path, size))
         return list(seen.values())
 
@@ -2148,8 +2130,8 @@ class DiskTab(QtWidgets.QWidget):
         first one already moved.
         """
         seen = {}
-        for section in self.sections:
-            for path, size in section.selected_items():
+        for group in self.sections:
+            for path, size in group.selected_items():
                 seen.setdefault(os.path.normcase(path), (path, size))
         return list(seen.values())
 
