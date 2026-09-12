@@ -15,15 +15,7 @@ from utils.disk_utils import (
     top_level_breakdown,
 )
 from utils.file_utils import delete_file
-from widgets import icons
-from widgets.common import (ConfirmDialog, EmptyState, PageHeader, add_field, divider,
-                            form_layout, icon_button, section_header, table_header)
-
-
-def _palette() -> dict:
-    from main import active_palette
-
-    return active_palette()
+from widgets.common import ConfirmDialog, EmptyState, PageHeader, divider, icon_button, table_header
 
 
 class ScanWorker(QtCore.QObject):
