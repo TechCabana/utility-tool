@@ -82,6 +82,24 @@ def blockers(record: BatchRecord) -> List[str]:
     already moved back is exactly the half-reverted state this avoids.
     """
     problems: List[str] = []
+
+    # Two files that would be put back to the same place. Nothing else in
+    # this function can see it: each pair is individually fine, the
+    # destination does not exist yet at check time, and the loop below would
+    # happily move the first one back and then overwrite it with the second
+    # - destroying a file and reporting "undone" for both. A batch can reach
+    # this state by listing the same source twice, which the file list
+    # permits. Checked across the batch rather than per file, because that
+    # is the only level at which the collision exists.
+    seen: dict = {}
+    for original, final in record.pairs:
+        key = os.path.normcase(os.path.abspath(original))
+        if key in seen:
+            problems.append(
+                f"{os.path.basename(final)} and {os.path.basename(seen[key])} "
+                f"would both be put back as {os.path.basename(original)}")
+        seen[key] = final
+
     for (original, final), expected in zip(record.pairs, record.fingerprints):
         name = os.path.basename(final)
 

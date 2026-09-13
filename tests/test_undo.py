@@ -205,3 +205,30 @@ def test_a_move_or_rename_recreates_a_missing_parent_directory(tmp_path, operati
     result = undo.reverse(record)
     assert result["ok"] is True
     assert original.exists()
+
+
+def test_two_files_that_would_land_on_the_same_name_are_refused(tmp_path):
+    """Silent data loss, found by probing rather than by a failing test.
+
+    Two pairs whose `original` is the same path are each individually fine:
+    the destination does not exist yet, so no per-file check can see the
+    problem. The reversal would move the first file back and then overwrite
+    it with the second, destroying one and reporting both as undone. A batch
+    reaches this state by listing the same source file twice, which the file
+    list permits.
+    """
+    first = tmp_path / "final_a.txt"
+    second = tmp_path / "final_b.txt"
+    first.write_text("A", encoding="utf-8")
+    second.write_text("B", encoding="utf-8")
+    collide = str(tmp_path / "collide.txt")
+
+    record = undo.record_batch("rename", [(collide, str(first)), (collide, str(second))])
+    result = undo.reverse(record)
+
+    assert result["ok"] is False
+    assert "would both be put back" in result["message"]
+    # Both files still there, contents intact, nothing overwritten.
+    assert first.read_text(encoding="utf-8") == "A"
+    assert second.read_text(encoding="utf-8") == "B"
+    assert not os.path.exists(collide)
