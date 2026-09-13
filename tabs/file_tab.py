@@ -5,7 +5,7 @@ from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
 from utils.file_utils import build_new_name, move_file, copy_file, delete_file
 from utils.presets import add_file_preset, get_file_presets, load_all
-from utils import activity
+from utils import activity, undo
 from widgets import icons
 from widgets.common import (
     ConfirmDialog, EmptyState, PageHeader, SPACE_FIELD, add_field,
@@ -385,7 +385,23 @@ class FileTab(QtWidgets.QWidget):
         self.retry_btn.setToolTip("Run this operation again on only the files that failed")
         self.retry_btn.clicked.connect(self.retry_failed)
         self.retry_btn.setVisible(False)
-        fv.addWidget(self.retry_btn, 0, Qt.AlignLeft)
+
+        # Undo sits beside Retry: both are "that did not go how I wanted",
+        # and both are only offered when they can actually do something.
+        self.undo_btn = QtWidgets.QPushButton("  Undo this batch")
+        self.undo_btn.setObjectName("Secondary")
+        icons.set_icon(self.undo_btn, "rotate-ccw", "text_muted", 15)
+        self.undo_btn.setToolTip(
+            "Put every file back where it was before this batch ran")
+        self.undo_btn.clicked.connect(self.undo_batch)
+        self.undo_btn.setVisible(False)
+
+        after = QtWidgets.QHBoxLayout()
+        after.setSpacing(8)
+        after.addWidget(self.retry_btn)
+        after.addWidget(self.undo_btn)
+        after.addStretch(1)
+        fv.addLayout(after)
         v.addWidget(footer)
 
         # Signals
@@ -415,6 +431,8 @@ class FileTab(QtWidgets.QWidget):
         self._total = 0
         self._failed_indices = []
         self._batch_paths = []
+        self._undo_pairs = []
+        self._undo_record = None
         self._on_operation_changed()  # apply initial (Rename) field visibility
         self._refresh_state()
 
@@ -448,6 +466,41 @@ class FileTab(QtWidgets.QWidget):
         self.progress.setVisible(False)
         self.status.setText("Add files to get started.")
         self._refresh_state()
+
+    def undo_batch(self):
+        """Put the last batch back, or refuse and say what is in the way.
+
+        All or nothing, by the owner's decision: a folder half in one state
+        and half in another is worse than a refusal, because the refusal is
+        recoverable by hand and the half-reverted folder is not.
+        """
+        record = self._undo_record
+        if record is None:
+            return
+
+        if not ConfirmDialog.ask(
+            self,
+            f"Undo this {record.operation}?",
+            f"This puts {len(record)} file(s) back where they were before the "
+            f"batch ran. If any of them cannot be put back, nothing is changed.",
+            confirm_text="Undo batch",
+            cancel_text="Leave as is",
+        ):
+            return
+
+        result = undo.reverse(record)
+        self.status.setObjectName("Hint" if result["ok"] else "StatusWarn")
+        self._restyle_status()
+        self.status.setText(result["message"])
+        if result["ok"]:
+            # The record is spent: the files are back, and offering to undo
+            # again would act on paths that no longer mean anything.
+            self._undo_record = None
+            self.undo_btn.setVisible(False)
+            self.listw.clear()
+            self.retry_btn.setVisible(False)
+            self._refresh_state()
+            activity.record(result["message"], kind="files")
 
     def retry_failed(self):
         """Rebuild the list from the files that failed and run it again."""
@@ -668,6 +721,11 @@ class FileTab(QtWidgets.QWidget):
         self._start_time = time.time()
         self._failures = 0
         self._failed_indices = []
+        # (original, final) for every file that actually moved, built as the
+        # worker reports each one. A file that failed never moved, so it is
+        # not in here and must not be "put back".
+        self._undo_pairs = []
+        self._undo_record = None
         # The paths as they were before the operation ran: the list items are
         # rewritten in place with their outcome, so their text is no longer a
         # path once a batch has finished.
@@ -688,6 +746,10 @@ class FileTab(QtWidgets.QWidget):
     def on_done(self, idx: int, final_path: str):
         if not (0 <= idx < self.listw.count()):
             return
+        if 0 <= idx < len(self._batch_paths):
+            # The path as it was before the batch, not the item's text, which
+            # is rewritten with the outcome a line below.
+            self._undo_pairs.append((self._batch_paths[idx], final_path))
         orig = self.listw.item(idx).text()
         if self._current_op in ("rename", "move"):
             self.listw.item(idx).setText(final_path)
@@ -727,6 +789,8 @@ class FileTab(QtWidgets.QWidget):
         self.status.setText(summary)
         self.progress.setValue(100)
         self.retry_btn.setVisible(bool(failures))
+        self._undo_record = undo.record_batch(self._current_op, self._undo_pairs)
+        self.undo_btn.setVisible(self._undo_record is not None)
         activity.record(summary, kind="files")
         if self.thread:
             self.thread.quit()
