@@ -7,6 +7,7 @@ on disk moved** - a refusal that has already shuffled half the batch is the
 exact failure this design exists to prevent.
 """
 import os
+import shutil
 
 import pytest
 
@@ -129,6 +130,67 @@ def test_a_fingerprint_of_a_missing_file_is_distinct(tmp_path):
     present = tmp_path / "here.txt"
     present.write_text("x", encoding="utf-8")
     assert undo.fingerprint(str(present)) != undo.fingerprint(str(tmp_path / "gone.txt"))
+
+
+def test_an_os_error_mid_reversal_is_rolled_back_not_crashed(tmp_path, monkeypatch):
+    # blockers() cannot see a lock that only appears at move time - a file
+    # held open by another process, a race, a drive that goes away. The
+    # loop must catch it, put back what it already reversed, and report a
+    # clean refusal rather than raising out of undo.reverse().
+    record = make_batch(tmp_path)
+    real_move = shutil.move
+    calls = {"n": 0}
+
+    def flaky_move(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise PermissionError(13, "file in use by another process")
+        return real_move(src, dst)
+
+    monkeypatch.setattr(shutil, "move", flaky_move)
+    result = undo.reverse(record)
+
+    assert result["ok"] is False
+    assert result["reversed"] == 0
+    assert "could not be put back" in result["message"]
+    # The one file the fake failure let through was put back on disk before
+    # the failure, so it must be moved back again rather than left reversed.
+    for original, final in record.pairs:
+        assert not os.path.exists(original)
+        assert os.path.exists(final)
+
+
+def test_a_copy_that_fails_to_remove_mid_reversal_names_it_and_stops(tmp_path, monkeypatch):
+    source_a = tmp_path / "a.txt"
+    source_a.write_text("a", encoding="utf-8")
+    copy_a = tmp_path / "out" / "a.txt"
+    copy_a.parent.mkdir()
+    copy_a.write_text("a", encoding="utf-8")
+
+    source_b = tmp_path / "b.txt"
+    source_b.write_text("b", encoding="utf-8")
+    copy_b = tmp_path / "out" / "b.txt"
+    copy_b.write_text("b", encoding="utf-8")
+
+    record = undo.record_batch("copy", [(str(source_a), str(copy_a)),
+                                         (str(source_b), str(copy_b))])
+
+    from utils import file_utils
+    real_delete = file_utils.delete_file
+
+    def flaky_delete(path):
+        if os.path.basename(path) == "b.txt":
+            raise PermissionError(13, "file in use by another process")
+        return real_delete(path)
+
+    monkeypatch.setattr("utils.file_utils.delete_file", flaky_delete)
+    result = undo.reverse(record)
+
+    assert result["ok"] is False
+    assert result["reversed"] == 1
+    assert "b.txt" in result["message"]
+    assert not copy_a.exists(), "the copy that did remove must stay removed"
+    assert source_a.exists() and source_b.exists(), "originals are never touched"
 
 
 @pytest.mark.parametrize("operation", ["rename", "move"])

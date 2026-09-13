@@ -1,4 +1,4 @@
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from styles import tokens
 from utils import activity, firstrun
@@ -142,6 +142,15 @@ class HomeTab(QtWidgets.QWidget):
         self.welcome.setVisible(not firstrun.seen())
         layout.addWidget(self.welcome)
 
+        # A QShortcut (default WindowShortcut context) fires from anywhere
+        # in the window, not only when a HomeTab descendant has focus. A
+        # keyPressEvent override does not: on the very launch this panel
+        # exists for, the widget that actually holds focus is the sidebar's
+        # own Home button, a sibling of HomeTab, not a descendant of it, so
+        # Escape never reached HomeTab.keyPressEvent to bubble from.
+        self._dismiss_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Escape), self)
+        self._dismiss_shortcut.activated.connect(self.dismiss_welcome)
+
         self._activity_card, self._activity_body = card(
             "Recent activity", "The last batches this app ran, newest first.")
         layout.addWidget(self._activity_card, 1)
@@ -166,15 +175,6 @@ class HomeTab(QtWidgets.QWidget):
             return
         firstrun.mark_seen()
         self.welcome.setVisible(False)
-
-    def keyPressEvent(self, event):
-        # Esc dismisses it, which is what the card asks for: the whole thing
-        # has to be gone in one key. Anything else falls through, so Esc is
-        # not swallowed once the panel has been dismissed.
-        if event.key() == QtCore.Qt.Key_Escape and self.welcome.isVisible():
-            self.dismiss_welcome()
-            return
-        super().keyPressEvent(event)
 
     def showEvent(self, event):
         # Refreshed on show rather than pushed from the tool tabs: the log is

@@ -113,7 +113,13 @@ def reverse(record: BatchRecord) -> dict:
     """Put the batch back, or change nothing at all.
 
     Returns `{"ok", "message", "reversed"}`. When `ok` is False nothing on
-    disk has been touched: every check runs first.
+    disk has been touched: every check runs first. `blockers()` rules out
+    everything that can be known in advance, but a real OS error can still
+    hit the loop below - a file locked by another process, a race in the gap
+    between the check and the move, a drive that goes away. That failure is
+    caught rather than left to crash the caller, and everything already put
+    back is put back the way it was again, so the promise holds even when
+    the filesystem does not cooperate.
     """
     if record is None or not len(record):
         return {"ok": False, "message": "There is nothing to undo.", "reversed": 0}
@@ -130,21 +136,69 @@ def reverse(record: BatchRecord) -> dict:
                         f"as it is rather than putting only some of it back."),
         }
 
-    done = 0
+    done: List[Tuple[str, str]] = []
     for original, final in record.pairs:
-        if record.operation == "copy":
-            # The copy is this app's own artefact and the original is
-            # untouched, so removing it loses nothing the user had before.
-            from utils.file_utils import delete_file
+        try:
+            if record.operation == "copy":
+                # The copy is this app's own artefact and the original is
+                # untouched, so removing it loses nothing the user had before.
+                from utils.file_utils import delete_file
 
-            delete_file(final)
-        else:
-            os.makedirs(os.path.dirname(original) or ".", exist_ok=True)
-            shutil.move(final, original)
-        done += 1
+                delete_file(final)
+            else:
+                os.makedirs(os.path.dirname(original) or ".", exist_ok=True)
+                shutil.move(final, original)
+        except OSError as exc:
+            return _reversal_failed(record.operation, done, final, exc)
+        done.append((original, final))
 
-    return {"ok": True, "reversed": done,
-            "message": _describe(record.operation, done)}
+    return {"ok": True, "reversed": len(done),
+            "message": _describe(record.operation, len(done))}
+
+
+def _reversal_failed(operation: str, done: List[Tuple[str, str]], failed_final: str,
+                      exc: OSError) -> dict:
+    """A move mid-reversal hit a real OS error that `blockers()` could not
+    have ruled out in advance. For rename/move, everything already put back
+    is moved back to `final` again, so the batch ends where it started
+    rather than half-reversed. A removed copy cannot be restored the same
+    way - it went to the Recycle Bin, not to nowhere - so it is named
+    instead of chased.
+    """
+    name = os.path.basename(failed_final)
+    reason = exc.strerror or str(exc)
+
+    if operation == "copy":
+        return {
+            "ok": False,
+            "reversed": len(done),
+            "message": (f"Removed {len(done)} copy(s), then {name} could not be "
+                        f"removed ({reason}). The rest of the batch is left as it "
+                        f"is - check the Recycle Bin for what was already removed."),
+        }
+
+    stuck = []
+    for original, final in reversed(done):
+        try:
+            shutil.move(original, final)
+        except OSError:
+            stuck.append(os.path.basename(final))
+
+    if not stuck:
+        return {
+            "ok": False,
+            "reversed": 0,
+            "message": (f"Nothing was undone - {name} could not be put back "
+                        f"({reason}), and the file(s) already reversed were put "
+                        f"back the way they were."),
+        }
+    return {
+        "ok": False,
+        "reversed": 0,
+        "message": (f"{name} could not be put back ({reason}), and restoring "
+                    f"{len(stuck)} already-reversed file(s) also failed: "
+                    f"{', '.join(stuck[:3])}. Check these by hand."),
+    }
 
 
 def _describe(operation: str, count: int) -> str:

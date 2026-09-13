@@ -726,6 +726,10 @@ class FileTab(QtWidgets.QWidget):
         # not in here and must not be "put back".
         self._undo_pairs = []
         self._undo_record = None
+        # A batch just starting has nothing of its own to undo yet, and the
+        # previous batch's record is gone (line above) - the button must not
+        # keep offering it, clickable and doing nothing, while this one runs.
+        self.undo_btn.setVisible(False)
         # The paths as they were before the operation ran: the list items are
         # rewritten in place with their outcome, so their text is no longer a
         # path once a batch has finished.
