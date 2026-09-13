@@ -1180,6 +1180,7 @@ class DiskTab(QtWidgets.QWidget):
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setAccessibleName("Overview content")
         scroll.setWidget(page)
         return scroll
 
@@ -1287,6 +1288,7 @@ class DiskTab(QtWidgets.QWidget):
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setAccessibleName("Cleanup content")
         # The drill-down lists real paths, some of them very deep. Denying the
         # horizontal scrollbar holds the categories to the window width and
         # makes the wrapped detail labels wrap instead of widening the page.
@@ -1567,6 +1569,7 @@ class DiskTab(QtWidgets.QWidget):
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setAccessibleName("Backup content")
         # No horizontal scrollbar here either, as of the table reshape: four
         # columns with the paths on a second line fit inside the app's own
         # 940px minimum, so nothing needs to scroll sideways. The column
@@ -2151,10 +2154,13 @@ class DiskTab(QtWidgets.QWidget):
             # just above the card's own edge reads as an unfinished table.
             if index:
                 self.sections_layout.addWidget(divider())
-            section = CategorySection(category)
-            section.toggled.connect(self.update_selection)
-            self.sections.append(section)
-            self.sections_layout.addWidget(section)
+            # Named `row`, not `section`: the latter shadows the
+            # widgets.common.section() import, the exact mistake already
+            # fixed for two loop variables elsewhere in this file.
+            row = CategorySection(category)
+            row.toggled.connect(self.update_selection)
+            self.sections.append(row)
+            self.sections_layout.addWidget(row)
         self.update_selection()
 
     def selected_items(self) -> List[Tuple[str, int]]:

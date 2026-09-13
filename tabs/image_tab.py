@@ -262,6 +262,7 @@ class ImageTab(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setAccessibleName("Image Tools specification form")
         scroll.setWidget(spec_body)
 
         # --- Output ------------------------------------------------------

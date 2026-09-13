@@ -206,6 +206,7 @@ class FileTab(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setAccessibleName("File Tools specification form")
         scroll.setWidget(spec_body)
         v.addWidget(scroll, 1)
 

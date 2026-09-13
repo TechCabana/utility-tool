@@ -35,6 +35,7 @@ class SettingsTab(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setAccessibleName("Settings content")
         outer.addWidget(scroll)
 
         body = QtWidgets.QWidget()
