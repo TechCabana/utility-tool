@@ -36,6 +36,41 @@ def test_every_text_pair_clears_its_contrast_floor(theme):
             for fg, bg, floor, actual in failures))
 
 
+def test_danger_border_contrast_matches_its_documented_measurement():
+    """`danger_border` (BRAND.md, "How far the destructive colour sits from
+    the brand, measured") is not a text pair, so `TEXT_PAIRS` never covers
+    it -- until this test, the 2.76:1 / 16.9:1 figures in BRAND.md and in
+    the token comments were asserted nowhere, only written down. A drift in
+    either token would pass every other test in this file.
+
+    Dark deliberately stops short of WCAG 1.4.11's 3:1 (every rose that
+    clears it collides with the accent) -- the floor here pins the
+    documented 2.76:1, not 3:1, so a regression is caught without silently
+    ratcheting the requirement up to a bar the design explicitly rejected.
+    """
+    light_border_vs_card = tokens.contrast_ratio(
+        tokens.LIGHT["danger_border"], tokens.LIGHT["bg_elev"])
+    dark_border_vs_card = tokens.contrast_ratio(
+        tokens.DARK["danger_border"], tokens.DARK["bg_elev"])
+
+    assert tokens.LIGHT["danger_border"] == tokens.LIGHT["danger_fill"], (
+        "light's border is documented as the fill acting as its own boundary")
+    assert light_border_vs_card >= 15.0, (
+        f"light danger_border vs card is {light_border_vs_card:.2f}:1, "
+        "expected well above 3:1 (documented ~16.9:1)")
+    assert dark_border_vs_card >= 2.7, (
+        f"dark danger_border vs card is {dark_border_vs_card:.2f}:1, "
+        "expected >= 2.7:1 (documented 2.76:1)")
+    # The fill alone (no border) reads notably worse -- that gap is the
+    # whole reason the border token exists; assert it stays a real gap
+    # rather than the two tokens quietly converging back to one value.
+    dark_fill_vs_card = tokens.contrast_ratio(
+        tokens.DARK["danger_fill"], tokens.DARK["bg_elev"])
+    assert dark_border_vs_card - dark_fill_vs_card >= 0.5, (
+        "dark danger_border should read clearly better than the fill alone "
+        "against the card -- that lift is the token's entire purpose")
+
+
 def test_both_palettes_define_the_same_tokens():
     missing_in_dark = set(tokens.LIGHT) - set(tokens.DARK)
     missing_in_light = set(tokens.DARK) - set(tokens.LIGHT)
