@@ -35,6 +35,7 @@ class SettingsTab(QtWidgets.QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setAccessibleName("Settings content")
         outer.addWidget(scroll)
 
         body = QtWidgets.QWidget()
@@ -69,6 +70,7 @@ class SettingsTab(QtWidgets.QWidget):
         row_layout.addWidget(label)
 
         self.theme_combo = QtWidgets.QComboBox()
+        self.theme_combo.setAccessibleName("Theme")
         for text, value in THEME_CHOICES:
             self.theme_combo.addItem(text, value)
 

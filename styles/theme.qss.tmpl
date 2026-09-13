@@ -194,6 +194,18 @@ QLabel#FieldLabel {
     color: @@text_muted@@;
 }
 
+/* The label half of a section heading that carries actions on its right --
+   `section()` in widgets/common.py. Same type role as SectionHeader, without
+   the rule and the margins, because the composite draws its own divider and
+   owns its own spacing. */
+QLabel#SectionLabel {
+    font-size: @@size_group@@;
+    font-weight: @@weight_group@@;
+    color: @@text_muted@@;
+    text-transform: uppercase;
+    letter-spacing: @@track_group@@;
+}
+
 /* Column header inside a repeated-row table. Its own name rather than
    reusing the field-label style, which is a different role. */
 QLabel#TableHeader {
@@ -635,7 +647,17 @@ QProgressBar#BusyBar::chunk { background-color: @@text_faint@@; }
  * Overlay style, no arrows, transparent trough. The previous sheet left the
  * trough and the corner unstyled, so a scrolling card showed a grey block
  * sitting on top of its own border. */
-QAbstractScrollArea { background: transparent; }
+/* A scroll area is a tab stop - that is how a keyboard user scrolls a long
+   form without moving focus into it - so it has to show that it has focus.
+   The border is always present and merely changes colour, so gaining focus
+   never nudges the layout. */
+QAbstractScrollArea {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: @@radius_m@@;
+}
+
+QAbstractScrollArea:focus { border-color: @@accent@@; }
 QAbstractScrollArea::corner { background: transparent; border: none; }
 
 QScrollBar:vertical {
