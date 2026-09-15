@@ -390,8 +390,14 @@ class ConfirmDialog(QtWidgets.QDialog):
         cancel.clicked.connect(self.reject)
         buttons.addWidget(cancel)
 
-        confirm = QtWidgets.QPushButton(confirm_text)
+        confirm = QtWidgets.QPushButton(f"  {confirm_text}")
         confirm.setObjectName("Danger")
+        # The commit point carries the same mark as the action that opened
+        # this dialog, so the two read as one gesture rather than two
+        # unrelated red buttons.
+        from widgets import icons as icon_set
+
+        icon_set.set_icon(confirm, "trash", "danger_text", 15)
         confirm.setDefault(True)
         confirm.clicked.connect(self.accept)
         buttons.addWidget(confirm)
