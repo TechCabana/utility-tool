@@ -639,6 +639,15 @@ class ImageTab(QtWidgets.QWidget):
             f"Added {added} image(s) from {os.path.basename(folder)}." if added
             else "That folder has no images this tool can read.")
 
+    def _forget_last_batch(self):
+        """Drop the previous batch's failure state so Retry and the failure
+        panel stop pointing at a run no longer on screen."""
+        self._failures = 0
+        self._failure_reasons = []
+        self.retry_btn.setVisible(False)
+        self.failures.setVisible(False)
+        self.failures.clear()
+
     def clear_files(self):
         """Discard the current batch setup.
 
@@ -657,6 +666,7 @@ class ImageTab(QtWidgets.QWidget):
             return
         self.listw.clear()
         self.rows.clear()
+        self._forget_last_batch()
         self.overall.setValue(0)
         self.status.setText("Add images to get started.")
         self.open_output_btn.setVisible(False)

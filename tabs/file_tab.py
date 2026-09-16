@@ -468,6 +468,27 @@ class FileTab(QtWidgets.QWidget):
             self.status.setText(f"Added {len(files)} file(s).")
             self._refresh_state()
 
+    def _forget_last_batch(self):
+        """Drop everything that points at the batch just cleared.
+
+        Without this, Retry and Undo keep working on a run the user just
+        asked to forget: Retry repopulates the list from `_batch_paths` and
+        runs it again, Undo still offers to reverse it, and the failure
+        panel keeps showing its text.
+        """
+        self._failures = 0
+        self._total = 0
+        self._failed_indices = []
+        self._batch_paths = []
+        self._undo_pairs = []
+        self._undo_record = None
+        self._failure_reasons = []
+        self._continuing = False
+        self.retry_btn.setVisible(False)
+        self.undo_btn.setVisible(False)
+        self.failures.setVisible(False)
+        self.failures.clear()
+
     def clear_files(self):
         count = self.listw.count()
         if not count:
@@ -480,6 +501,7 @@ class FileTab(QtWidgets.QWidget):
         ):
             return
         self.listw.clear()
+        self._forget_last_batch()
         self.progress.setValue(0)
         self.progress.setVisible(False)
         self.status.setText("Add files to get started.")
