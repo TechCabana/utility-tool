@@ -117,10 +117,21 @@ LIGHT = {
     # too light to carry white label text, and darkening the status word to
     # suit the button would make it hard to read as text. Two roles, two
     # tokens, both asserted in tests/test_tokens.py.
-    "danger_fill":   "#b3352d",
-    "danger_hover":  "#c44039",
-    "danger_press":  "#992c25",
+    # Deep enough to stop competing with the accent. Measured with CIEDE2000:
+    # the old #b3352d sat dE 11.8 from `accent`, against dE 32.2 for `warn` -
+    # the colour meaning "this deletes things" was three times closer to the
+    # brand colour than the warning was. This is dE 23.6 from the accent and
+    # 33.3 from warn, and carries white at 16.9:1.
+    #
+    # No other *red* fixes this: every candidate in the credible-danger hue
+    # range lands dE 13-20, because the accent is itself a red. Going darker
+    # within the family was the owner's call over moving the accent off red.
+    "danger_fill":   "#3c0a10",
+    "danger_hover":  "#551017",
+    "danger_press":  "#2a070b",
     "danger_text":   "#ffffff",
+    # On white the fill is its own boundary at 16.9:1, so the border matches.
+    "danger_border": "#3c0a10",
 
     "data_track":    "#e6e6e9",
     "data_fill":     "#6b6b74",
@@ -163,10 +174,26 @@ DARK = {
     "success":       "#4bbd8a",
     "warn":          "#d9a441",
     "error":         "#e8695f",
-    "danger_fill":   "#a83028",
-    "danger_hover":  "#c03a31",
-    "danger_press":  "#8f2721",
+    # Dark cannot take the depth light does: a near-black fill on a near-black
+    # card stops reading as a button at all (edge contrast 1.2:1). So dark
+    # takes the *family* change rather than the full depth - it stops being
+    # orange-red while light is rose-black, so both themes read as one family
+    # - and gains label contrast (6.73 -> 8.22:1). Separation from the accent
+    # stays around dE 14. The owner accepted that dark gets the smaller win.
+    "danger_fill":   "#8f2a38",
+    "danger_hover":  "#a33246",
+    "danger_press":  "#78232f",
     "danger_text":   "#ffffff",
+    # A lighter edge, because the fill alone reads only 2.09:1 against the
+    # card. This lifts it to 2.76:1, which is short of the 3:1 that WCAG
+    # 1.4.11 asks of a control boundary, and that shortfall is deliberate:
+    # every rose light enough to clear 3:1 lands within dE 3.4 of the accent,
+    # i.e. it stops being distinguishable from the brand colour, and a
+    # destructive button outlined in the accent misleads worse than a dim
+    # edge does. The button is not identified by its boundary alone - its
+    # label sits on the fill at 8.22:1 - so the honest trade is a visible
+    # edge that stays unmistakably not-the-accent.
+    "danger_border": "#a83a4c",
 
     "data_track":    "#2e2e35",
     "data_fill":     "#8f8f9a",

@@ -16,6 +16,7 @@ from utils.disk_utils import (
     top_level_breakdown,
 )
 from utils.file_utils import delete_file
+from widgets import icons
 from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
                             divider, icon_button, section, table_header)
 
@@ -1310,8 +1311,12 @@ class DiskTab(QtWidgets.QWidget):
         self.selection_label = QtWidgets.QLabel("Nothing selected")
         row.addWidget(self.selection_label)
         row.addStretch(1)
-        self.clean_btn = QtWidgets.QPushButton("Clean Selected")
+        self.clean_btn = QtWidgets.QPushButton("  Clean selected")
         self.clean_btn.setObjectName("Danger")
+        # Colour is the weaker half of this signal - the two filled surfaces
+        # are one-per-screen and never appear together, so nothing is being
+        # compared. The icon is what survives that.
+        icons.set_icon(self.clean_btn, "trash", "danger_text", 15)
         self.clean_btn.setEnabled(False)
         self.clean_btn.clicked.connect(self.clean_selected)
         row.addWidget(self.clean_btn)
@@ -1436,8 +1441,9 @@ class DiskTab(QtWidgets.QWidget):
         self.dup_selection_label = QtWidgets.QLabel("Nothing selected")
         footer.addWidget(self.dup_selection_label)
         footer.addStretch(1)
-        self.dup_remove_btn = QtWidgets.QPushButton("Remove Selected")
+        self.dup_remove_btn = QtWidgets.QPushButton("  Remove selected")
         self.dup_remove_btn.setObjectName("Danger")
+        icons.set_icon(self.dup_remove_btn, "trash", "danger_text", 15)
         self.dup_remove_btn.setEnabled(False)
         self.dup_remove_btn.clicked.connect(self.remove_duplicates)
         footer.addWidget(self.dup_remove_btn)

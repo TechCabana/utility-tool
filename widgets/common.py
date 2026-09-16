@@ -12,6 +12,8 @@ here beyond the drop shadow, which QSS cannot express.
 """
 from __future__ import annotations
 
+import re
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from styles import tokens
@@ -124,6 +126,35 @@ def section(title: str, *actions: QtWidgets.QWidget) -> QtWidgets.QWidget:
     column.addLayout(row)
     column.addWidget(divider())
     return host
+
+
+_OS_ERROR_CODE = re.compile(r"^\[(?:Win)?Err(?:or|no)\s*\d+\]\s*")
+_TRAILING_PATH = re.compile(r":\s*'[^']*'\s*$")
+
+
+def readable_error(message: str) -> str:
+    """Strip an OS error down to the sentence a person can act on.
+
+    `str(OSError)` on Windows carries three things: an error code the user
+    cannot use, one sentence they can, and the path repeated back at them
+    with its separators doubled by repr. The caller already names the file,
+    so only the middle part carries information.
+
+    Anything not matching that shape is passed through untouched - a message
+    from somewhere else is not improved by being trimmed on a guess.
+    """
+    stripped = message.strip()
+    trimmed = _OS_ERROR_CODE.sub("", stripped)
+    if trimmed == stripped:
+        # No error code recognised at the front, so this was never claimed
+        # to be an OSError's `[Errno N]`/`[WinError N]` shape - trimming a
+        # trailing "...: '...'" here would mangle a message that only
+        # happens to end in a quoted word (e.g. a non-OSError message
+        # naming a job or a value in quotes), which is exactly the "guess"
+        # the docstring says not to make.
+        return stripped
+    trimmed = _TRAILING_PATH.sub("", trimmed)
+    return trimmed.strip() or stripped
 
 
 def table_header(text: str) -> QtWidgets.QLabel:
@@ -390,8 +421,14 @@ class ConfirmDialog(QtWidgets.QDialog):
         cancel.clicked.connect(self.reject)
         buttons.addWidget(cancel)
 
-        confirm = QtWidgets.QPushButton(confirm_text)
+        confirm = QtWidgets.QPushButton(f"  {confirm_text}")
         confirm.setObjectName("Danger")
+        # The commit point carries the same mark as the action that opened
+        # this dialog, so the two read as one gesture rather than two
+        # unrelated red buttons.
+        from widgets import icons as icon_set
+
+        icon_set.set_icon(confirm, "trash", "danger_text", 15)
         confirm.setDefault(True)
         confirm.clicked.connect(self.accept)
         buttons.addWidget(confirm)

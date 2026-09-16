@@ -36,6 +36,41 @@ def test_every_text_pair_clears_its_contrast_floor(theme):
             for fg, bg, floor, actual in failures))
 
 
+def test_danger_border_contrast_matches_its_documented_measurement():
+    """`danger_border` (BRAND.md, "How far the destructive colour sits from
+    the brand, measured") is not a text pair, so `TEXT_PAIRS` never covers
+    it -- until this test, the 2.76:1 / 16.9:1 figures in BRAND.md and in
+    the token comments were asserted nowhere, only written down. A drift in
+    either token would pass every other test in this file.
+
+    Dark deliberately stops short of WCAG 1.4.11's 3:1 (every rose that
+    clears it collides with the accent) -- the floor here pins the
+    documented 2.76:1, not 3:1, so a regression is caught without silently
+    ratcheting the requirement up to a bar the design explicitly rejected.
+    """
+    light_border_vs_card = tokens.contrast_ratio(
+        tokens.LIGHT["danger_border"], tokens.LIGHT["bg_elev"])
+    dark_border_vs_card = tokens.contrast_ratio(
+        tokens.DARK["danger_border"], tokens.DARK["bg_elev"])
+
+    assert tokens.LIGHT["danger_border"] == tokens.LIGHT["danger_fill"], (
+        "light's border is documented as the fill acting as its own boundary")
+    assert light_border_vs_card >= 15.0, (
+        f"light danger_border vs card is {light_border_vs_card:.2f}:1, "
+        "expected well above 3:1 (documented ~16.9:1)")
+    assert dark_border_vs_card >= 2.7, (
+        f"dark danger_border vs card is {dark_border_vs_card:.2f}:1, "
+        "expected >= 2.7:1 (documented 2.76:1)")
+    # The fill alone (no border) reads notably worse -- that gap is the
+    # whole reason the border token exists; assert it stays a real gap
+    # rather than the two tokens quietly converging back to one value.
+    dark_fill_vs_card = tokens.contrast_ratio(
+        tokens.DARK["danger_fill"], tokens.DARK["bg_elev"])
+    assert dark_border_vs_card - dark_fill_vs_card >= 0.5, (
+        "dark danger_border should read clearly better than the fill alone "
+        "against the card -- that lift is the token's entire purpose")
+
+
 def test_both_palettes_define_the_same_tokens():
     missing_in_dark = set(tokens.LIGHT) - set(tokens.DARK)
     missing_in_light = set(tokens.DARK) - set(tokens.LIGHT)
@@ -96,3 +131,60 @@ def test_no_colour_literal_escaped_into_the_template():
     # Object-name selectors (#Card, #Sidebar) are not colours; the pattern
     # above only matches hex digits, so anything it finds really is one.
     assert not literals, f"colour literals in the template: {sorted(set(literals))}"
+
+
+# ---------------------------------------------------------------------------
+# readable_error: what a failed file actually tells the user
+# ---------------------------------------------------------------------------
+# Lives here rather than in a Qt test because it is a pure string function,
+# and CLAUDE.md §2 records the decision that `tabs/` has no Qt harness.
+
+def test_readable_error_strips_the_code_and_the_repeated_path():
+    from widgets.common import readable_error
+
+    raw = ("[WinError 32] The process cannot access the file because it is "
+           "being used by another process: 'C:\\files\\gamma.txt'")
+    assert readable_error(raw) == (
+        "The process cannot access the file because it is being used by "
+        "another process")
+
+
+def test_readable_error_handles_posix_errno_too():
+    from widgets.common import readable_error
+
+    assert readable_error("[Errno 13] Permission denied") == "Permission denied"
+    assert readable_error("[Errno 2] No such file or directory: '/tmp/x'") == \
+        "No such file or directory"
+
+
+def test_readable_error_passes_through_anything_it_does_not_recognise():
+    from widgets.common import readable_error
+
+    # A message from somewhere else is not improved by being trimmed on a
+    # guess, and silently mangling one would be worse than leaving it long.
+    assert readable_error("Destination is not a folder") == "Destination is not a folder"
+    assert readable_error("  padded  ") == "padded"
+
+
+def test_readable_error_never_returns_empty():
+    from widgets.common import readable_error
+
+    # A message that is nothing but a code would otherwise trim to "", and an
+    # empty reason beside a filename is worse than a useless one.
+    assert readable_error("[WinError 5]") == "[WinError 5]"
+
+
+def test_readable_error_does_not_strip_a_quote_from_a_non_os_error():
+    from widgets.common import readable_error
+
+    # The trailing ": '...'" trim is only valid because an OSError repeats
+    # the path after the recognised [Errno N]/[WinError N] code. A message
+    # that never carried that code but happens to end the same way (a
+    # custom error naming a job, a value, or a duplicate name in quotes) is
+    # not an OS error, and stripping its last word on a shape-guess would be
+    # the exact "trimmed on a guess" mangling this function promises not to
+    # do.
+    assert readable_error("Copy failed for job: 'nightly-backup'") == \
+        "Copy failed for job: 'nightly-backup'"
+    assert readable_error("cannot identify image file 'C:\\\\x\\\\y.jpg'") == \
+        "cannot identify image file 'C:\\\\x\\\\y.jpg'"

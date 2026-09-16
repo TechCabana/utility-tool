@@ -15,7 +15,8 @@ from utils.presets import add_image_preset, get_image_presets
 from widgets import icons
 from widgets.common import (
     ConfirmDialog, EmptyState, PageHeader, SPACE_FIELD, add_field,
-    card, data_label, field_pair, form_layout, section_header,
+    card, data_label, field_pair, form_layout, readable_error,
+    section_header,
 )
 from widgets.pattern import PatternField
 
@@ -165,6 +166,7 @@ class ImageTab(QtWidgets.QWidget):
         self._start_time = 0.0
         self._count = 0
         self._failures = 0
+        self._failure_reasons = []
 
         self._reload_presets()
         self.preset_combo.currentIndexChanged.connect(self._apply_selected_preset)
@@ -475,6 +477,17 @@ class ImageTab(QtWidgets.QWidget):
         self.retry_btn.setVisible(False)
         layout.addWidget(self.retry_btn, 0, Qt.AlignLeft)
 
+        # What failed and why, in the result area rather than behind a hover.
+        # Same reasoning as File Tools: a reason you have to point at a row to
+        # read cannot be fixed before you press Retry, because you do not know
+        # it is there.
+        self.failures = QtWidgets.QLabel()
+        self.failures.setObjectName("StatusWarn")
+        self.failures.setWordWrap(True)
+        self.failures.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.failures.setVisible(False)
+        layout.addWidget(self.failures)
+
         self.open_output_btn = QtWidgets.QPushButton("  Open output folder")
         self.open_output_btn.setObjectName("Secondary")
         icons.set_icon(self.open_output_btn, "folder-open", "text_muted", 15)
@@ -686,8 +699,10 @@ class ImageTab(QtWidgets.QWidget):
         out_dir = self.out_edit.text() or os.path.dirname(files[0])
         self._out_dir_used = out_dir
         self._failures = 0
+        self._failure_reasons = []
         self.open_output_btn.setVisible(False)
         self.retry_btn.setVisible(False)
+        self.failures.setVisible(False)
 
         self._inflate_rows(files)
         self.overall.setValue(0)
@@ -712,6 +727,43 @@ class ImageTab(QtWidgets.QWidget):
         self._start_time = time.time()
         self._count = len(files)
         self._set_running(True)
+
+    def _show_failures(self):
+        """List what failed, by name and reason, in the result area.
+
+        Grouped by reason and capped: a batch where every file failed the same
+        way is one line of information, not two hundred.
+        """
+        if not self._failure_reasons:
+            self.failures.setVisible(False)
+            self.failures.clear()
+            return
+
+        # Grouped by the READABLE reason, not the raw one: the raw OSError
+        # string repeats each file's own path (see readable_error()'s
+        # docstring), so two files that failed for the exact same underlying
+        # reason -- e.g. both an unreadable format -- have DIFFERENT raw
+        # strings and would otherwise never collapse into one group, which
+        # is the one case ("every image failed the same way") this grouping
+        # exists to handle.
+        grouped = {}
+        for name, reason in self._failure_reasons:
+            grouped.setdefault(readable_error(reason), []).append(name)
+
+        lines = []
+        for reason, names in list(grouped.items())[:4]:
+            shown = ", ".join(names[:3])
+            if len(names) > 3:
+                shown += f" and {len(names) - 3} more"
+            lines.append(f"    {shown} - {reason}")
+        if len(grouped) > 4:
+            lines.append(f"    and {len(grouped) - 4} other problem(s)")
+
+        count = len(self._failure_reasons)
+        self.failures.setText(
+            f"{count} image(s) could not be processed. Fix these, then press "
+            f"Retry failed:\n" + "\n".join(lines))
+        self.failures.setVisible(True)
 
     def retry_failed(self):
         """Rebuild the list from the files that failed, and run it again.
@@ -757,6 +809,8 @@ class ImageTab(QtWidgets.QWidget):
         self._failures += 1
         if 0 <= idx < len(self.rows):
             self.rows[idx].mark_error(msg)
+            self._failure_reasons.append(
+                (os.path.basename(self.rows[idx].path), msg))
 
     def on_finished(self, seconds: float):
         done = self._count - self._failures
@@ -772,6 +826,7 @@ class ImageTab(QtWidgets.QWidget):
 
         self.open_output_btn.setVisible(bool(self._out_dir_used))
         self.retry_btn.setVisible(bool(self._failures))
+        self._show_failures()
         activity.record(summary, kind="image")
 
         if self.thread:
