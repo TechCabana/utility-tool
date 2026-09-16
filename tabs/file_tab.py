@@ -665,6 +665,18 @@ class FileTab(QtWidgets.QWidget):
     # Apply (Rename / Move / Copy / Delete)
     # ------------------------------
     def apply(self):
+        # Consumed here, unconditionally, before any validation below can
+        # return early. `_continuing` is a one-shot flag set by
+        # retry_failed() for the call it is about to make; if it were only
+        # read (and reset) after every early-return point further down, a
+        # retry that bails out here -- a destination cleared before Retry
+        # was pressed, a conflict-policy or Delete confirmation dialog
+        # cancelled -- would leave it stuck True. The next Apply, on a
+        # completely unrelated batch, would then silently inherit this
+        # run's undo pairs instead of starting clean.
+        continuing = self._continuing
+        self._continuing = False
+
         paths = [self.listw.item(i).text() for i in range(self.listw.count())]
         if not paths:
             # Unreachable through the UI (Apply is disabled on an empty list)
@@ -753,11 +765,10 @@ class FileTab(QtWidgets.QWidget):
         # A retry continues the same run, so it keeps what the earlier pass
         # already moved and appends to it. Anything else is a new run and
         # starts clean.
-        if not self._continuing:
+        if not continuing:
             self._undo_pairs = []
         self._failure_reasons = []
         self._undo_record = None
-        self._continuing = False
         # A batch just starting has nothing of its own to undo yet, and the
         # previous batch's record is gone (line above) - the button must not
         # keep offering it, clickable and doing nothing, while this one runs.
