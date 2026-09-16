@@ -762,6 +762,12 @@ class FileTab(QtWidgets.QWidget):
         # previous batch's record is gone (line above) - the button must not
         # keep offering it, clickable and doing nothing, while this one runs.
         self.undo_btn.setVisible(False)
+        # Likewise the failure panel: it still shows the PREVIOUS batch's
+        # text at this point (on_finished is what last wrote it), and this
+        # run -- retry or not -- has not reported anything of its own yet.
+        # Left alone, a retry's failure list stayed on screen, stale, for the
+        # whole duration of the retry it was about to be superseded by.
+        self.failures.setVisible(False)
         # The paths as they were before the operation ran: the list items are
         # rewritten in place with their outcome, so their text is no longer a
         # path once a batch has finished.
