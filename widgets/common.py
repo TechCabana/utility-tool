@@ -12,6 +12,8 @@ here beyond the drop shadow, which QSS cannot express.
 """
 from __future__ import annotations
 
+import re
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from styles import tokens
@@ -124,6 +126,26 @@ def section(title: str, *actions: QtWidgets.QWidget) -> QtWidgets.QWidget:
     column.addLayout(row)
     column.addWidget(divider())
     return host
+
+
+_OS_ERROR_CODE = re.compile(r"^\[(?:Win)?Err(?:or|no)\s*\d+\]\s*")
+_TRAILING_PATH = re.compile(r":\s*'[^']*'\s*$")
+
+
+def readable_error(message: str) -> str:
+    """Strip an OS error down to the sentence a person can act on.
+
+    `str(OSError)` on Windows carries three things: an error code the user
+    cannot use, one sentence they can, and the path repeated back at them
+    with its separators doubled by repr. The caller already names the file,
+    so only the middle part carries information.
+
+    Anything not matching that shape is passed through untouched - a message
+    from somewhere else is not improved by being trimmed on a guess.
+    """
+    trimmed = _OS_ERROR_CODE.sub("", message.strip())
+    trimmed = _TRAILING_PATH.sub("", trimmed)
+    return trimmed or message.strip()
 
 
 def table_header(text: str) -> QtWidgets.QLabel:

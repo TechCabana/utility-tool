@@ -131,3 +131,44 @@ def test_no_colour_literal_escaped_into_the_template():
     # Object-name selectors (#Card, #Sidebar) are not colours; the pattern
     # above only matches hex digits, so anything it finds really is one.
     assert not literals, f"colour literals in the template: {sorted(set(literals))}"
+
+
+# ---------------------------------------------------------------------------
+# readable_error: what a failed file actually tells the user
+# ---------------------------------------------------------------------------
+# Lives here rather than in a Qt test because it is a pure string function,
+# and CLAUDE.md §2 records the decision that `tabs/` has no Qt harness.
+
+def test_readable_error_strips_the_code_and_the_repeated_path():
+    from widgets.common import readable_error
+
+    raw = ("[WinError 32] The process cannot access the file because it is "
+           "being used by another process: 'C:\\files\\gamma.txt'")
+    assert readable_error(raw) == (
+        "The process cannot access the file because it is being used by "
+        "another process")
+
+
+def test_readable_error_handles_posix_errno_too():
+    from widgets.common import readable_error
+
+    assert readable_error("[Errno 13] Permission denied") == "Permission denied"
+    assert readable_error("[Errno 2] No such file or directory: '/tmp/x'") == \
+        "No such file or directory"
+
+
+def test_readable_error_passes_through_anything_it_does_not_recognise():
+    from widgets.common import readable_error
+
+    # A message from somewhere else is not improved by being trimmed on a
+    # guess, and silently mangling one would be worse than leaving it long.
+    assert readable_error("Destination is not a folder") == "Destination is not a folder"
+    assert readable_error("  padded  ") == "padded"
+
+
+def test_readable_error_never_returns_empty():
+    from widgets.common import readable_error
+
+    # A message that is nothing but a code would otherwise trim to "", and an
+    # empty reason beside a filename is worse than a useless one.
+    assert readable_error("[WinError 5]") == "[WinError 5]"

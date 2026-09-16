@@ -9,7 +9,8 @@ from utils import activity, undo
 from widgets import icons
 from widgets.common import (
     ConfirmDialog, EmptyState, PageHeader, SPACE_FIELD, add_field,
-    card, data_label, field_pair, form_layout, section_header,
+    card, data_label, field_pair, form_layout, readable_error,
+    section_header,
 )
 from widgets.pattern import PatternField
 
@@ -386,6 +387,17 @@ class FileTab(QtWidgets.QWidget):
         self.retry_btn.clicked.connect(self.retry_failed)
         self.retry_btn.setVisible(False)
 
+        # What failed and why, in the result area rather than behind a hover.
+        # The owner's words: "the user should be alerted on what failed so
+        # that they can fix before retrying" - which a tooltip cannot do,
+        # because you have to already suspect a row to point at it.
+        self.failures = QtWidgets.QLabel()
+        self.failures.setObjectName("StatusWarn")
+        self.failures.setWordWrap(True)
+        self.failures.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.failures.setVisible(False)
+        fv.addWidget(self.failures)
+
         # Undo sits beside Retry: both are "that did not go how I wanted",
         # and both are only offered when they can actually do something.
         self.undo_btn = QtWidgets.QPushButton("  Undo this batch")
@@ -433,6 +445,8 @@ class FileTab(QtWidgets.QWidget):
         self._batch_paths = []
         self._undo_pairs = []
         self._undo_record = None
+        self._failure_reasons = []
+        self._continuing = False
         self._on_operation_changed()  # apply initial (Rename) field visibility
         self._refresh_state()
 
@@ -503,7 +517,17 @@ class FileTab(QtWidgets.QWidget):
             activity.record(result["message"], kind="files")
 
     def retry_failed(self):
-        """Rebuild the list from the files that failed and run it again."""
+        """Run the failed files again as part of the SAME run.
+
+        The owner's decision, 2026-09-16: "retry should be seen as the same
+        run". That matters for undo, because `apply()` clears the undo
+        record - so before this, retrying silently threw away the ability to
+        undo the files that had already succeeded. The user had done nothing
+        wrong and lost the safety net for the part that worked.
+
+        `_continuing` carries the accumulated pairs across, so one run plus
+        its retries reverses as a single unit.
+        """
         failed = [self._batch_paths[i] for i in self._failed_indices
                   if 0 <= i < len(self._batch_paths)]
         if not failed:
@@ -513,6 +537,7 @@ class FileTab(QtWidgets.QWidget):
         self.retry_btn.setVisible(False)
         self.status.setText(f"Retrying {len(failed)} file(s) that failed.")
         self._refresh_state()
+        self._continuing = True
         self.apply()
 
     def _refresh_state(self):
@@ -724,8 +749,15 @@ class FileTab(QtWidgets.QWidget):
         # (original, final) for every file that actually moved, built as the
         # worker reports each one. A file that failed never moved, so it is
         # not in here and must not be "put back".
-        self._undo_pairs = []
+        #
+        # A retry continues the same run, so it keeps what the earlier pass
+        # already moved and appends to it. Anything else is a new run and
+        # starts clean.
+        if not self._continuing:
+            self._undo_pairs = []
+        self._failure_reasons = []
         self._undo_record = None
+        self._continuing = False
         # A batch just starting has nothing of its own to undo yet, and the
         # previous batch's record is gone (line above) - the button must not
         # keep offering it, clickable and doing nothing, while this one runs.
@@ -774,10 +806,48 @@ class FileTab(QtWidgets.QWidget):
         # ones used to mean three dialogs to dismiss, mid-run.
         self._failures = getattr(self, "_failures", 0) + 1
         self._failed_indices.append(idx)
+        name = (os.path.basename(self._batch_paths[idx])
+                if 0 <= idx < len(self._batch_paths) else "a file")
+        self._failure_reasons.append((name, msg))
         if 0 <= idx < self.listw.count():
             item = self.listw.item(idx)
             item.setText(f"{item.text()}  \u2014  failed: {msg}")
             item.setToolTip(msg)
+
+    def _show_failures(self):
+        """List what failed, by name and reason, in the result area.
+
+        The owner's words: "the user should be alerted on what failed so that
+        they can fix before retrying". A tooltip cannot do that - you have to
+        already suspect a row before you point at it.
+
+        Grouped by reason and capped, because the panel has to stay readable:
+        a batch where every file failed for the same reason is one line of
+        information, not two hundred.
+        """
+        if not self._failure_reasons:
+            self.failures.setVisible(False)
+            self.failures.clear()
+            return
+
+        grouped = {}
+        for name, reason in self._failure_reasons:
+            grouped.setdefault(reason, []).append(name)
+
+        lines = []
+        for reason, names in list(grouped.items())[:4]:
+            shown = ", ".join(names[:3])
+            if len(names) > 3:
+                shown += f" and {len(names) - 3} more"
+            lines.append(f"    {shown} \u2014 {readable_error(reason)}")
+        if len(grouped) > 4:
+            lines.append(f"    and {len(grouped) - 4} other problem(s)")
+
+        count = len(self._failure_reasons)
+        self.failures.setText(
+            f"{count} file(s) could not be processed. Fix these, then press "
+            f"Retry failed:\n" + "\n".join(lines))
+        self.failures.setVisible(True)
 
     def _restyle_status(self):
         self.status.style().unpolish(self.status)
@@ -793,6 +863,7 @@ class FileTab(QtWidgets.QWidget):
         self.status.setText(summary)
         self.progress.setValue(100)
         self.retry_btn.setVisible(bool(failures))
+        self._show_failures()
         self._undo_record = undo.record_batch(self._current_op, self._undo_pairs)
         self.undo_btn.setVisible(self._undo_record is not None)
         activity.record(summary, kind="files")
