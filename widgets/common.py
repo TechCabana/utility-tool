@@ -143,9 +143,18 @@ def readable_error(message: str) -> str:
     Anything not matching that shape is passed through untouched - a message
     from somewhere else is not improved by being trimmed on a guess.
     """
-    trimmed = _OS_ERROR_CODE.sub("", message.strip())
+    stripped = message.strip()
+    trimmed = _OS_ERROR_CODE.sub("", stripped)
+    if trimmed == stripped:
+        # No error code recognised at the front, so this was never claimed
+        # to be an OSError's `[Errno N]`/`[WinError N]` shape - trimming a
+        # trailing "...: '...'" here would mangle a message that only
+        # happens to end in a quoted word (e.g. a non-OSError message
+        # naming a job or a value in quotes), which is exactly the "guess"
+        # the docstring says not to make.
+        return stripped
     trimmed = _TRAILING_PATH.sub("", trimmed)
-    return trimmed or message.strip()
+    return trimmed.strip() or stripped
 
 
 def table_header(text: str) -> QtWidgets.QLabel:

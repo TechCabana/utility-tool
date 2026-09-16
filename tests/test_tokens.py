@@ -172,3 +172,19 @@ def test_readable_error_never_returns_empty():
     # A message that is nothing but a code would otherwise trim to "", and an
     # empty reason beside a filename is worse than a useless one.
     assert readable_error("[WinError 5]") == "[WinError 5]"
+
+
+def test_readable_error_does_not_strip_a_quote_from_a_non_os_error():
+    from widgets.common import readable_error
+
+    # The trailing ": '...'" trim is only valid because an OSError repeats
+    # the path after the recognised [Errno N]/[WinError N] code. A message
+    # that never carried that code but happens to end the same way (a
+    # custom error naming a job, a value, or a duplicate name in quotes) is
+    # not an OS error, and stripping its last word on a shape-guess would be
+    # the exact "trimmed on a guess" mangling this function promises not to
+    # do.
+    assert readable_error("Copy failed for job: 'nightly-backup'") == \
+        "Copy failed for job: 'nightly-backup'"
+    assert readable_error("cannot identify image file 'C:\\\\x\\\\y.jpg'") == \
+        "cannot identify image file 'C:\\\\x\\\\y.jpg'"
