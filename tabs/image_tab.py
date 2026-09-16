@@ -739,16 +739,23 @@ class ImageTab(QtWidgets.QWidget):
             self.failures.clear()
             return
 
+        # Grouped by the READABLE reason, not the raw one: the raw OSError
+        # string repeats each file's own path (see readable_error()'s
+        # docstring), so two files that failed for the exact same underlying
+        # reason -- e.g. both an unreadable format -- have DIFFERENT raw
+        # strings and would otherwise never collapse into one group, which
+        # is the one case ("every image failed the same way") this grouping
+        # exists to handle.
         grouped = {}
         for name, reason in self._failure_reasons:
-            grouped.setdefault(reason, []).append(name)
+            grouped.setdefault(readable_error(reason), []).append(name)
 
         lines = []
         for reason, names in list(grouped.items())[:4]:
             shown = ", ".join(names[:3])
             if len(names) > 3:
                 shown += f" and {len(names) - 3} more"
-            lines.append(f"    {shown} - {readable_error(reason)}")
+            lines.append(f"    {shown} - {reason}")
         if len(grouped) > 4:
             lines.append(f"    and {len(grouped) - 4} other problem(s)")
 
