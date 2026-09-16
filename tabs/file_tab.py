@@ -25,6 +25,10 @@ LIST_HEIGHT_FULL = 150
 # worker is built (see that method's docstring for why).
 CONFLICT_POLICY_CODES = {"Keep both": "keep_both", "Skip": "skip", "Overwrite": "overwrite"}
 
+# The reverse of `op.lower()` in FileTab.apply() -- used by retry_failed() to
+# put the Operation combo back to what the run being retried actually used.
+OPERATION_LABELS = {"rename": "Rename", "move": "Move", "copy": "Copy", "delete": "Delete"}
+
 
 class FileWorker(QtCore.QObject):
     progress = QtCore.Signal(int, int)  # idx, percent
@@ -527,11 +531,25 @@ class FileTab(QtWidgets.QWidget):
 
         `_continuing` carries the accumulated pairs across, so one run plus
         its retries reverses as a single unit.
+
+        The operation is pinned to whatever the run being retried actually
+        used, not read fresh from the combo. The combo stays enabled between
+        a batch finishing and Retry being pressed, so nothing stops it being
+        changed in between -- and the accumulated undo record is tagged with
+        a single `operation`, checked by `undo.reverse()` to decide whether
+        reversing a pair means moving it back or deleting it (a "copy"
+        reversal deletes `final`; a rename/move reversal moves it back). A
+        retry that silently switched the tag to "copy" while the record
+        still held rename pairs would turn "Undo this batch" into deleting
+        the very files it should be restoring.
         """
         failed = [self._batch_paths[i] for i in self._failed_indices
                   if 0 <= i < len(self._batch_paths)]
         if not failed:
             return
+        wanted_op = OPERATION_LABELS.get(self._current_op)
+        if wanted_op and self.operation_combo.currentText() != wanted_op:
+            self.operation_combo.setCurrentText(wanted_op)
         self.listw.clear()
         self.listw.addItems(failed)
         self.retry_btn.setVisible(False)
