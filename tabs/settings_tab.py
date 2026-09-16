@@ -24,8 +24,12 @@ class SettingsTab(QtWidgets.QWidget):
     # stylesheet, since the theme is application-wide, not this page's.
     theme_changed = QtCore.Signal(str)
 
-    def __init__(self):
+    def __init__(self, settings: QtCore.QSettings):
         super().__init__()
+        # Passed in rather than built here: a second settings object for the
+        # same org and app would hardcode main.py's names a second time and
+        # defeat any harness that redirects where this screen reads from.
+        self._settings = settings
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -74,8 +78,7 @@ class SettingsTab(QtWidgets.QWidget):
         for text, value in THEME_CHOICES:
             self.theme_combo.addItem(text, value)
 
-        settings = QtCore.QSettings("TechCabana", "UtilityTool")
-        current = str(settings.value("ui/theme", "system"))
+        current = str(self._settings.value("ui/theme", "system"))
         index = self.theme_combo.findData(current)
         self.theme_combo.setCurrentIndex(index if index >= 0 else 0)
         self.theme_combo.currentIndexChanged.connect(

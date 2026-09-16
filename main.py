@@ -80,7 +80,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.stacked = QtWidgets.QStackedWidget()
         self.home_tab = HomeTab()
-        self.settings_tab = SettingsTab()
+        self.settings_tab = SettingsTab(self.settings)
         for page in (self.home_tab, ImageTab(), FileTab(), DiskTab(), self.settings_tab):
             self.stacked.addWidget(page)
         root.addWidget(self.stacked, 1)
