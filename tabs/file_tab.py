@@ -766,8 +766,16 @@ class FileTab(QtWidgets.QWidget):
                 # asks about exactly what the worker will compute -- index
                 # and destination folder included. A file whose target is
                 # another file in the SAME batch, about to be renamed away,
-                # counts here and then resolves itself; intra-batch ordering
-                # is out of scope for this card.
+                # counts here. It does NOT always resolve itself: the worker
+                # runs pairs in list order with no reordering, so under
+                # "Skip" a chain like a.txt->b.txt, b.txt->c.txt drops the
+                # first rename whenever it is processed before the second
+                # frees b.txt (verified: tests/test_file_utils.py ::
+                # test_apply_renames_chain_is_order_dependent_under_skip).
+                # No data is destroyed and the row reports "skipped", but the
+                # rename is genuinely lost, not just an extra prompt.
+                # Execution-order/cycle handling is out of scope for this
+                # card and needs its own decision.
                 if op == "Rename":
                     targets = self._rename_targets(paths)
                 else:

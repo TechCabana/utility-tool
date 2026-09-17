@@ -258,6 +258,40 @@ def test_apply_renames_passes_the_policy_through(tmp_path):
     assert dest_b.read_text() == "B"
 
 
+def test_apply_renames_chain_is_order_dependent_under_skip(tmp_path):
+    # KNOWN LIMITATION, not fixed by card hq0Px4yy -- flagged for a follow-up
+    # card, not guessed at here (needs an owner decision on execution order
+    # / cycle handling, e.g. a topological pass or a temp-name swap).
+    #
+    # A "shift" renumber -- a.txt -> b.txt, b.txt -> c.txt -- processes pairs
+    # in list order with no reordering. Under "skip", the FIRST pair sees
+    # b.txt still occupied by the ORIGINAL b.txt (the second pair hasn't run
+    # yet) and is skipped for a real reason at that instant, even though the
+    # whole batch is a valid, collision-free renumber if resolved as a unit.
+    # No data is destroyed (unlike pre-fix's unconditional os.replace) and
+    # the skip is reported on its row -- but the intended rename is dropped.
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text("A-content")
+    b.write_text("B-content")
+    c = tmp_path / "c.txt"
+
+    results = apply_renames([str(a), str(b)], [str(b), str(c)], conflict_policy="skip")
+    assert results == [("skipped", str(b)), ("done", str(c))]
+    assert a.exists() and a.read_text() == "A-content"  # NOT renamed to b.txt
+    assert not b.exists()  # renamed away to c.txt by the second pair
+    assert c.read_text() == "B-content"
+
+    # The same chain in the order that happens to work: no skip needed.
+    a2, b2 = tmp_path / "a2.txt", tmp_path / "b2.txt"
+    a2.write_text("A2"); b2.write_text("B2")
+    c2 = tmp_path / "c2.txt"
+    results2 = apply_renames([str(b2), str(a2)], [str(c2), str(b2)], conflict_policy="skip")
+    assert results2 == [("done", str(c2)), ("done", str(b2))]
+    assert not a2.exists()
+    assert b2.read_text() == "A2"
+    assert c2.read_text() == "B2"
+
+
 # ---------------------------------------------------------------------------
 # resolve_conflict_path -- the three utils-layer conflict policies
 # ---------------------------------------------------------------------------
