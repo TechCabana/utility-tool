@@ -15,6 +15,7 @@ from utils.file_utils import (
     format_date_token,
     build_new_name,
     apply_renames,
+    rename_file,
     resolve_conflict_path,
     move_file,
     copy_file,
@@ -166,6 +167,95 @@ def test_apply_renames_creates_missing_destination_directory(tmp_path):
     dest = tmp_path / "nested" / "dest.txt"
     apply_renames([str(src)], [str(dest)])
     assert dest.read_text() == "content"
+
+
+# ---------------------------------------------------------------------------
+# rename_file -- a rename onto a pre-existing file obeys the conflict policy
+# ---------------------------------------------------------------------------
+
+def test_rename_file_no_conflict(tmp_path):
+    src = tmp_path / "src.txt"
+    src.write_text("hello")
+    dest = tmp_path / "renamed.txt"
+    status, path = rename_file(str(src), str(dest))
+    assert status == "done"
+    assert path == str(dest)
+    assert not src.exists()
+    assert dest.read_text() == "hello"
+
+
+def test_rename_file_conflict_skip(tmp_path):
+    src = tmp_path / "src.txt"
+    dest = tmp_path / "dest.txt"
+    src.write_text("new")
+    dest.write_text("old")
+    status, path = rename_file(str(src), str(dest), conflict_policy="skip")
+    assert status == "skipped"
+    assert path == str(dest)
+    assert src.read_text() == "new"  # never renamed
+    assert dest.read_text() == "old"  # and the existing file survives
+
+
+def test_rename_file_conflict_keep_both(tmp_path):
+    src = tmp_path / "src.txt"
+    dest = tmp_path / "dest.txt"
+    src.write_text("new")
+    dest.write_text("old")
+    status, path = rename_file(str(src), str(dest), conflict_policy="keep_both")
+    assert status == "done"
+    assert path == str(tmp_path / "dest (1).txt")
+    assert (tmp_path / "dest (1).txt").read_text() == "new"
+    assert dest.read_text() == "old"  # original untouched
+    assert not src.exists()
+
+
+def test_rename_file_conflict_overwrite(tmp_path):
+    src = tmp_path / "src.txt"
+    dest = tmp_path / "dest.txt"
+    src.write_text("new")
+    dest.write_text("old")
+    status, path = rename_file(str(src), str(dest), conflict_policy="overwrite")
+    assert status == "done"
+    assert path == str(dest)
+    assert not src.exists()
+    assert dest.read_text() == "new"
+
+
+def test_rename_file_same_path_is_not_a_conflict(tmp_path):
+    # A pattern that produces the file's current name is a no-op rename, not
+    # a collision with itself -- under "skip" it must still report "done" and
+    # leave the file where it is, rather than skipping every unchanged name.
+    src = tmp_path / "src.txt"
+    src.write_text("content")
+    status, path = rename_file(str(src), str(src), conflict_policy="skip")
+    assert status == "done"
+    assert path == str(src)
+    assert src.read_text() == "content"
+
+
+def test_rename_file_creates_missing_destination_directory(tmp_path):
+    src = tmp_path / "src.txt"
+    src.write_text("content")
+    dest = tmp_path / "nested" / "dest.txt"
+    status, path = rename_file(str(src), str(dest))
+    assert status == "done"
+    assert dest.read_text() == "content"
+
+
+def test_apply_renames_passes_the_policy_through(tmp_path):
+    # apply_renames is a thin loop over rename_file, so the policy it is
+    # given has to reach each pair -- and the per-file statuses come back.
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text("A")
+    b.write_text("B")
+    dest_a, dest_b = tmp_path / "x.txt", tmp_path / "y.txt"
+    dest_a.write_text("existing")  # only a's target is occupied
+    results = apply_renames([str(a), str(b)], [str(dest_a), str(dest_b)],
+                            conflict_policy="skip")
+    assert results == [("skipped", str(dest_a)), ("done", str(dest_b))]
+    assert dest_a.read_text() == "existing"
+    assert a.read_text() == "A"  # left alone by the skip
+    assert dest_b.read_text() == "B"
 
 
 # ---------------------------------------------------------------------------

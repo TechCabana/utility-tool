@@ -3,7 +3,9 @@ import os, time
 from typing import List
 from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
-from utils.file_utils import build_new_name, move_file, copy_file, delete_file
+from utils.file_utils import (
+    build_new_name, rename_file, move_file, copy_file, delete_file, same_path,
+)
 from utils.presets import add_file_preset, get_file_presets, load_all
 from utils import activity, undo
 from widgets import icons
@@ -28,6 +30,16 @@ CONFLICT_POLICY_CODES = {"Keep both": "keep_both", "Skip": "skip", "Overwrite": 
 # The reverse of `op.lower()` in FileTab.apply() -- used by retry_failed() to
 # put the Operation combo back to what the run being retried actually used.
 OPERATION_LABELS = {"rename": "Rename", "move": "Move", "copy": "Copy", "delete": "Delete"}
+
+
+def is_conflict(src: str, target: str) -> bool:
+    """True when this file's target is already occupied by a different file.
+
+    A target that IS the file itself -- a rename that changes nothing, or
+    only the letter case on a case-insensitive filesystem -- is a no-op, not
+    a conflict, and must not be counted as one or the "Ask" pre-scan prompts
+    about files it is not going to touch."""
+    return os.path.exists(target) and not same_path(src, target)
 
 
 class FileWorker(QtCore.QObject):
@@ -72,23 +84,14 @@ class FileWorker(QtCore.QObject):
                         self.regex_find, self.regex_replace, self.case
                     )
                     if self.dest_base:
-                        os.makedirs(self.dest_base, exist_ok=True)
                         final_path = os.path.join(self.dest_base, os.path.basename(new_name))
                     else:
                         final_path = os.path.join(os.path.dirname(p), new_name)
 
                     self.progress.emit(i, 20)
-                    try:
-                        if os.path.exists(final_path):
-                            os.replace(p, final_path)
-                        else:
-                            os.rename(p, final_path)
-                    except Exception:
-                        import shutil
-                        shutil.move(p, final_path)
-
+                    status, final_path = rename_file(p, final_path, self.conflict_policy)
                     self.progress.emit(i, 100)
-                    self.done.emit(i, final_path)
+                    (self.skipped if status == "skipped" else self.done).emit(i, final_path)
 
                 elif self.operation == "move":
                     self.progress.emit(i, 20)
@@ -247,7 +250,7 @@ class FileTab(QtWidgets.QWidget):
         add_field(self.op_form, "Destination folder", dest_row)
         self._row_destination = self.op_form.rowCount() - 1
 
-        # Move/Copy-only: conflict policy.
+        # Rename/Move/Copy: conflict policy (Delete has no destination).
         self.conflict_combo = QtWidgets.QComboBox()
         self.conflict_combo.addItems(["Ask", "Keep both", "Skip", "Overwrite"])
         add_field(self.op_form, "If a file already exists", self.conflict_combo)
@@ -629,7 +632,7 @@ class FileTab(QtWidgets.QWidget):
         op = self.operation_combo.currentText()
         self.rename_fields.setVisible(op == "Rename")
         self.op_form.setRowVisible(self._row_destination, op != "Delete")
-        self.op_form.setRowVisible(self._row_conflict, op in ("Move", "Copy"))
+        self.op_form.setRowVisible(self._row_conflict, op != "Delete")
         self.op_form.setRowVisible(self._row_delete_warning, op == "Delete")
 
         self.apply_btn.setText({
@@ -656,29 +659,43 @@ class FileTab(QtWidgets.QWidget):
     # ------------------------------
     # Preview
     # ------------------------------
+    def _rename_targets(self, paths: List[str]) -> List[str]:
+        """Where each file in `paths` would land under the current Rename
+        settings -- honouring the destination folder when one is set.
+
+        The preview, the "Ask" conflict pre-scan and FileWorker must all
+        agree on this, index included: build_new_name numbers files by their
+        position in the batch, so a scan that enumerated differently would
+        check names nothing is about to be written to."""
+        targets = []
+        for idx, p in enumerate(paths):
+            new_name, new_path = build_new_name(
+                p,
+                self.pattern.text(),
+                self.prefix.text(),
+                self.suffix.text(),
+                idx,
+                self.start.value(),
+                self.pad.value(),
+                self.date_source.currentText(),
+                self.regex_find.text(),
+                self.regex_replace.text(),
+                self.case.currentText()
+            )
+            if self.dest_edit.text():
+                new_path = os.path.join(self.dest_edit.text(), os.path.basename(new_name))
+            targets.append(new_path)
+        return targets
+
     def _compute_preview(self) -> List[str]:
         paths = [self.listw.item(i).text() for i in range(self.listw.count())]
         op = self.operation_combo.currentText()
 
         if op == "Rename":
             lines = []
-            for idx, p in enumerate(paths):
-                new_name, new_path = build_new_name(
-                    p,
-                    self.pattern.text(),
-                    self.prefix.text(),
-                    self.suffix.text(),
-                    idx,
-                    self.start.value(),
-                    self.pad.value(),
-                    self.date_source.currentText(),
-                    self.regex_find.text(),
-                    self.regex_replace.text(),
-                    self.case.currentText()
-                )
-                if self.dest_edit.text():
-                    new_path = os.path.join(self.dest_edit.text(), os.path.basename(new_name))
-                lines.append(f"{os.path.basename(p)}  →  {os.path.basename(new_path)}")
+            for p, new_path in zip(paths, self._rename_targets(paths)):
+                conflict = " — already exists, see conflict policy" if is_conflict(p, new_path) else ""
+                lines.append(f"{os.path.basename(p)}  →  {os.path.basename(new_path)}{conflict}")
             return lines
 
         if op in ("Move", "Copy"):
@@ -690,7 +707,7 @@ class FileTab(QtWidgets.QWidget):
                     lines.append(f"{base}  →  (choose a destination folder)")
                     continue
                 dest_path = os.path.join(dest, base)
-                conflict = " — already exists, see conflict policy" if os.path.exists(dest_path) else ""
+                conflict = " — already exists, see conflict policy" if is_conflict(p, dest_path) else ""
                 lines.append(f"{base}  →  {dest_path}{conflict}")
             return lines
 
@@ -734,7 +751,7 @@ class FileTab(QtWidgets.QWidget):
             return
 
         conflict_policy = "overwrite"
-        if op in ("Move", "Copy"):
+        if op in ("Rename", "Move", "Copy"):
             choice = self.conflict_combo.currentText()
             if choice == "Ask":
                 # Prompting per-conflicting-file would mean popping a modal
@@ -744,16 +761,23 @@ class FileTab(QtWidgets.QWidget):
                 # every conflict in this batch -- then the worker runs with
                 # a single resolved policy like any other choice. Judgement
                 # call, noted in the PR/report.
-                conflicts = [
-                    p for p in paths
-                    if os.path.exists(os.path.join(dest_base, os.path.basename(p)))
-                    and os.path.abspath(os.path.join(dest_base, os.path.basename(p))) != os.path.abspath(p)
-                ]
+                #
+                # Rename's targets come from _rename_targets, so the scan
+                # asks about exactly what the worker will compute -- index
+                # and destination folder included. A file whose target is
+                # another file in the SAME batch, about to be renamed away,
+                # counts here and then resolves itself; intra-batch ordering
+                # is out of scope for this card.
+                if op == "Rename":
+                    targets = self._rename_targets(paths)
+                else:
+                    targets = [os.path.join(dest_base, os.path.basename(p)) for p in paths]
+                conflicts = [p for p, t in zip(paths, targets) if is_conflict(p, t)]
                 if conflicts:
                     resolved, ok = QtWidgets.QInputDialog.getItem(
                         self, "Files already exist",
-                        f"{len(conflicts)} of {len(paths)} file(s) already exist in the destination. "
-                        "Choose how to handle every conflict in this batch:",
+                        f"{len(conflicts)} of {len(paths)} file(s) would replace a file that "
+                        "already exists. Choose how to handle every conflict in this batch:",
                         ["Keep both", "Skip", "Overwrite"], 0, False
                     )
                     if not ok:
@@ -776,7 +800,7 @@ class FileTab(QtWidgets.QWidget):
         self.thread = QtCore.QThread(self)
         if op == "Rename":
             self.worker = FileWorker(
-                "rename", paths, dest_base,
+                "rename", paths, dest_base, conflict_policy=conflict_policy,
                 pattern=self.pattern.text(), prefix=self.prefix.text(), suffix=self.suffix.text(),
                 start=self.start.value(), pad=self.pad.value(),
                 regex_find=self.regex_find.text(), regex_replace=self.regex_replace.text(),

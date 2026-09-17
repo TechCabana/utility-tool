@@ -33,14 +33,15 @@ def build_new_name(path: str, pattern: str, prefix: str, suffix: str, idx: int, 
     new_name = f"{new_stem}{ext}"
     return new_name, os.path.join(folder, new_name)
 
-def apply_renames(src_paths: List[str], dest_paths: List[str]) -> None:
-    for s, d in zip(src_paths, dest_paths):
-        os.makedirs(os.path.dirname(d) or ".", exist_ok=True)
-        # use replace to overwrite if needed
-        if os.path.exists(d):
-            os.replace(s, d)
-        else:
-            os.rename(s, d)
+def apply_renames(src_paths: List[str], dest_paths: List[str],
+                  conflict_policy: str = "overwrite") -> List[Tuple[str, str]]:
+    """Rename each src to its paired dest, honoring conflict_policy when a
+    dest is already occupied by a different file. Returns one (status, path)
+    per pair, in order -- the same shape rename_file returns.
+
+    The default stays "overwrite" so existing callers keep the behaviour they
+    had, now as a policy stated out loud rather than a silent one."""
+    return [rename_file(s, d, conflict_policy) for s, d in zip(src_paths, dest_paths)]
 
 
 # ------------------------------
@@ -72,6 +73,44 @@ def resolve_conflict_path(dest_path: str, conflict_policy: str) -> Optional[str]
             n += 1
         return candidate
     return dest_path  # "overwrite"
+
+
+def same_path(a: str, b: str) -> bool:
+    """True when a and b name the same existing file.
+
+    os.path.samefile asks the filesystem for the file's identity, so a
+    case-only rename on a case-insensitive filesystem reads as the same file
+    rather than as a conflict with itself. Falls back to comparing absolute
+    paths where the OS cannot answer (a path that is already gone)."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.abspath(a) == os.path.abspath(b)
+
+
+def rename_file(src: str, dest_path: str, conflict_policy: str = "overwrite") -> Tuple[str, str]:
+    """Rename src to dest_path, honoring conflict_policy if a different file
+    already occupies dest_path. Returns (status, path) where status is
+    "done" or "skipped". Raises on unexpected filesystem errors -- the
+    QThread worker that calls this catches and reports those as errors.
+
+    A dest_path that IS src (a no-op rename, or a case-only one on a
+    case-insensitive filesystem) is not a conflict and never goes through
+    the policy."""
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    if os.path.exists(dest_path) and not same_path(src, dest_path):
+        resolved = resolve_conflict_path(dest_path, conflict_policy)
+        if resolved is None:
+            return "skipped", dest_path
+        dest_path = resolved
+    try:
+        os.replace(src, dest_path)
+    except OSError:
+        # os.replace cannot cross drives; shutil.move can. This runs only
+        # after the policy has chosen dest_path, so the fallback can never
+        # overwrite something the policy protected.
+        shutil.move(src, dest_path)
+    return "done", dest_path
 
 
 def move_file(src: str, dest_folder: str, conflict_policy: str = "overwrite") -> Tuple[str, str]:
