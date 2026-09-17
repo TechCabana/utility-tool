@@ -29,6 +29,8 @@ import shutil
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
+from utils.file_utils import order_renames
+
 # What a reversal does per operation:
 #   rename / move -> put the file back where it came from
 #   copy          -> remove the copy that was made, leaving the original alone
@@ -83,6 +85,14 @@ def blockers(record: BatchRecord) -> List[str]:
     """
     problems: List[str] = []
 
+    # Where this batch's own files are sitting now. A file of the batch
+    # occupying an original name is not "something else": reverse() orders
+    # the moves so it leaves before that name is needed, the same way
+    # FileWorker orders the batch on the way in. Without this, a batch that
+    # chained (a -> b, b -> c) or swapped (a <-> b) reports every one of its
+    # own files as a blocker and refuses to undo itself.
+    finals = {os.path.normcase(os.path.abspath(final)) for _, final in record.pairs}
+
     # Two files that would be put back to the same place. Nothing else in
     # this function can see it: each pair is individually fine, the
     # destination does not exist yet at check time, and the loop below would
@@ -117,7 +127,8 @@ def blockers(record: BatchRecord) -> List[str]:
         # A rename or a move puts the file back, so the place it came from
         # has to still be free. Something else living there now means undoing
         # would overwrite a file this app never touched.
-        if os.path.exists(original) and not _same_path(original, final):
+        if (os.path.exists(original) and not _same_path(original, final)
+                and os.path.normcase(os.path.abspath(original)) not in finals):
             problems.append(f"something else now occupies {os.path.basename(original)}")
 
     return problems
@@ -154,24 +165,38 @@ def reverse(record: BatchRecord) -> dict:
                         f"as it is rather than putting only some of it back."),
         }
 
+    # A batch that chained on the way in has to be reversed in an order that
+    # resolves too: putting a -> b, b -> c back means moving c to b before b
+    # goes to a, and a swap needs a temp name in between. That is the same
+    # problem the batch itself had, so it is the same function -- each step
+    # is (src, dest), and a swap's extra temp step is just another one of
+    # them. Removing copies has no order to get wrong.
+    if record.operation == "copy":
+        steps = [(final, original) for original, final in record.pairs]
+    else:
+        steps = [(src, dest) for _, src, dest in
+                 order_renames([(final, original) for original, final in record.pairs])]
+
     done: List[Tuple[str, str]] = []
-    for original, final in record.pairs:
+    for src, dest in steps:
         try:
             if record.operation == "copy":
                 # The copy is this app's own artefact and the original is
                 # untouched, so removing it loses nothing the user had before.
                 from utils.file_utils import delete_file
 
-                delete_file(final)
+                delete_file(src)
             else:
-                os.makedirs(os.path.dirname(original) or ".", exist_ok=True)
-                shutil.move(final, original)
+                os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+                shutil.move(src, dest)
         except OSError as exc:
-            return _reversal_failed(record.operation, done, final, exc)
-        done.append((original, final))
+            return _reversal_failed(record.operation, done, src, exc)
+        done.append((dest, src))
 
-    return {"ok": True, "reversed": len(done),
-            "message": _describe(record.operation, len(done))}
+    # Counted in files, not in steps: a swap reverses two files in three
+    # moves, and the user is being told how many files went back.
+    return {"ok": True, "reversed": len(record),
+            "message": _describe(record.operation, len(record))}
 
 
 def _reversal_failed(operation: str, done: List[Tuple[str, str]], failed_final: str,

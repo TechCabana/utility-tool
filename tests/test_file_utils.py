@@ -1,9 +1,10 @@
 # tests/test_file_utils.py
-# Covers utils/file_utils.py: the pattern-based naming engine, Move/Copy/
-# Delete, and resolve_conflict_path's conflict policies. Only the policy
-# resolution logic is tested here -- "ask" is a UI-thread concern resolved
-# by tabs/file_tab.py before these functions are ever called, so it has no
-# testable surface in utils/. Uses real temp files/dirs (tmp_path), no
+# Covers utils/file_utils.py: the pattern-based naming engine, the batch
+# ordering that lets a rename batch collide with itself and still complete,
+# Move/Copy/Delete, and resolve_conflict_path's conflict policies. Only the
+# policy resolution logic is tested here -- "ask" is a UI-thread concern
+# resolved by tabs/file_tab.py before these functions are ever called, so it
+# has no testable surface in utils/. Uses real temp files/dirs (tmp_path), no
 # filesystem mocking.
 import datetime
 import os
@@ -15,6 +16,8 @@ from utils.file_utils import (
     format_date_token,
     build_new_name,
     apply_renames,
+    order_renames,
+    pending_conflicts,
     rename_file,
     resolve_conflict_path,
     move_file,
@@ -258,30 +261,30 @@ def test_apply_renames_passes_the_policy_through(tmp_path):
     assert dest_b.read_text() == "B"
 
 
-def test_apply_renames_chain_is_order_dependent_under_skip(tmp_path):
-    # KNOWN LIMITATION, not fixed by card hq0Px4yy -- flagged for a follow-up
-    # card, not guessed at here (needs an owner decision on execution order
-    # / cycle handling, e.g. a topological pass or a temp-name swap).
+def test_apply_renames_chain_completes_in_either_order_under_skip(tmp_path):
+    # Was test_apply_renames_chain_is_order_dependent_under_skip, which pinned
+    # the opposite result: a "shift" renumber -- a.txt -> b.txt,
+    # b.txt -> c.txt -- used to run in list order, so the first pair landed on
+    # a b.txt that had not moved yet. That was a real collision at that
+    # instant, "skip" dropped the rename, and whether the batch worked at all
+    # came down to which file the user happened to add first.
     #
-    # A "shift" renumber -- a.txt -> b.txt, b.txt -> c.txt -- processes pairs
-    # in list order with no reordering. Under "skip", the FIRST pair sees
-    # b.txt still occupied by the ORIGINAL b.txt (the second pair hasn't run
-    # yet) and is skipped for a real reason at that instant, even though the
-    # whole batch is a valid, collision-free renumber if resolved as a unit.
-    # No data is destroyed (unlike pre-fix's unconditional os.replace) and
-    # the skip is reported on its row -- but the intended rename is dropped.
+    # order_renames (card 7gRxAGFc) runs the batch as a unit: b.txt -> c.txt
+    # goes first, freeing b.txt, and both pairs land whichever way round they
+    # were listed. The results still come back in the order the pairs were
+    # given, not in the order they ran.
     a, b = tmp_path / "a.txt", tmp_path / "b.txt"
     a.write_text("A-content")
     b.write_text("B-content")
     c = tmp_path / "c.txt"
 
     results = apply_renames([str(a), str(b)], [str(b), str(c)], conflict_policy="skip")
-    assert results == [("skipped", str(b)), ("done", str(c))]
-    assert a.exists() and a.read_text() == "A-content"  # NOT renamed to b.txt
-    assert not b.exists()  # renamed away to c.txt by the second pair
+    assert results == [("done", str(b)), ("done", str(c))]
+    assert not a.exists()
+    assert b.read_text() == "A-content"
     assert c.read_text() == "B-content"
 
-    # The same chain in the order that happens to work: no skip needed.
+    # The same chain listed the other way round: the same outcome.
     a2, b2 = tmp_path / "a2.txt", tmp_path / "b2.txt"
     a2.write_text("A2"); b2.write_text("B2")
     c2 = tmp_path / "c2.txt"
@@ -290,6 +293,195 @@ def test_apply_renames_chain_is_order_dependent_under_skip(tmp_path):
     assert not a2.exists()
     assert b2.read_text() == "A2"
     assert c2.read_text() == "B2"
+
+
+def test_apply_renames_swaps_two_files_under_skip(tmp_path):
+    # A swap is a cycle: neither pair can go first, so one file is parked
+    # under a temp name and lands at the end. The temp is an implementation
+    # detail -- nothing but the two real names is left behind.
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text("A")
+    b.write_text("B")
+
+    results = apply_renames([str(a), str(b)], [str(b), str(a)], conflict_policy="skip")
+    assert results == [("done", str(b)), ("done", str(a))]
+    assert a.read_text() == "B"
+    assert b.read_text() == "A"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.txt", "b.txt"]
+
+
+def test_apply_renames_rotates_a_three_file_cycle_under_skip(tmp_path):
+    x, y, z = tmp_path / "x.txt", tmp_path / "y.txt", tmp_path / "z.txt"
+    x.write_text("X")
+    y.write_text("Y")
+    z.write_text("Z")
+
+    results = apply_renames([str(x), str(y), str(z)], [str(y), str(z), str(x)],
+                            conflict_policy="skip")
+    assert results == [("done", str(y)), ("done", str(z)), ("done", str(x))]
+    assert y.read_text() == "X"
+    assert z.read_text() == "Y"
+    assert x.read_text() == "Z"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["x.txt", "y.txt", "z.txt"]
+
+
+def test_apply_renames_chain_lands_but_a_pre_existing_target_still_skips(tmp_path):
+    # Ordering resolves the batch against itself and nothing more. A target
+    # occupied by a file this batch is NOT moving is still a conflict, and
+    # still goes through the policy -- the silent overwrite card hq0Px4yy
+    # fixed must not come back through the ordering.
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    d = tmp_path / "d.txt"
+    occupied = tmp_path / "occupied.txt"
+    a.write_text("A")
+    b.write_text("B")
+    d.write_text("D")
+    occupied.write_text("NOT OURS")
+    c = tmp_path / "c.txt"
+
+    results = apply_renames([str(a), str(b), str(d)],
+                            [str(b), str(c), str(occupied)],
+                            conflict_policy="skip")
+    assert results == [("done", str(b)), ("done", str(c)), ("skipped", str(occupied))]
+    assert b.read_text() == "A"        # the chain still completes
+    assert c.read_text() == "B"
+    assert d.read_text() == "D"        # left where it was by the skip
+    assert occupied.read_text() == "NOT OURS"
+
+
+def test_apply_renames_without_a_chain_runs_in_list_order(tmp_path):
+    # The ordinary case -- no pair's target is another pair's source -- must
+    # be untouched by the ordering: same order, same results.
+    first, second = tmp_path / "one.txt", tmp_path / "two.txt"
+    first.write_text("1")
+    second.write_text("2")
+    pairs = [(str(first), str(tmp_path / "first.txt")),
+             (str(second), str(tmp_path / "second.txt"))]
+
+    assert order_renames(pairs) == [(0, pairs[0][0], pairs[0][1]),
+                                    (1, pairs[1][0], pairs[1][1])]
+    results = apply_renames([s for s, _ in pairs], [t for _, t in pairs],
+                            conflict_policy="skip")
+    assert results == [("done", pairs[0][1]), ("done", pairs[1][1])]
+    assert (tmp_path / "first.txt").read_text() == "1"
+    assert (tmp_path / "second.txt").read_text() == "2"
+
+
+def test_num_numbering_follows_batch_position_not_execution_order(tmp_path):
+    # build_new_name numbers a file by its position in the batch, and the
+    # batch is only reordered afterwards, for execution. If the reordering
+    # ever fed back into the numbering, {num} would silently renumber the
+    # files whenever a batch happened to chain.
+    #
+    # Here it does chain: x.txt is listed first and wants "1.txt", which the
+    # second file currently occupies, so execution runs them the other way
+    # round -- and the numbers must not follow.
+    existing_one = tmp_path / "1.txt"
+    x = tmp_path / "x.txt"
+    existing_one.write_text("ONE")
+    x.write_text("X")
+
+    paths = [str(x), str(existing_one)]
+    targets = [build_new_name(p, pattern="{num}", prefix="", suffix="", idx=idx,
+                              start=1, pad=1, date_source="now", regex_find="",
+                              regex_replace="", case="none")[1]
+               for idx, p in enumerate(paths)]
+    assert targets == [str(tmp_path / "1.txt"), str(tmp_path / "2.txt")]
+    # x.txt is listed first but has to run second: its target is still held.
+    assert [i for i, _, _ in order_renames(list(zip(paths, targets)))] == [1, 0]
+
+    results = apply_renames(paths, targets, conflict_policy="skip")
+    assert results == [("done", targets[0]), ("done", targets[1])]
+    assert (tmp_path / "1.txt").read_text() == "X"    # the first file listed
+    assert (tmp_path / "2.txt").read_text() == "ONE"  # the second
+
+
+# ---------------------------------------------------------------------------
+# order_renames -- the execution order that makes a batch a unit
+# ---------------------------------------------------------------------------
+
+def test_order_renames_runs_a_chain_back_to_front(tmp_path):
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text("A")
+    b.write_text("B")
+    c = tmp_path / "c.txt"
+
+    # Listed a -> b, b -> c; b -> c has to run first to free b.txt. The index
+    # travels with each step so the caller can still report the row the file
+    # was added on.
+    assert order_renames([(str(a), str(b)), (str(b), str(c))]) == [
+        (1, str(b), str(c)),
+        (0, str(a), str(b)),
+    ]
+
+
+def test_order_renames_breaks_a_cycle_with_one_temp_step(tmp_path):
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text("A")
+    b.write_text("B")
+
+    steps = order_renames([(str(a), str(b)), (str(b), str(a))])
+    # Three steps for two files: one of them is parked out of the way first
+    # and lands on its real target last. A parked step is recognisable by its
+    # target not being the pair's target, which is how a caller knows not to
+    # report it.
+    assert len(steps) == 3
+    assert [i for i, _, _ in steps] == [0, 1, 0]
+    assert steps[0][2] not in (str(a), str(b))       # parked under a temp name
+    assert steps[1] == (1, str(b), str(a))
+    assert steps[2] == (0, steps[0][2], str(b))      # the temp lands at the end
+    assert not os.path.exists(steps[0][2])           # nothing was renamed yet
+
+
+def test_order_renames_leaves_a_pre_existing_target_for_the_policy(tmp_path):
+    # An occupied target that is NOT another pair's source is a real conflict
+    # and must not be reordered around: the pair runs where it was, and
+    # rename_file's policy decides what happens to it.
+    src = tmp_path / "src.txt"
+    occupied = tmp_path / "occupied.txt"
+    src.write_text("S")
+    occupied.write_text("O")
+
+    assert order_renames([(str(src), str(occupied))]) == [(0, str(src), str(occupied))]
+
+
+def test_order_renames_treats_a_no_op_rename_as_ready(tmp_path):
+    # A pattern that produces the file's own name: the target exists and is
+    # this batch's own source, which must not be read as waiting on itself.
+    src = tmp_path / "src.txt"
+    src.write_text("S")
+    assert order_renames([(str(src), str(src))]) == [(0, str(src), str(src))]
+
+
+def test_order_renames_of_an_empty_batch_is_empty():
+    assert order_renames([]) == []
+
+
+# ---------------------------------------------------------------------------
+# pending_conflicts -- what the preview marks and the "Ask" pre-scan counts
+# ---------------------------------------------------------------------------
+
+def test_pending_conflicts_ignores_a_target_the_batch_is_vacating(tmp_path):
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text("A")
+    b.write_text("B")
+    c = tmp_path / "c.txt"
+    # b.txt is occupied, but by a file this batch is about to rename away.
+    assert pending_conflicts([(str(a), str(b)), (str(b), str(c))]) == [False, False]
+
+
+def test_pending_conflicts_reports_a_file_the_batch_does_not_touch(tmp_path):
+    src = tmp_path / "src.txt"
+    occupied = tmp_path / "occupied.txt"
+    src.write_text("S")
+    occupied.write_text("O")
+    assert pending_conflicts([(str(src), str(occupied))]) == [True]
+
+
+def test_pending_conflicts_does_not_count_a_file_against_itself(tmp_path):
+    src = tmp_path / "src.txt"
+    src.write_text("S")
+    assert pending_conflicts([(str(src), str(src))]) == [False]
 
 
 # ---------------------------------------------------------------------------

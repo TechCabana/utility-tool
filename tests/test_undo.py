@@ -232,3 +232,46 @@ def test_two_files_that_would_land_on_the_same_name_are_refused(tmp_path):
     assert first.read_text(encoding="utf-8") == "A"
     assert second.read_text(encoding="utf-8") == "B"
     assert not os.path.exists(collide)
+
+
+def test_a_chained_batch_is_reversed_in_an_order_that_resolves(tmp_path):
+    """A batch that chained on the way in has to chain on the way back.
+
+    `a.txt -> b.txt, b.txt -> c.txt` leaves b.txt occupied by what used to be
+    a.txt, so every pair's original name looks taken -- by a file of this very
+    batch, about to move away. Before card 7gRxAGFc that read as "something
+    else now occupies b.txt" and the whole reversal was refused, which would
+    have shipped a rename the user could not undo.
+    """
+    a, b, c = tmp_path / "a.txt", tmp_path / "b.txt", tmp_path / "c.txt"
+    b.write_text("A", encoding="utf-8")  # a.txt's contents, already renamed
+    c.write_text("B", encoding="utf-8")  # b.txt's contents
+
+    record = undo.record_batch("rename", [(str(a), str(b)), (str(b), str(c))])
+    assert undo.blockers(record) == []
+
+    result = undo.reverse(record)
+    assert result["ok"] is True
+    assert result["reversed"] == 2
+    assert a.read_text(encoding="utf-8") == "A"
+    assert b.read_text(encoding="utf-8") == "B"
+    assert not c.exists()
+
+
+def test_a_swap_is_reversed_through_a_temp_name_and_counted_in_files(tmp_path):
+    # Neither file can go back first, so the reversal parks one under a temp
+    # name exactly as the batch itself did. That extra move must not show up
+    # in the count the user is given: two files went back, not three.
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text("B", encoding="utf-8")  # swapped: a.txt holds b.txt's contents
+    b.write_text("A", encoding="utf-8")
+
+    record = undo.record_batch("rename", [(str(a), str(b)), (str(b), str(a))])
+    result = undo.reverse(record)
+
+    assert result["ok"] is True
+    assert result["reversed"] == 2
+    assert "2 file(s)" in result["message"]
+    assert a.read_text(encoding="utf-8") == "A"
+    assert b.read_text(encoding="utf-8") == "B"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.txt", "b.txt"]

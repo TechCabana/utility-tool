@@ -5,6 +5,7 @@ from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt
 from utils.file_utils import (
     build_new_name, rename_file, move_file, copy_file, delete_file, same_path,
+    order_renames, pending_conflicts,
 )
 from utils.presets import add_file_preset, get_file_presets, load_all
 from utils import activity, undo
@@ -73,27 +74,75 @@ class FileWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         t0 = time.time()
+        if self.operation == "rename":
+            self._run_renames()
+        else:
+            self._run_batch()
+        self.finished.emit(time.time() - t0)
+
+    def _run_renames(self):
+        """Rename the batch, ordered so that it cannot collide with itself.
+
+        Every target is computed FIRST, in the order the files were added:
+        build_new_name numbers a file by its position in the batch, and that
+        position is the index every progress/done/skipped/error signal
+        carries -- the row it updates, the undo pair it records, the retry
+        list it feeds. So the names are fixed before anything is reordered,
+        and each step reports the index it was given, never where it happens
+        to run in the execution order.
+
+        order_renames decides that order, and gives a cycle member two steps:
+        one parking it under a temp name, one landing it on its real target.
+        Only the landing step is reported -- the temp name is this function's
+        business and must never reach _undo_pairs, which has to hold
+        (original, final) or undo puts a file back from a path that is gone.
+        """
+        plan = []
+        for i, p in enumerate(self.src_paths):
+            new_name, new_path = build_new_name(
+                p, self.pattern, self.prefix, self.suffix,
+                i, self.start, self.pad, self.date_source,
+                self.regex_find, self.regex_replace, self.case
+            )
+            if self.dest_base:
+                new_path = os.path.join(self.dest_base, os.path.basename(new_name))
+            plan.append((p, new_path))
+
+        parked = {}
+        for i, src, target in order_renames(plan):
+            if self._abort:
+                break
+            parking = target != plan[i][1]
+            try:
+                if not parking:
+                    self.progress.emit(i, 20)
+                status, final_path = rename_file(src, target, self.conflict_policy)
+                if parking:
+                    parked[i] = (final_path, src)
+                    continue
+                self.progress.emit(i, 100)
+                (self.skipped if status == "skipped" else self.done).emit(i, final_path)
+                if status == "done":
+                    parked.pop(i, None)
+            except Exception as e:
+                self.error.emit(i, str(e))
+
+        for i, (tmp, original) in parked.items():
+            # Parked, but its real step never landed -- skipped by the policy,
+            # aborted, or a failure elsewhere in its cycle. Leaving the file
+            # under a temp name would read as data loss, so it goes back under
+            # the name it had.
+            try:
+                os.replace(tmp, original)
+            except OSError as e:
+                self.error.emit(i, f"could not put {os.path.basename(original)} back: {e}")
+
+    def _run_batch(self):
         for i, p in enumerate(self.src_paths):
             if self._abort:
                 break
             try:
-                if self.operation == "rename":
-                    new_name, new_path = build_new_name(
-                        p, self.pattern, self.prefix, self.suffix,
-                        i, self.start, self.pad, self.date_source,
-                        self.regex_find, self.regex_replace, self.case
-                    )
-                    if self.dest_base:
-                        final_path = os.path.join(self.dest_base, os.path.basename(new_name))
-                    else:
-                        final_path = os.path.join(os.path.dirname(p), new_name)
-
-                    self.progress.emit(i, 20)
-                    status, final_path = rename_file(p, final_path, self.conflict_policy)
-                    self.progress.emit(i, 100)
-                    (self.skipped if status == "skipped" else self.done).emit(i, final_path)
-
-                elif self.operation == "move":
+                if self.operation == "move":
                     self.progress.emit(i, 20)
                     status, final_path = move_file(p, self.dest_base, self.conflict_policy)
                     self.progress.emit(i, 100)
@@ -113,8 +162,6 @@ class FileWorker(QtCore.QObject):
 
             except Exception as e:
                 self.error.emit(i, str(e))
-
-        self.finished.emit(time.time() - t0)
 
     def abort(self):
         self._abort = True
@@ -692,9 +739,14 @@ class FileTab(QtWidgets.QWidget):
         op = self.operation_combo.currentText()
 
         if op == "Rename":
+            targets = self._rename_targets(paths)
             lines = []
-            for p, new_path in zip(paths, self._rename_targets(paths)):
-                conflict = " — already exists, see conflict policy" if is_conflict(p, new_path) else ""
+            # pending_conflicts, not is_conflict: a target another file in
+            # this batch is about to vacate is not a collision, because
+            # FileWorker orders the batch so that file moves first.
+            for p, new_path, clash in zip(paths, targets,
+                                          pending_conflicts(list(zip(paths, targets)))):
+                conflict = " — already exists, see conflict policy" if clash else ""
                 lines.append(f"{os.path.basename(p)}  →  {os.path.basename(new_path)}{conflict}")
             return lines
 
@@ -765,22 +817,20 @@ class FileTab(QtWidgets.QWidget):
                 # Rename's targets come from _rename_targets, so the scan
                 # asks about exactly what the worker will compute -- index
                 # and destination folder included. A file whose target is
-                # another file in the SAME batch, about to be renamed away,
-                # counts here. It does NOT always resolve itself: the worker
-                # runs pairs in list order with no reordering, so under
-                # "Skip" a chain like a.txt->b.txt, b.txt->c.txt drops the
-                # first rename whenever it is processed before the second
-                # frees b.txt (verified: tests/test_file_utils.py ::
-                # test_apply_renames_chain_is_order_dependent_under_skip).
-                # No data is destroyed and the row reports "skipped", but the
-                # rename is genuinely lost, not just an extra prompt.
-                # Execution-order/cycle handling is out of scope for this
-                # card and needs its own decision.
+                # another file in the SAME batch does NOT count: FileWorker
+                # orders the batch (utils.file_utils.order_renames) so that
+                # file moves away first, so a chain like a.txt->b.txt,
+                # b.txt->c.txt resolves itself and asking about it would be
+                # prompting over a collision that never happens. Only what
+                # is left once the batch's own sources are accounted for is
+                # a real conflict -- that one still goes through the policy.
                 if op == "Rename":
                     targets = self._rename_targets(paths)
+                    clashes = pending_conflicts(list(zip(paths, targets)))
                 else:
                     targets = [os.path.join(dest_base, os.path.basename(p)) for p in paths]
-                conflicts = [p for p, t in zip(paths, targets) if is_conflict(p, t)]
+                    clashes = [is_conflict(p, t) for p, t in zip(paths, targets)]
+                conflicts = [p for p, clash in zip(paths, clashes) if clash]
                 if conflicts:
                     resolved, ok = QtWidgets.QInputDialog.getItem(
                         self, "Files already exist",
