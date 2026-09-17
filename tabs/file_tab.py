@@ -131,9 +131,23 @@ class FileWorker(QtCore.QObject):
             # Parked, but its real step never landed -- skipped by the policy,
             # aborted, or a failure elsewhere in its cycle. Leaving the file
             # under a temp name would read as data loss, so it goes back under
-            # the name it had.
+            # the name it had -- but `original` can by now be occupied by a
+            # DIFFERENT pair of this same batch that already landed there (any
+            # pair whose target is this file's pre-batch name becomes free the
+            # moment this file is parked out of the way, so it can land there
+            # while this one is still waiting). A plain os.replace would
+            # silently destroy that pair's file after this function already
+            # reported it "done" -- exactly the silent overwrite card
+            # hq0Px4yy removed. "keep_both" guarantees this file always
+            # survives, under its own name or next to it, and the row says so
+            # when that happens rather than staying silent about it.
             try:
-                os.replace(tmp, original)
+                status, final_path = rename_file(tmp, original, "keep_both")
+                if final_path != original:
+                    self.error.emit(
+                        i, f"{os.path.basename(original)} was already taken by "
+                           f"another file in this batch -- kept as "
+                           f"{os.path.basename(final_path)} instead")
             except OSError as e:
                 self.error.emit(i, f"could not put {os.path.basename(original)} back: {e}")
 

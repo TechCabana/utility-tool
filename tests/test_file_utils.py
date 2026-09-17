@@ -325,6 +325,39 @@ def test_apply_renames_rotates_a_three_file_cycle_under_skip(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["x.txt", "y.txt", "z.txt"]
 
 
+def test_apply_renames_never_clobbers_a_landed_file_when_restoring_a_park(tmp_path):
+    # Found by adversarial review of card 7gRxAGFc, not by the card's own
+    # tests. x -> a and b -> a share a target: b is the OTHER half of a
+    # genuine 2-cycle with a (a -> b, b -> a), so a is parked under a temp
+    # name while x lands there first. Once a's real step (the temp landing
+    # on b) is skipped -- b.txt is occupied and "skip" is the policy -- the
+    # cleanup used to restore the park with a bare os.replace(tmp, original),
+    # which silently overwrote x's just-landed file: two different files
+    # reported "done" while only one of them actually survived on disk.
+    # "keep_both" for the restore step closes that: the parked file always
+    # lands somewhere, under its own name or next to it, never on top of
+    # another file this same call already reported successful.
+    x, a, b = tmp_path / "x.txt", tmp_path / "a.txt", tmp_path / "b.txt"
+    x.write_text("X-CONTENT")
+    a.write_text("A-CONTENT")
+    b.write_text("B-CONTENT")
+
+    results = apply_renames([str(x), str(a), str(b)], [str(a), str(b), str(a)],
+                            conflict_policy="skip")
+
+    assert results[0] == ("done", str(a))
+    # x's content must actually be at a.txt -- not silently replaced by the
+    # parked file's restore.
+    assert a.read_text() == "X-CONTENT"
+    # b.txt was never touched: its own landing step was skipped too.
+    assert b.read_text() == "B-CONTENT"
+    # a.txt's ORIGINAL content is not gone -- it was parked and then could
+    # not go back under its own name, so it must survive under another one.
+    survivors = {p.name: p.read_text() for p in tmp_path.iterdir()}
+    assert "A-CONTENT" in survivors.values(), (
+        f"a.txt's original content was lost during the restore: {survivors}")
+
+
 def test_apply_renames_chain_lands_but_a_pre_existing_target_still_skips(tmp_path):
     # Ordering resolves the batch against itself and nothing more. A target
     # occupied by a file this batch is NOT moving is still a conflict, and

@@ -51,23 +51,39 @@ def apply_renames(src_paths: List[str], dest_paths: List[str],
     pairs = list(zip(src_paths, dest_paths))
     results: List[Optional[Tuple[str, str]]] = [None] * len(pairs)
     parked: dict = {}
-    for i, src, target in order_renames(pairs):
-        status, path = rename_file(src, target, conflict_policy)
-        if target != pairs[i][1]:
-            # A cycle member parked under a temp name: not its real step, so
-            # it produces no result yet. Remember where it came from in case
-            # the real step never lands.
-            parked[i] = (path, src)
-            continue
-        results[i] = (status, path)
-        if status == "done":
-            parked.pop(i, None)
+    try:
+        for i, src, target in order_renames(pairs):
+            status, path = rename_file(src, target, conflict_policy)
+            if target != pairs[i][1]:
+                # A cycle member parked under a temp name: not its real step,
+                # so it produces no result yet. Remember where it came from
+                # in case the real step never lands.
+                parked[i] = (path, src)
+                continue
+            results[i] = (status, path)
+            if status == "done":
+                parked.pop(i, None)
+    finally:
+        # Runs even if a later step raised: a park already on disk must
+        # still be put back rather than left under a temp name that reads
+        # as data loss to anyone who finds it later (see below).
+        _restore_parked(parked)
+    return results
+
+
+def _restore_parked(parked: dict) -> None:
     for tmp, original in parked.values():
         # The real step was skipped by the policy, so this file never reached
         # its target -- put it back under the name it had rather than leaving
-        # it parked under a temp one.
-        os.replace(tmp, original)
-    return results
+        # it parked under a temp one. `original` can by now be occupied by a
+        # DIFFERENT pair of this same batch that already landed there (any
+        # pair whose target is this file's pre-batch name lands there once
+        # this file is parked out of the way -- order_renames' docstring on
+        # cycles), so restoring must never blindly overwrite it: os.replace
+        # would silently destroy a file this same call already reported
+        # "done" for. "keep_both" guarantees the parked file always survives,
+        # under its own name or next to it, and never erases someone else's.
+        rename_file(tmp, original, "keep_both")
 
 
 # ------------------------------
