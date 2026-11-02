@@ -29,7 +29,8 @@ class BackupWorker(QtCore.QObject):
     are all "walk and copy through utils/backup_utils, report (done, total),
     hand back a result dict" -- they differ only in which function is called,
     so the work is passed in as a callable taking `(on_progress,
-    should_abort)` instead of being three copies of this class.
+    should_abort, on_phase)` instead of being three copies of this class.
+    Only a backup run reports phases; the other two ignore `on_phase`.
 
     A plain QObject moved onto a QThread, started by `thread.started`,
     reporting only through signals.
@@ -37,6 +38,7 @@ class BackupWorker(QtCore.QObject):
     kind of work CLAUDE.md §3 forbids on the UI thread.
     """
     progress = QtCore.Signal(int, int)   # done, total
+    phase = QtCore.Signal(str)           # "copying", "verifying"
     finished = QtCore.Signal(dict)       # the result dict from backup_utils
 
     def __init__(self, work):
@@ -47,7 +49,8 @@ class BackupWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
-            result = self.work(self.progress.emit, lambda: self._abort)
+            result = self.work(self.progress.emit, lambda: self._abort,
+                               self.phase.emit)
         except Exception as exc:
             # backup_utils turns every filesystem failure it expects into an
             # ok=False result, so reaching here means something genuinely
@@ -968,8 +971,10 @@ class BackupTab(QtWidgets.QWidget):
             return
         self._start_backup(
             f"Backing up \"{job.get('name')}\"...",
-            lambda progress, abort: backup_utils.run_job(job, progress, abort),
+            lambda progress, abort, phase: backup_utils.run_job(
+                job, progress, abort, phase),
             lambda result: self._finish_run(job, result),
+            phases={"verifying": f"Verifying backup \"{job.get('name')}\"..."},
         )
 
     def restore_backup_job(self, job: dict):
@@ -994,7 +999,7 @@ class BackupTab(QtWidgets.QWidget):
             return
         self._start_backup(
             f"Restoring \"{job.get('name')}\" from {version}...",
-            lambda progress, abort: backup_utils.restore_version(
+            lambda progress, abort, _phase: backup_utils.restore_version(
                 job, version, destination, progress, abort),
             lambda result: self._say(result.get("message", ""),
                                      ok=result.get("ok", False)),
@@ -1018,7 +1023,7 @@ class BackupTab(QtWidgets.QWidget):
             self.refresh_backup()
             return
 
-        def work(progress, abort):
+        def work(progress, abort, _phase):
             measured = {}
             for index, job in enumerate(jobs, 1):
                 if abort():
@@ -1030,8 +1035,12 @@ class BackupTab(QtWidgets.QWidget):
         self._start_backup("Checking what has changed since each backup...",
                            work, self._finish_changes)
 
-    def _start_backup(self, status: str, work, done):
-        """Run one backup-related call on a QThread, locking the screen."""
+    def _start_backup(self, status: str, work, done, phases=None):
+        """Run one backup-related call on a QThread, locking the screen.
+
+        `phases` maps a phase name the work reports to the status line shown
+        while it lasts; a phase not in it leaves the status line alone.
+        """
         self._say(status)
         self.backup_bar.setRange(0, 0)  # indeterminate until a total arrives
         self.backup_bar.setValue(0)
@@ -1039,10 +1048,12 @@ class BackupTab(QtWidgets.QWidget):
         self._set_backup_controls(enabled=False)
 
         self._backup_done = done
+        self._backup_phases = phases or {}
         self.backup_thread = QtCore.QThread(self)
         self.backup_worker = BackupWorker(work)
         self.backup_worker.moveToThread(self.backup_thread)
         self.backup_worker.progress.connect(self.on_backup_progress)
+        self.backup_worker.phase.connect(self.on_backup_phase)
         self.backup_worker.finished.connect(self.on_backup_finished)
         self.backup_thread.started.connect(self.backup_worker.run)
         self.backup_thread.start()
@@ -1050,6 +1061,16 @@ class BackupTab(QtWidgets.QWidget):
     def on_backup_progress(self, done: int, total: int):
         self.backup_bar.setRange(0, total)
         self.backup_bar.setValue(done)
+
+    def on_backup_phase(self, phase: str):
+        """Show the status line for the phase the worker just entered.
+
+        A bound method, not a lambda, so the queued connection delivers it on
+        the UI thread rather than running it on the worker's.
+        """
+        status = self._backup_phases.get(phase)
+        if status:
+            self._say(status)
 
     def on_backup_finished(self, result: dict):
         self.backup_bar.setVisible(False)

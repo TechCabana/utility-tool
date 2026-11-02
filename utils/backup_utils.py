@@ -30,6 +30,7 @@ tests/test_backup_utils.py; loading it with `launchctl` is not. A failure
 there reports the real error rather than claiming success, which is the most
 that can honestly be promised until someone runs it.
 """
+import hashlib
 import json
 import os
 import re
@@ -39,7 +40,7 @@ import sys
 import tempfile
 import uuid
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from utils.fs_utils import _is_link_like, app_dir, human_size
 
@@ -58,7 +59,7 @@ _VERSION_RE = re.compile(r"^\d{8}-\d{6}$")
 SCHEDULES = ("manual", "daily", "weekly")
 DEFAULT_RETENTION = 5
 
-# copy2 preserves mtime, so an untouched file compares equal to the nanosecond
+# The copy preserves mtime (copystat, as copy2 does), so an untouched file compares equal to the nanosecond
 # on NTFS. The tolerance is for filesystems that store a coarser timestamp
 # (FAT32 on a USB backup drive rounds to 2 seconds), not for slack.
 MTIME_TOLERANCE = 2.0
@@ -321,6 +322,82 @@ def version_datetime(name: str) -> Optional[datetime]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Manifests
+# ---------------------------------------------------------------------------
+# Each version has a JSON Lines manifest BESIDE its folder, never inside it:
+# `<job root>/<stamp>.manifest.jsonl`. Inside, it would be a file the source
+# does not have -- changes_since would count it as removed and a restore would
+# bring it back as a stray file -- and the version folder must stay an
+# ordinary copy of the source. version_names() only lists directories, so the
+# sibling file is never mistaken for a version.
+#
+# Line 1 is a header, then one line per copied file, then -- only once every
+# file has been re-read and matched -- an end trailer with "verified": true.
+# A version is verified iff its folder exists and its manifest ends in that
+# trailer. Legacy versions (made before manifests) have none and are simply
+# unverified.
+
+MANIFEST_SUFFIX = ".manifest.jsonl"
+MANIFEST_VERSION = 1
+
+
+def manifest_path(job: Dict, stamp: str) -> str:
+    """Where version `stamp`'s manifest lives: a sibling of its folder."""
+    return os.path.join(job_root(job), stamp + MANIFEST_SUFFIX)
+
+
+def _last_line(path: str, limit: int = 4096) -> Optional[bytes]:
+    """The last non-empty line of `path`, reading only its tail.
+
+    None if the file cannot be read or the last line is longer than `limit`
+    (a real trailer is under 100 bytes, so that is garbage, not a trailer).
+    """
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            start = max(0, end - limit)
+            handle.seek(start)
+            tail = handle.read().rstrip(b"\r\n")
+    except OSError:
+        return None
+    cut = tail.rfind(b"\n")
+    if cut < 0 and start > 0:
+        return None
+    return tail[cut + 1:]
+
+
+def read_manifest_summary(job: Dict, stamp: str) -> Optional[Dict]:
+    """Version `stamp`'s end trailer, or None if it has no valid one.
+
+    Missing, truncated (a run that died mid-write) or garbage manifests all
+    come back None -- "not verified", never an exception.
+    """
+    line = _last_line(manifest_path(job, stamp))
+    if not line:
+        return None
+    try:
+        trailer = json.loads(line.decode("utf-8"))
+    except ValueError:
+        return None
+    if (not isinstance(trailer, dict) or trailer.get("type") != "end"
+            or trailer.get("verified") is not True):
+        return None
+    return trailer
+
+
+def is_verified(job: Dict, stamp: str) -> bool:
+    """True iff version `stamp` exists and its manifest ends verified."""
+    return (os.path.isdir(version_path(job, stamp))
+            and read_manifest_summary(job, stamp) is not None)
+
+
+def verified_versions(job: Dict) -> List[str]:
+    """The verified subset of `version_names(job)`, oldest first."""
+    return [name for name in version_names(job) if is_verified(job, name)]
+
+
 def prune_versions(job: Dict) -> List[str]:
     """Delete the oldest versions beyond the job's retention count.
 
@@ -328,16 +405,34 @@ def prune_versions(job: Dict) -> List[str]:
     file in it is open, the drive went away) is left in place and simply not
     reported as removed -- a failed prune must never fail the backup that
     just succeeded.
+
+    The newest VERIFIED version is never deleted, even when retention says
+    it should be: if every newer version is a legacy (manifest-less) copy,
+    it is still the last one known to match what was copied. Legacy versions
+    otherwise prune by retention as before. A pruned version's manifest goes
+    with it.
     """
     keep = max(1, int(job.get("retention", DEFAULT_RETENTION)))
     names = version_names(job)
+    protected = next((name for name in reversed(names)
+                      if is_verified(job, name)), None)
     removed = []
     for name in names[:max(0, len(names) - keep)]:
+        if name == protected:
+            continue
+        # Manifest first: a version whose folder deletion fails halfway must
+        # not keep claiming to be verified.
         try:
-            shutil.rmtree(version_path(job, name))
-            removed.append(name)
+            os.remove(manifest_path(job, name))
+        except FileNotFoundError:
+            pass  # a legacy version has none
         except OSError:
             continue
+        try:
+            shutil.rmtree(version_path(job, name))
+        except OSError:
+            continue
+        removed.append(name)
     return removed
 
 
@@ -361,16 +456,13 @@ def _ignore_links(directory: str, names) -> set:
         return set()
 
 
-def walk_tree(root: str) -> Tuple[Dict[str, Tuple[int, float]], int]:
-    """`({relative path: (size, mtime)}, unreadable_count)` for a whole tree.
+def _iter_tree(root: str) -> Iterator[Optional[Tuple[str, int, float]]]:
+    """Yield `(relative path, size, mtime)` per file, or None per unreadable
+    entry. Relative paths use forward slashes and keep their case.
 
-    Relative paths are normalised with forward slashes and lowercased case
-    only for the *key*, so a source and its backup compare correctly on
-    Windows' case-insensitive filesystem. Unreadable entries are counted, not
-    raised.
+    A generator so a caller that only needs a count or a total (pre-flight,
+    the copy's progress total) never holds the whole tree in memory.
     """
-    files: Dict[str, Tuple[int, float]] = {}
-    skipped = 0
     stack = [root]
     while stack:
         current = stack.pop()
@@ -385,17 +477,82 @@ def walk_tree(root: str) -> Tuple[Dict[str, Tuple[int, float]], int]:
                             continue
                         stat = entry.stat(follow_symlinks=False)
                         rel = os.path.relpath(entry.path, root).replace("\\", "/")
-                        files[rel.lower()] = (stat.st_size, stat.st_mtime)
+                        yield rel, stat.st_size, stat.st_mtime
                     except OSError:
-                        skipped += 1
+                        yield None
         except OSError:
+            yield None
+
+
+def walk_tree(root: str) -> Tuple[Dict[str, Tuple[int, float]], int]:
+    """`({relative path: (size, mtime)}, unreadable_count)` for a whole tree.
+
+    Relative paths are normalised with forward slashes and lowercased case
+    only for the *key*, so a source and its backup compare correctly on
+    Windows' case-insensitive filesystem. Unreadable entries are counted, not
+    raised.
+    """
+    files: Dict[str, Tuple[int, float]] = {}
+    skipped = 0
+    for item in _iter_tree(root):
+        if item is None:
             skipped += 1
+        else:
+            files[item[0].lower()] = (item[1], item[2])
     return files, skipped
+
+
+def tree_totals(root: str) -> Tuple[int, int]:
+    """`(file count, total bytes)` of a tree, in constant memory."""
+    count = size = 0
+    for item in _iter_tree(root):
+        if item is not None:
+            count += 1
+            size += item[1]
+    return count, size
+
+
+# Read/write chunk for the hashing copy and the verify pass. 1 MiB is
+# shutil's own Windows buffer size.
+CHUNK = 1024 * 1024
+
+
+def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
+    """Copy `src` to `dst`, hashing the bytes as they pass through.
+
+    Returns `(bytes read, source mtime, sha256 hex)`. Metadata is then copied
+    with `copystat`, as `copy2` does, so the mtime the changes-since
+    comparison relies on is preserved. If anything fails once `dst` exists,
+    the half-written file is deleted before the error propagates, so it can
+    never sit in a version looking like a real copy.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    with open(src, "rb") as fsrc:
+        mtime = os.fstat(fsrc.fileno()).st_mtime
+        try:
+            with open(dst, "wb") as fdst:
+                while True:
+                    chunk = fsrc.read(CHUNK)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    fdst.write(chunk)
+                    size += len(chunk)
+            shutil.copystat(src, dst)
+        except BaseException:
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+            raise
+    return size, mtime, digest.hexdigest()
 
 
 def copy_tree(source: str, destination: str,
               on_progress: Optional[Callable[[int, int], None]] = None,
-              should_abort: Optional[Callable[[], bool]] = None
+              should_abort: Optional[Callable[[], bool]] = None,
+              on_copied: Optional[Callable[[str, int, float, str], None]] = None
               ) -> Tuple[int, int, List[str]]:
     """Copy `source` into `destination`, reporting `(done, total)` per file.
 
@@ -405,19 +562,40 @@ def copy_tree(source: str, destination: str,
     on, which is exactly the "a permission error must not abandon the batch"
     behaviour the rest of this app has, and it already handles directory
     creation and metadata.
+
+    With `on_copied`, each file is copied by `_hash_copy` and
+    `on_copied(relative path, size, mtime, sha256)` is called once it has
+    landed -- `run_job` streams that into the version's manifest. Without it
+    (restore), files are copied with plain `copy2`. If `on_copied` fails the
+    file just copied is deleted, so the tree never holds a file its manifest
+    does not list.
     """
-    total = len(walk_tree(source)[0])
+    total = tree_totals(source)[0]
     state = {"done": 0, "bytes": 0}
 
     def copy_one(src: str, dst: str) -> str:
+        """copytree's per-file hook: abort check, copy, count, report."""
         if should_abort is not None and should_abort():
             raise BackupAborted()
-        shutil.copy2(src, dst)
+        if on_copied is None:
+            shutil.copy2(src, dst)
+            try:
+                state["bytes"] += os.path.getsize(dst)
+            except OSError:
+                pass
+        else:
+            size, mtime, sha = _hash_copy(src, dst)
+            try:
+                on_copied(os.path.relpath(src, source).replace("\\", "/"),
+                          size, mtime, sha)
+            except BaseException:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                raise
+            state["bytes"] += size
         state["done"] += 1
-        try:
-            state["bytes"] += os.path.getsize(dst)
-        except OSError:
-            pass
         if on_progress is not None:
             on_progress(state["done"], total)
         return dst
@@ -529,8 +707,8 @@ def preflight(job: Dict,
     if not target:
         return "No target folder is set for this job"
 
-    files, _ = walk_tree(source)
-    if not files:
+    file_count, source_bytes = tree_totals(source)
+    if not file_count:
         return ("The source folder is empty (or none of its files can be "
                 "read), so nothing was backed up. Check that its drive is "
                 "connected.")
@@ -541,7 +719,7 @@ def preflight(job: Dict,
     if anchor is None:
         return f"The target drive is not available, so nothing was backed up: {target}"
 
-    need = int(sum(size for size, _ in files.values()) * SPACE_MARGIN)
+    need = int(source_bytes * SPACE_MARGIN)
     try:
         free = free_space(anchor)
     except OSError as exc:
@@ -566,24 +744,122 @@ def preflight(job: Dict,
 # Running a job
 # ---------------------------------------------------------------------------
 
+class _ManifestWriteFailed(Exception):
+    """A manifest line could not be written. Not an OSError on purpose, for
+    the same reason as BackupAborted: copytree would swallow an OSError as one
+    skipped file and carry on, leaving a copied file the manifest omits."""
+
+
+# How many offending files a failed verification names in its message.
+VERIFY_NAMED = 5
+
+
+def _verify_copy(partial: str, manifest: str,
+                 on_progress: Optional[Callable[[int, int], None]],
+                 should_abort: Optional[Callable[[], bool]],
+                 total: int) -> Tuple[int, int, List[str]]:
+    """Re-read every file the manifest lists from `partial`; compare.
+
+    Streams the manifest a line at a time and returns `(files checked, bad
+    count, the first VERIFY_NAMED bad paths)`, so memory stays flat however
+    many files there are. A file is bad if it is missing, unreadable, a different size
+    or a different SHA-256 from what was recorded while copying.
+
+    The re-read is a fresh open of the copied file, not the hash computed
+    during the copy, so it catches a fault anywhere on the write path. It
+    does not prove the bytes are on the platter: the OS file cache can serve
+    this read from memory. Bit rot on the stored disk is a later scheduled
+    deep-verify's job, not this one's.
+    """
+    bad = 0
+    named: List[str] = []
+    done = 0
+    if on_progress is not None:
+        on_progress(0, total)
+    with open(manifest, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if should_abort is not None and should_abort():
+                raise BackupAborted()
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                entry = None
+            if not isinstance(entry, dict):
+                bad += 1
+                if len(named) < VERIFY_NAMED:
+                    named.append("(damaged manifest line)")
+                continue
+            if entry.get("type") != "file":
+                continue
+            rel = entry.get("path", "")
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                with open(os.path.join(partial, *rel.split("/")), "rb") as copied:
+                    while True:
+                        chunk = copied.read(CHUNK)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        size += len(chunk)
+                ok = size == entry.get("size") and digest.hexdigest() == entry.get("sha256")
+            except OSError:
+                ok = False
+            if not ok:
+                bad += 1
+                if len(named) < VERIFY_NAMED:
+                    named.append(rel)
+            done += 1
+            if on_progress is not None:
+                on_progress(done, total)
+    return done, bad, named
+
+
+def _discard(partial: str, manifest_tmp: str) -> None:
+    """Remove an abandoned run's `.partial` folder and its temp manifest."""
+    shutil.rmtree(partial, ignore_errors=True)
+    try:
+        os.remove(manifest_tmp)
+    except OSError:
+        pass
+
+
 def run_job(job: Dict,
             on_progress: Optional[Callable[[int, int], None]] = None,
-            should_abort: Optional[Callable[[], bool]] = None) -> Dict:
-    """Take one versioned copy of `job`'s source and prune old versions.
+            should_abort: Optional[Callable[[], bool]] = None,
+            on_phase: Optional[Callable[[str], None]] = None) -> Dict:
+    """Take one versioned, verified copy of `job`'s source; prune old versions.
 
     Returns a plain result dict: `ok`, `message`, and on success `version`,
-    `files`, `bytes`, `pruned`, `errors`. Never raises for a filesystem
+    `files`, `bytes`, `pruned`, `errors`, `verified` (always True on
+    success), `manifest` and `target_volume`. Never raises for a filesystem
     problem the user can see and fix -- a missing source, an unwritable
     target and a drive that is not mounted all come back as `ok=False` with a
     message, per CLAUDE.md §5's "a destination failure degrades cleanly".
 
-    The copy lands in `<stamp>.partial` and is renamed to `<stamp>` only once
-    it completes. An interrupted run therefore leaves nothing that
-    `version_names()` will offer as a restore point, and nothing that the
-    changes-since comparison would measure against.
+    The sequence, and why it is in this order:
 
-    `preflight()` runs first and nothing is created until it passes. On
-    success the result carries `target_volume` for `record_run` to store.
+    1. Copy into `<stamp>.partial`, hashing each file as it is copied and
+       streaming one manifest line per file into `<stamp>.manifest.jsonl.tmp`.
+    2. Re-read every copied file and compare it to the manifest
+       (`_verify_copy`). Any mismatch fails the run: nothing is promoted,
+       nothing is pruned, and the `.partial` folder and `.tmp` manifest are
+       KEPT so the failure can be inspected.
+    3. Append the verified trailer, fsync, rename the manifest into place,
+       and only then rename `.partial` to `<stamp>` -- so a version folder
+       never exists without its finished manifest.
+    4. Prune, which never removes the newest verified version.
+
+    Source files that could not be read are reported in `errors` and left
+    out of the manifest; the run is still ok. "Verified" means every file
+    that was copied matches, not that every source file was copied -- the
+    message says how many were skipped.
+
+    `on_phase` is called with "copying" and then "verifying"; `on_progress`
+    restarts from 0 for the verify pass. Cancelling (`should_abort`) in
+    either phase removes the `.partial` folder and the `.tmp` manifest.
+
+    `preflight()` runs first and nothing is created until it passes.
     """
     problem = preflight(job)
     if problem:
@@ -594,35 +870,92 @@ def run_job(job: Dict,
     root = job_root(job)
     partial = os.path.join(root, stamp + ".partial")
     final = os.path.join(root, stamp)
+    manifest = manifest_path(job, stamp)
+    manifest_tmp = manifest + ".tmp"
     try:
         os.makedirs(root, exist_ok=True)
     except OSError as exc:
         return {"ok": False, "message": f"Target folder is not writable: {exc}"}
 
+    if on_phase is not None:
+        on_phase("copying")
     try:
-        files, copied_bytes, errors = copy_tree(
-            source, partial, on_progress=on_progress, should_abort=should_abort)
+        with open(manifest_tmp, "w", encoding="utf-8", newline="\n") as out:
+            out.write(json.dumps({"type": "header", "version": MANIFEST_VERSION,
+                                  "stamp": stamp, "source": source}) + "\n")
+
+            def record(rel: str, size: int, mtime: float, sha: str) -> None:
+                """Stream one file's manifest line straight to disk."""
+                try:
+                    out.write(json.dumps({"type": "file", "path": rel, "size": size,
+                                          "mtime": mtime, "sha256": sha}) + "\n")
+                    out.flush()
+                except OSError as exc:
+                    raise _ManifestWriteFailed(str(exc)) from exc
+
+            files, copied_bytes, errors = copy_tree(
+                source, partial, on_progress=on_progress,
+                should_abort=should_abort, on_copied=record)
     except BackupAborted:
-        shutil.rmtree(partial, ignore_errors=True)
+        _discard(partial, manifest_tmp)
         return {"ok": False, "message": "Backup cancelled"}
-    except OSError as exc:
-        shutil.rmtree(partial, ignore_errors=True)
+    except (OSError, _ManifestWriteFailed) as exc:
+        _discard(partial, manifest_tmp)
         return {"ok": False, "message": f"Backup failed: {exc}"}
 
+    if on_phase is not None:
+        on_phase("verifying")
+    problem = None
     try:
+        checked, bad, named = _verify_copy(partial, manifest_tmp, on_progress,
+                                           should_abort, files)
+    except BackupAborted:
+        _discard(partial, manifest_tmp)
+        return {"ok": False, "message": "Backup cancelled"}
+    except OSError as exc:
+        problem = f"its manifest could not be read back ({exc})"
+    else:
+        if bad:
+            more = ", ..." if bad > len(named) else ""
+            problem = (f"{bad} file(s) did not match what was copied "
+                       f"({', '.join(named)}{more})")
+        elif checked != files:
+            problem = (f"the manifest lists {checked} file(s) but {files} "
+                       "were copied")
+    if problem:
+        return {"ok": False,
+                "message": (f"Backup verification failed: {problem}. Nothing was "
+                            "pruned and earlier backups are untouched. The "
+                            f"unverified copy was kept for inspection at {partial}"),
+                "verified": False, "partial": partial, "manifest": manifest_tmp,
+                "files": files, "errors": errors}
+
+    try:
+        with open(manifest_tmp, "a", encoding="utf-8", newline="\n") as out:
+            out.write(json.dumps({"type": "end", "files": files,
+                                  "bytes": copied_bytes, "verified": True}) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(manifest_tmp, manifest)
         os.replace(partial, final)
     except OSError as exc:
-        shutil.rmtree(partial, ignore_errors=True)
+        _discard(partial, manifest_tmp)
+        try:
+            os.remove(manifest)
+        except OSError:
+            pass
         return {"ok": False, "message": f"Could not finalise the backup: {exc}"}
 
     pruned = prune_versions(job)
-    message = f"Backed up {files} file(s) to {final}"
+    message = f"Backed up {files} file(s) to {final} and verified every copied file"
     if errors:
-        message += f". {len(errors)} file(s) could not be read"
+        message += (f". {len(errors)} file(s) could not be read and were "
+                    "skipped, so they are not in this backup")
     if pruned:
         message += f". Removed {len(pruned)} old version(s)"
     return {"ok": True, "message": message, "version": stamp, "files": files,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
+            "verified": True, "manifest": manifest,
             "target_volume": target_volume(target)}
 
 
@@ -662,7 +995,7 @@ def changes_since(job: Dict,
     `removed`, `changed` (their sum) and `bytes` (the size of everything
     added or modified, i.e. what the next backup would have to write).
 
-    **Comparison is by size and mtime, not by content hash.** `copy2`
+    **Comparison is by size and mtime, not by content hash.** The copy
     preserves mtime, so an untouched file matches its backup exactly and any
     ordinary edit changes one or both. Hashing both trees would be certain but
     reads every byte of both -- minutes for the kind of folder people back up,

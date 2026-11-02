@@ -100,7 +100,8 @@ def test_run_job_reports_progress_for_every_file(tree):
     job, _, _ = tree
     seen = []
     backup_utils.run_job(job, on_progress=lambda done, total: seen.append((done, total)))
-    assert seen == [(1, 2), (2, 2)]
+    # The copy, then the verify pass restarting from 0 over the same files.
+    assert seen == [(1, 2), (2, 2), (0, 2), (1, 2), (2, 2)]
 
 
 def test_two_runs_make_two_versions(tree):
