@@ -1,7 +1,7 @@
 from PySide6 import QtCore, QtWidgets
 
 from styles import tokens
-from utils.fs_utils import app_dir
+from utils.fs_utils import APP_NAME, app_dir
 from widgets.common import ElidedLabel, PageHeader, card, section_header
 
 THEME_CHOICES = (
@@ -124,7 +124,7 @@ class SettingsTab(QtWidgets.QWidget):
 
         body.addWidget(section_header("Privacy"))
         privacy = QtWidgets.QLabel(
-            "UtilityTool makes no network calls. Every file and folder it "
+            f"{APP_NAME} makes no network calls. Every file and folder it "
             "touches stays on this machine, and nothing is uploaded, logged or "
             "shared. It needs no account and works with the network switched off.")
         privacy.setObjectName("Hint")
@@ -133,7 +133,7 @@ class SettingsTab(QtWidgets.QWidget):
 
         body.addWidget(section_header("Licences"))
         licences = QtWidgets.QLabel(
-            "UtilityTool is MIT licensed. It bundles the Manrope and Geist Mono "
+            f"{APP_NAME} is MIT licensed. It bundles the Manrope and Geist Mono "
             "typefaces (SIL Open Font License 1.1) and Lucide icons (ISC) — the "
             "full licence texts ship in assets/fonts/ and assets/icons/.")
         licences.setObjectName("Hint")

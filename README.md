@@ -1,6 +1,6 @@
 <div align="center">
 
-# UtilityTool
+# Safekeep
 
 **Versioned, scheduled folder backups with restore, in one offline desktop app.**
 
@@ -19,7 +19,7 @@
 
 ---
 
-> **TL;DR:** UtilityTool is a PySide6 desktop app for one job: backing folders up. A backup
+> **TL;DR:** Safekeep is a PySide6 desktop app for one job: backing folders up. A backup
 > job copies a source folder into a new timestamped version under a target folder, keeps the
 > last few versions, can be scheduled through Windows Task Scheduler, and restores a version
 > into a new folder. The app runs fully offline.
@@ -91,7 +91,7 @@ python main.py
 ```
 
 A light-themed window opens with a sidebar and three tabs: Home, Backup, Settings. The window title bar, sidebar header and every other surface in the app go by
-"UtilityTool" (one word).
+"Safekeep" (one word).
 
 ### 4. Verify
 
@@ -106,11 +106,19 @@ per-user directory (`utils/fs_utils.py`, function `app_dir()`):
 
 | Platform | Location |
 | --- | --- |
-| Windows | `%APPDATA%\UtilityTool\backup_jobs.json` |
-| macOS | `~/Library/Application Support/UtilityTool/backup_jobs.json` |
-| Linux | `~/.config/UtilityTool/backup_jobs.json` |
+| Windows | `%APPDATA%\Safekeep\backup_jobs.json` |
+| macOS | `~/Library/Application Support/Safekeep/backup_jobs.json` |
+| Linux | `~/.config/Safekeep/backup_jobs.json` |
 
 Nothing here is committed to the repo, and nothing needs to be.
+
+**Upgrading from UtilityTool.** Safekeep was called UtilityTool before. On first start it copies
+everything from the old app-data folder (`%APPDATA%\UtilityTool` and its macOS/Linux
+equivalents) into the new one, never overwriting a file already there, and leaves the old folder
+in place as a safety copy. It also re-registers each scheduled job as `Safekeep_Backup_<id>` and
+deletes the old `UtilityTool_Backup_<id>` task only once the new one has registered; if that
+fails, the old task keeps running and the app says so. Settings (theme, last tab) carry over too.
+The logic is in `utils/migrate.py`.
 
 ### Everyday use
 
@@ -134,24 +142,25 @@ pip install pyinstaller
 **Windows (PowerShell or cmd):**
 
 ```powershell
-pyinstaller --onefile --windowed --name "UtilityTool" `
+pyinstaller --onefile --windowed --name "Safekeep" `
   --add-data "styles;styles" `
   --add-data "assets;assets" `
   main.py
 ```
 
-Writes `dist\UtilityTool.exe`.
+Writes `dist\Safekeep.exe`. The local `Safekeep.spec` (gitignored by `*.spec`) carries the
+same settings: `python -m PyInstaller --noconfirm --clean Safekeep.spec`.
 
 **macOS (or Linux):**
 
 ```bash
-pyinstaller --onefile --windowed --name "UtilityTool" \
+pyinstaller --onefile --windowed --name "Safekeep" \
   --add-data "styles:styles" \
   --add-data "assets:assets" \
   main.py
 ```
 
-Writes `dist/UtilityTool.app` on macOS, or a plain `dist/UtilityTool` executable on Linux.
+Writes `dist/Safekeep.app` on macOS, or a plain `dist/Safekeep` executable on Linux.
 
 The packaged binary is unsigned on both platforms — see
 [If it does not work](#if-it-does-not-work) for the SmartScreen/Gatekeeper warnings this
@@ -302,11 +311,13 @@ utility-tool/
 ├── utils/                 pure logic, no Qt imports
 │   ├── backup_utils.py     jobs storage, versioned copy, restore, changes-since, Task Scheduler
 │   ├── activity.py         short log of recent runs shown on Home
-│   └── fs_utils.py         app-data path, symlink/junction test, byte formatting
+│   ├── fs_utils.py         app-data path, symlink/junction test, byte formatting
+│   └── migrate.py          one-time copy of data, tasks and settings from the UtilityTool name
 └── tests/                 pytest suite over utils/ and styles/ (Qt-free layer only, see Testing)
     ├── test_backup_utils.py
     ├── test_activity.py
     ├── test_fs_utils.py
+    ├── test_migrate.py
     └── test_tokens.py
 ```
 
@@ -330,8 +341,8 @@ pytest tests/
 ```
 
 Covers the Qt-free layer only (`utils/backup_utils.py`, `utils/activity.py`,
-`utils/fs_utils.py` and the design tokens in `styles/tokens.py`), using real `tmp_path` files,
-no mocking. 81 tests, all passing. The Qt-driven `tabs/` layer (including the Backup screen's
+`utils/fs_utils.py`, `utils/migrate.py` and the design tokens in `styles/tokens.py`), using real `tmp_path` files,
+no mocking. 97 tests, all passing. The Qt-driven `tabs/` layer (including the Backup screen's
 worker thread and UI) has no automated coverage and stays manually
 verified, per the [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps
 above.

@@ -42,7 +42,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from utils.fs_utils import _is_link_like, app_dir
 
-JOBS_FILE = os.path.join(app_dir(), "backup_jobs.json")
+# A path, not a snapshot: nothing is read until load_jobs() opens it, so
+# utils/migrate.py copying a pre-rename jobs file into app_dir() any time
+# before that first read is enough for it to be found here.
+JOBS_FILENAME = "backup_jobs.json"
+JOBS_FILE = os.path.join(app_dir(), JOBS_FILENAME)
 
 # A version directory is named for the moment the backup started. Matched by
 # this pattern when versions are listed, so a half-written ".partial" copy or
@@ -490,11 +494,18 @@ def restore_version(job: Dict, version: str, destination: str,
 # Windows Task Scheduler
 # ---------------------------------------------------------------------------
 
-def task_name(job_id: str) -> str:
+# Task Scheduler name prefixes. The legacy one is what tasks were registered
+# under before the Safekeep rename; only utils/migrate.py asks for it, to
+# remove an old task once its replacement has registered.
+TASK_PREFIX = "Safekeep_Backup_"
+LEGACY_TASK_PREFIX = "UtilityTool_Backup_"
+
+
+def task_name(job_id: str, legacy: bool = False) -> str:
     """The scheduled task's name. Prefixed so every task this app owns is
     identifiable in Task Scheduler, and keyed on the job id so a rename never
-    strands one."""
-    return f"UtilityTool_Backup_{job_id}"
+    strands one. `legacy=True` gives the pre-rename name."""
+    return f"{LEGACY_TASK_PREFIX if legacy else TASK_PREFIX}{job_id}"
 
 
 def job_command(job_id: str) -> str:
@@ -557,7 +568,9 @@ def schtasks_args(job: Dict) -> Optional[List[str]]:
 # macOS (launchd)
 # ------------------------------
 # A launchd label has to be unique per user and is conventionally reverse-DNS.
-LAUNCHD_PREFIX = "com.techcabana.utilitytool.backup"
+# The legacy prefix is the pre-rename label, used only by the migration.
+LAUNCHD_PREFIX = "com.techcabana.safekeep.backup"
+LEGACY_LAUNCHD_PREFIX = "com.techcabana.utilitytool.backup"
 
 # launchd's own weekday numbering: 0 and 7 are both Sunday, 1 is Monday. The
 # Windows path pins a weekly job to Monday, so this does too -- the two
@@ -565,14 +578,15 @@ LAUNCHD_PREFIX = "com.techcabana.utilitytool.backup"
 LAUNCHD_MONDAY = 1
 
 
-def launchd_label(job_id: str) -> str:
-    return f"{LAUNCHD_PREFIX}.{job_id}"
+def launchd_label(job_id: str, legacy: bool = False) -> str:
+    """The launchd label for `job_id`; `legacy=True` gives the pre-rename one."""
+    return f"{LEGACY_LAUNCHD_PREFIX if legacy else LAUNCHD_PREFIX}.{job_id}"
 
 
-def launchd_plist_path(job_id: str) -> str:
+def launchd_plist_path(job_id: str, legacy: bool = False) -> str:
     """Where the agent's plist lives. Per-user, so no admin rights needed."""
     return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents",
-                        f"{launchd_label(job_id)}.plist")
+                        f"{launchd_label(job_id, legacy)}.plist")
 
 
 def launchd_plist(job: Dict) -> Optional[str]:
@@ -650,17 +664,17 @@ def _launchd_domain() -> str:
     return f"gui/{os.getuid()}" if hasattr(os, "getuid") else "gui/501"
 
 
-def _launchd_unregister(job_id: str) -> Tuple[bool, str]:
-    ok, output = _launchctl(["bootout", _launchd_domain(), launchd_label(job_id)])
+def _launchd_unregister(job_id: str, legacy: bool = False) -> Tuple[bool, str]:
+    ok, output = _launchctl(["bootout", _launchd_domain(), launchd_label(job_id, legacy)])
     try:
-        os.remove(launchd_plist_path(job_id))
+        os.remove(launchd_plist_path(job_id, legacy))
     except OSError:
         pass  # never registered, or already gone
     return ok, output
 
 
-def _launchd_exists(job_id: str) -> bool:
-    return os.path.isfile(launchd_plist_path(job_id))
+def _launchd_exists(job_id: str, legacy: bool = False) -> bool:
+    return os.path.isfile(launchd_plist_path(job_id, legacy))
 
 
 def _launchctl(args: List[str]) -> Tuple[bool, str]:
@@ -711,19 +725,21 @@ def register_task(job: Dict) -> Tuple[bool, str]:
     return _run(args)
 
 
-def unregister_task(job_id: str) -> Tuple[bool, str]:
+def unregister_task(job_id: str, legacy: bool = False) -> Tuple[bool, str]:
     """Delete the OS scheduled task for `job_id`. A job that never had one
     reports failure from schtasks, which the caller treats as "nothing to
-    remove" rather than an error."""
+    remove" rather than an error. `legacy=True` targets the pre-rename task."""
     if sys.platform == "darwin":
-        return _launchd_unregister(job_id)
-    return _run(["schtasks", "/delete", "/tn", task_name(job_id), "/f"])
+        return _launchd_unregister(job_id, legacy)
+    return _run(["schtasks", "/delete", "/tn", task_name(job_id, legacy), "/f"])
 
 
-def task_exists(job_id: str) -> bool:
+def task_exists(job_id: str, legacy: bool = False) -> bool:
+    """Whether the OS scheduler holds a task for `job_id` (or, with
+    `legacy=True`, one under the pre-rename name)."""
     if sys.platform == "darwin":
-        return _launchd_exists(job_id)
-    ok, _ = _run(["schtasks", "/query", "/tn", task_name(job_id)])
+        return _launchd_exists(job_id, legacy)
+    ok, _ = _run(["schtasks", "/query", "/tn", task_name(job_id, legacy)])
     return ok
 
 

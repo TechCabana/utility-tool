@@ -2,6 +2,7 @@ from PySide6 import QtCore, QtWidgets
 
 from styles import tokens
 from utils import activity
+from utils.fs_utils import APP_NAME
 from widgets import icons
 from widgets.common import EmptyState, PageHeader, card, divider
 
@@ -75,7 +76,7 @@ class HomeTab(QtWidgets.QWidget):
         layout.setSpacing(tokens.SPACE_BLOCK)
 
         layout.addWidget(PageHeader(
-            "UtilityTool",
+            APP_NAME,
             "Back up the folders on this machine to another drive. Nothing is uploaded."))
 
         cards = QtWidgets.QHBoxLayout()

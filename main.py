@@ -7,6 +7,8 @@ from styles import tokens
 from tabs.backup_tab import BackupTab
 from tabs.home_tab import HomeTab
 from tabs.settings_tab import SettingsTab
+from utils import migrate
+from utils.fs_utils import APP_NAME, LEGACY_APP_NAME
 from widgets import icons
 from widgets.motion import fade_in, motion_enabled
 
@@ -18,7 +20,6 @@ __version__ = "1.0.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 ORG_NAME = "TechCabana"
-APP_NAME = "UtilityTool"
 
 # One row per sidebar entry: label, icon, and the stacked-widget index. The
 # tuple is the single definition of navigation -- the buttons, the Ctrl+N
@@ -311,6 +312,12 @@ def run_backup_job_cli(job_id):
     """
     from utils import backup_utils
 
+    # A task registered before the rename can fire before the renamed app has
+    # ever been opened, so the jobs file it needs may still be in the old
+    # app-data directory. Copy it across first. Only the data: re-registering
+    # tasks is the GUI's job, and an unattended run must not touch the
+    # scheduler.
+    migrate.migrate_data()
     job = backup_utils.get_job(job_id)
     if job is None:
         print(f"[ERROR] No backup job with id '{job_id}'")
@@ -329,6 +336,11 @@ def main() -> int:
     app.setApplicationVersion(__version__)
 
     settings = QtCore.QSettings(ORG_NAME, APP_NAME)
+    # Before any window is built: the settings carry the theme and last tab,
+    # and the Backup screen reads the jobs file as it is constructed.
+    migrate.migrate_settings(QtCore.QSettings(ORG_NAME, LEGACY_APP_NAME), settings)
+    migrate.migrate_data()
+    task_failures = report_task_migration(migrate.migrate_tasks())
     load_fonts()
     apply_theme(app, str(settings.value("ui/theme", "system")))
 
@@ -336,7 +348,30 @@ def main() -> int:
     window.show()
     if motion_enabled():
         fade_in(window.centralWidget())
+    if task_failures:
+        # Queued so it opens over the window once the event loop is running.
+        QtCore.QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.warning(
+            window, "Scheduled backups not moved",
+            "Some scheduled backups could not be moved to their new "
+            f"{APP_NAME} task. They keep running under their old name, and "
+            f"{APP_NAME} will try again next time it starts.\n\n"
+            + "\n".join(task_failures)))
     return app.exec()
+
+
+def report_task_migration(results) -> list:
+    """Print each scheduled-task migration result; return the failure lines.
+
+    The console line is for a run from source; the failures also go to a
+    dialog in main(), because a packaged build has no console to read.
+    """
+    failures = []
+    for result in results:
+        line = f"{result['name']}: {result['message']}"
+        print(("[OK] " if result["ok"] else "[WARN] ") + line)
+        if not result["ok"]:
+            failures.append(line)
+    return failures
 
 
 if __name__ == "__main__":

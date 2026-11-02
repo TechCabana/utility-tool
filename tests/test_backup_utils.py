@@ -339,7 +339,20 @@ def test_walk_tree_of_a_missing_directory_counts_it_as_skipped(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_task_name_is_prefixed_and_keyed_on_the_job_id():
-    assert backup_utils.task_name("abc123") == "UtilityTool_Backup_abc123"
+    assert backup_utils.task_name("abc123") == "Safekeep_Backup_abc123"
+    # The pre-rename name, which the migration needs to find and remove.
+    assert backup_utils.task_name("abc123", legacy=True) == "UtilityTool_Backup_abc123"
+
+
+def test_unregister_and_exists_target_the_legacy_task_only_when_asked(monkeypatch):
+    calls = []
+    monkeypatch.setattr(backup_utils.sys, "platform", "win32")
+    monkeypatch.setattr(backup_utils, "_run", lambda args: calls.append(args) or (True, ""))
+    backup_utils.unregister_task("abc", legacy=True)
+    backup_utils.task_exists("abc", legacy=True)
+    backup_utils.unregister_task("abc")
+    assert [args[args.index("/tn") + 1] for args in calls] == [
+        "UtilityTool_Backup_abc", "UtilityTool_Backup_abc", "Safekeep_Backup_abc"]
 
 
 def test_job_command_invokes_the_headless_cli_flag():
@@ -450,6 +463,25 @@ def test_launchd_label_and_path_are_per_job():
     path = backup_utils.launchd_plist_path("abc")
     assert path.endswith(".plist")
     assert "LaunchAgents" in path
+
+
+def test_launchd_legacy_unregister_boots_out_and_removes_the_old_label(tmp_path, monkeypatch):
+    # Driven through injection on any OS: the macOS path has never run on a
+    # Mac, so this pins what it would ASK launchd to do, not that launchd does it.
+    monkeypatch.setattr(backup_utils.sys, "platform", "darwin")
+    monkeypatch.setattr(backup_utils.os.path, "expanduser", lambda p: str(tmp_path))
+    calls = []
+    monkeypatch.setattr(backup_utils, "_launchctl", lambda args: calls.append(args) or (True, ""))
+    old_plist = tmp_path / "Library" / "LaunchAgents" / "com.techcabana.utilitytool.backup.abc.plist"
+    old_plist.parent.mkdir(parents=True)
+    old_plist.write_text("<plist/>", encoding="utf-8")
+
+    assert backup_utils.task_exists("abc", legacy=True) is True
+    assert backup_utils.task_exists("abc") is False
+    backup_utils.unregister_task("abc", legacy=True)
+    assert calls[-1][-1] == "com.techcabana.utilitytool.backup.abc"
+    assert not old_plist.exists()
+    assert backup_utils.launchd_label("abc") == "com.techcabana.safekeep.backup.abc"
 
 
 def test_job_argv_and_job_command_describe_the_same_run():

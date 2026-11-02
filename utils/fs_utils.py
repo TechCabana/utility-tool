@@ -11,7 +11,11 @@ Qt-free by design (CLAUDE.md §3/§8) -- plain paths in, plain values out.
 import os
 import sys
 
-APP_NAME = "UtilityTool"
+APP_NAME = "Safekeep"
+
+# The product's name before the Safekeep rename. Read only by utils/migrate.py
+# (and main.py's one-time QSettings copy) to find data written under it.
+LEGACY_APP_NAME = "UtilityTool"
 
 _UNITS = ("B", "KB", "MB", "GB", "TB", "PB")
 
@@ -28,14 +32,22 @@ def app_dir() -> str:
     Every file the app stores (backup jobs, the activity log, the icon cache)
     lives here rather than beside the code, so it survives a reinstall.
     """
-    if sys.platform == "darwin":
-        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support", APP_NAME)
-    elif os.name == "nt":
-        base = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~\\AppData\\Roaming"), APP_NAME)
-    else:
-        base = os.path.join(os.path.expanduser("~/.config"), APP_NAME)
+    base = app_dir_for(APP_NAME)
     os.makedirs(base, exist_ok=True)
     return base
+
+
+def app_dir_for(name: str) -> str:
+    """Where the app-data directory for product `name` is, without creating it.
+
+    Separate from `app_dir()` so the migration can look for the pre-rename
+    directory without conjuring an empty one into existence.
+    """
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", name)
+    if os.name == "nt":
+        return os.path.join(os.getenv("APPDATA") or os.path.expanduser("~\\AppData\\Roaming"), name)
+    return os.path.join(os.path.expanduser("~/.config"), name)
 
 
 def _is_link_like(entry: os.DirEntry) -> bool:
