@@ -485,6 +485,10 @@ class RestoreRow(QtWidgets.QWidget):
 
         self.restore_btn = QtWidgets.QPushButton("Restore...")
         self.restore_btn.setObjectName("Secondary")
+        # Every row's button reads "Restore..."; the job name tells a screen
+        # reader which one this is, as fix_btn's name does above.
+        self.restore_btn.setAccessibleName(
+            f"Restore {job.get('name', 'this job')} from its last backup")
         # Nothing to restore from until a version exists on disk.
         self.restore_btn.setEnabled(bool(changes.get("ok")))
         self.restore_btn.clicked.connect(lambda: self.restore_requested.emit(self.job))

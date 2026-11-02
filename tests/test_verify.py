@@ -407,3 +407,75 @@ def test_a_real_run_after_legacy_versions_prunes_them_and_keeps_itself(tree):
     assert result["ok"], result["message"]
     assert result["pruned"] == ["20200101-000000"]
     assert backup_utils.verified_versions(job) == [result["version"]]
+
+
+# ---------------------------------------------------------------------------
+# Review-gate fixes: same-second runs, read-only prune, Windows attributes
+# ---------------------------------------------------------------------------
+
+class _FrozenClock(backup_utils.datetime):
+    """Every run starts in the same second."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return backup_utils.datetime(2026, 11, 2, 12, 0, 0)
+
+
+def test_a_second_run_in_the_same_second_never_demotes_the_first(tree, monkeypatch):
+    job, _, _ = tree
+    job["retention"] = 5
+    monkeypatch.setattr(backup_utils, "datetime", _FrozenClock)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    first = backup_utils.run_job(job)
+    assert first["ok"], first["message"]
+    second = backup_utils.run_job(job)
+    assert not second["ok"] and "same moment" in second["message"]
+    # The first run's version is still verified and nothing else was left.
+    assert backup_utils.verified_versions(job) == [first["version"]]
+    assert sorted(os.listdir(backup_utils.job_root(job))) == [
+        first["version"], first["version"] + backup_utils.MANIFEST_SUFFIX]
+
+
+def test_back_to_back_runs_get_distinct_verified_versions(tree):
+    job, _, _ = tree
+    job["retention"] = 5
+    first = backup_utils.run_job(job)
+    second = backup_utils.run_job(job)
+    assert first["ok"] and second["ok"], (first["message"], second["message"])
+    assert first["version"] != second["version"]
+    assert backup_utils.verified_versions(job) == [first["version"], second["version"]]
+
+
+def test_a_read_only_file_does_not_stop_retention(tree):
+    job, source, _ = tree
+    locked = source / "locked.txt"
+    locked.write_text("ro", encoding="utf-8")
+    os.chmod(locked, 0o444)
+    try:
+        first = backup_utils.run_job(job)
+        time.sleep(1.1)
+        second = backup_utils.run_job(job)
+    finally:
+        os.chmod(locked, 0o666)
+    assert first["ok"] and second["ok"]
+    assert second["pruned"] == [first["version"]]
+    assert backup_utils.version_names(job) == [second["version"]]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file attributes")
+def test_hidden_and_system_attributes_survive_the_copy(tree):
+    import ctypes
+    job, source, _ = tree
+    hidden = str(source / "a.txt")
+    ctypes.windll.kernel32.SetFileAttributesW(hidden, 0x2 | 0x4)  # HIDDEN | SYSTEM
+    try:
+        result = backup_utils.run_job(job)
+        assert result["ok"], result["message"]
+        copied = os.path.join(backup_utils.version_path(job, result["version"]), "a.txt")
+        assert os.stat(copied).st_file_attributes & 0x6 == 0x6
+        # Positive control: an ordinary file is not made hidden.
+        plain = os.path.join(backup_utils.version_path(job, result["version"]),
+                             "Nested", "Deeper", "c.txt")
+        assert os.stat(plain).st_file_attributes & 0x6 == 0
+    finally:
+        ctypes.windll.kernel32.SetFileAttributesW(hidden, 0x80)

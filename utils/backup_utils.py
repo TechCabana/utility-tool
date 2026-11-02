@@ -35,9 +35,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
@@ -307,15 +309,18 @@ def version_names(job: Dict) -> List[str]:
 
 
 def latest_version(job: Dict) -> Optional[str]:
+    """The newest version stamp of `job` (verified or not), or None."""
     names = version_names(job)
     return names[-1] if names else None
 
 
 def version_path(job: Dict, name: str) -> str:
+    """The folder holding version `name` of `job`."""
     return os.path.join(job_root(job), name)
 
 
 def version_datetime(name: str) -> Optional[datetime]:
+    """The local time a version stamp names, or None if it is not one."""
     try:
         return datetime.strptime(name, VERSION_FORMAT)
     except ValueError:
@@ -429,7 +434,7 @@ def prune_versions(job: Dict) -> List[str]:
         except OSError:
             continue
         try:
-            shutil.rmtree(version_path(job, name))
+            _rmtree(version_path(job, name))
         except OSError:
             continue
         removed.append(name)
@@ -517,6 +522,52 @@ def tree_totals(root: str) -> Tuple[int, int]:
 CHUNK = 1024 * 1024
 
 
+# Windows file attributes `_hash_copy` carries over. copy2 (CopyFile2) kept
+# these for free; copystat only carries read-only (through chmod), so without
+# this a backed-up hidden or system file came back as an ordinary one.
+# Compressed/encrypted/sparse are not settable through SetFileAttributesW and
+# are deliberately absent. Alternate data streams are NOT copied either.
+_KEPT_ATTRIBUTES = (0x1 | 0x2 | 0x4 | 0x20 | 0x2000)  # RO, HIDDEN, SYSTEM, ARCHIVE, NOT_CONTENT_INDEXED
+_FILE_ATTRIBUTE_NORMAL = 0x80
+
+
+def _copy_windows_attributes(src: str, dst: str) -> None:
+    """Give `dst` the hidden/system/archive/read-only bits `src` has.
+
+    Windows only; a no-op elsewhere. Best effort, like copy2's own metadata
+    copy: a failure here leaves a correct copy with plainer attributes, which
+    is not a reason to fail the file.
+    """
+    if os.name != "nt":
+        return
+    try:
+        wanted = os.stat(src).st_file_attributes & _KEPT_ATTRIBUTES
+        import ctypes
+        ctypes.windll.kernel32.SetFileAttributesW(dst, wanted or _FILE_ATTRIBUTE_NORMAL)
+    except (OSError, AttributeError):
+        pass
+
+
+def _make_writable_and_retry(func, path, _error) -> None:
+    """`shutil.rmtree` error hook: clear read-only, then retry once.
+
+    Windows refuses to delete a read-only file, and a backup keeps the
+    source's read-only bit, so without this one read-only file in the source
+    made every older version of the job undeletable and retention silently
+    stopped working. A second failure propagates to the caller.
+    """
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def _rmtree(path: str) -> None:
+    """`shutil.rmtree` that also removes read-only files. Raises OSError."""
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_make_writable_and_retry)
+    else:  # onexc does not exist before 3.12; onerror is deprecated from it
+        shutil.rmtree(path, onerror=_make_writable_and_retry)
+
+
 def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
     """Copy `src` to `dst`, hashing the bytes as they pass through.
 
@@ -540,6 +591,7 @@ def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
                     fdst.write(chunk)
                     size += len(chunk)
             shutil.copystat(src, dst)
+            _copy_windows_attributes(src, dst)
         except BaseException:
             try:
                 os.remove(dst)
@@ -659,8 +711,27 @@ def volume_id(path: str) -> str:
     there the check is best-effort and unverified: it can wrongly block a
     legitimate remount (re-save the job to re-record it) and is not relied on
     to catch every swapped drive. Raises OSError.
+
+    On Windows only the low 32 bits are kept: that is the serial `vol`
+    prints, and the only part every Python agrees on. 3.12+ reports NTFS's
+    64-bit serial in `st_dev` while earlier versions (README says 3.9+)
+    report the 32-bit one, so the raw value recorded under one interpreter
+    would read as "a different drive" under the other and block every run.
     """
-    return str(os.stat(path).st_dev)
+    dev = os.stat(path).st_dev
+    return str(dev & 0xFFFFFFFF if os.name == "nt" else dev)
+
+
+def _same_volume(recorded: str, current: str) -> bool:
+    """True if a recorded volume id names the `current` volume.
+
+    Also accepts a recorded raw 64-bit Windows serial (stored before
+    `volume_id` masked it) whose low 32 bits match.
+    """
+    if recorded == current:
+        return True
+    return (os.name == "nt" and recorded.isdigit() and current.isdigit()
+            and int(recorded) & 0xFFFFFFFF == int(current))
 
 
 def target_volume(target: str) -> str:
@@ -734,7 +805,7 @@ def preflight(job: Dict,
             current = volume(anchor)
         except OSError as exc:
             return f"Could not identify the target drive: {exc}"
-        if current != recorded:
+        if not _same_volume(str(recorded), current):
             return ("The backup drive is not the same drive as before. Connect "
                     "the original drive or edit the job.")
     return None
@@ -817,11 +888,51 @@ def _verify_copy(partial: str, manifest: str,
 
 def _discard(partial: str, manifest_tmp: str) -> None:
     """Remove an abandoned run's `.partial` folder and its temp manifest."""
-    shutil.rmtree(partial, ignore_errors=True)
+    try:
+        _rmtree(partial)
+    except OSError:
+        pass  # best effort: a leftover .partial is never listed as a version
     try:
         os.remove(manifest_tmp)
     except OSError:
         pass
+
+
+# How many one-second stamps `_claim_stamp` tries before giving up.
+CLAIM_ATTEMPTS = 3
+
+
+def _claim_stamp(root: str, job: Dict) -> Optional[str]:
+    """Reserve a version stamp no other run of this job holds; None if none.
+
+    Version names have one-second resolution, so two runs in the same second
+    (a quick run then Run now again, or the scheduled task firing during a
+    manual run) used to share a `.partial` folder and a manifest -- and the
+    loser's cleanup deleted the winner's verified manifest, silently demoting
+    a good version to unverified. `os.mkdir` of the `.partial` folder is the
+    atomic claim; a stamp whose version or manifest already exists is
+    released and the next second tried. Raises OSError if the target cannot
+    be written.
+
+    ponytail: per-stamp claim only. Two runs of one job in different seconds
+    still run side by side (each in its own folder, both verified); a per-job
+    lock is the upgrade if that ever needs preventing.
+    """
+    for attempt in range(CLAIM_ATTEMPTS):
+        if attempt:
+            time.sleep(1)
+        stamp = datetime.now().strftime(VERSION_FORMAT)
+        partial = os.path.join(root, stamp + ".partial")
+        try:
+            os.mkdir(partial)
+        except FileExistsError:
+            continue
+        if (os.path.exists(os.path.join(root, stamp))
+                or os.path.exists(manifest_path(job, stamp))):
+            os.rmdir(partial)
+            continue
+        return stamp
+    return None
 
 
 def run_job(job: Dict,
@@ -866,16 +977,20 @@ def run_job(job: Dict,
         return {"ok": False, "message": problem}
     source, target = job["source"], job["target"]
 
-    stamp = datetime.now().strftime(VERSION_FORMAT)
     root = job_root(job)
+    try:
+        os.makedirs(root, exist_ok=True)
+        stamp = _claim_stamp(root, job)
+    except OSError as exc:
+        return {"ok": False, "message": f"Target folder is not writable: {exc}"}
+    if stamp is None:
+        return {"ok": False, "message": (
+            "Another backup of this job is starting at the same moment, so this "
+            "one did not start. Nothing was written; try again.")}
     partial = os.path.join(root, stamp + ".partial")
     final = os.path.join(root, stamp)
     manifest = manifest_path(job, stamp)
     manifest_tmp = manifest + ".tmp"
-    try:
-        os.makedirs(root, exist_ok=True)
-    except OSError as exc:
-        return {"ok": False, "message": f"Target folder is not writable: {exc}"}
 
     if on_phase is not None:
         on_phase("copying")
@@ -1234,6 +1349,7 @@ def launchd_plist(job: Dict) -> Optional[str]:
 
 
 def _xml_escape(text: str) -> str:
+    """Escape `text` for a plist <string> element."""
     return (text.replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;"))
 
@@ -1262,10 +1378,12 @@ def _launchd_register(job: Dict) -> Tuple[bool, str]:
 
 
 def _launchd_domain() -> str:
+    """The per-user launchd domain the agents are loaded into."""
     return f"gui/{os.getuid()}" if hasattr(os, "getuid") else "gui/501"
 
 
 def _launchd_unregister(job_id: str, legacy: bool = False) -> Tuple[bool, str]:
+    """Unload the launchd agent for `job_id` and delete its plist."""
     ok, output = _launchctl(["bootout", _launchd_domain(), launchd_label(job_id, legacy)])
     try:
         os.remove(launchd_plist_path(job_id, legacy))
@@ -1275,6 +1393,7 @@ def _launchd_unregister(job_id: str, legacy: bool = False) -> Tuple[bool, str]:
 
 
 def _launchd_exists(job_id: str, legacy: bool = False) -> bool:
+    """Whether a plist for `job_id` is installed."""
     return os.path.isfile(launchd_plist_path(job_id, legacy))
 
 

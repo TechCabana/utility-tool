@@ -237,8 +237,13 @@ flowchart LR
 3. Run Now, Restore and the changes-since measurement each start a `QThread` running
    `BackupWorker`, which calls the pure functions in `utils/backup_utils.py` and emits progress
    signals the tab renders as a progress bar.
-4. A run copies the source into `<target>/<job id>/<timestamp>/` and prunes versions beyond
-   the number kept. A restore copies the latest version into a new folder the user picks; it
+4. A run first checks it can succeed (pre-flight: source present and non-empty, target not
+   inside the source, enough free space, the same target drive as before), then copies the
+   source into `<target>/<job id>/<timestamp>.partial/`, hashing every file into a
+   `<timestamp>.manifest.jsonl` beside it. Every copied file is re-read and checked against
+   the manifest before the folder is renamed to `<timestamp>/`; a mismatch fails the run and
+   prunes nothing. Versions beyond the number kept are then pruned, but the newest verified
+   version is never deleted. A restore copies the latest version into a new folder the user picks; it
    never writes over the live source.
 
 <details>
@@ -269,6 +274,7 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
     "schedule": "daily",
     "at": "20:00",
     "retention": 5,
+    "target_volume": "1754806083",
     "last_run": "2026-11-02T20:00:04",
     "last_result": "ok"
   }
@@ -281,6 +287,11 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `schedule` | string | `manual`, `daily` or `weekly` |
 | `at` | string | 24-hour run time, `HH:MM` |
 | `retention` | int | Versions to keep; older ones are deleted after a run |
+| `target_volume` | string | The target drive's volume id, recorded on save or first run; a run onto a different drive is refused |
+
+The file is replaced atomically on every save, and the previous good copy is kept as
+`backup_jobs.json.bak`. A damaged file is reported as damaged, never read as "no jobs"; the
+Backup screen offers to restore the `.bak`, and the headless `--run-backup-job` path exits 3.
 | `last_result` | string | `ok`, or `failed: <message>` |
 
 </details>
@@ -317,8 +328,11 @@ utility-tool/
     ├── test_backup_utils.py
     ├── test_activity.py
     ├── test_fs_utils.py
+    ├── test_jobs_file.py
     ├── test_migrate.py
-    └── test_tokens.py
+    ├── test_preflight.py
+    ├── test_tokens.py
+    └── test_verify.py
 ```
 
 | Path | Role |
@@ -341,8 +355,9 @@ pytest tests/
 ```
 
 Covers the Qt-free layer only (`utils/backup_utils.py`, `utils/activity.py`,
-`utils/fs_utils.py`, `utils/migrate.py` and the design tokens in `styles/tokens.py`), using real `tmp_path` files,
-no mocking. 97 tests, all passing. The Qt-driven `tabs/` layer (including the Backup screen's
+`utils/fs_utils.py`, `utils/migrate.py` and the design tokens in `styles/tokens.py`), using real `tmp_path` files;
+the scheduler, free space and volume identity are injected rather than touched. 163 tests,
+all passing. The Qt-driven `tabs/` layer (including the Backup screen's
 worker thread and UI) has no automated coverage and stays manually
 verified, per the [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps
 above.

@@ -232,11 +232,19 @@ class FakeSettings:
 
 
 def test_settings_copy_into_an_empty_new_store():
-    old = FakeSettings({"ui/theme": "dark", "ui/last_tab": 1})
+    old = FakeSettings({"ui/theme": "dark", "ui/geometry": b"\x01\x02"})
     new = FakeSettings()
-    assert sorted(migrate.migrate_settings(old, new)) == ["ui/last_tab", "ui/theme"]
-    assert new.values == {"ui/theme": "dark", "ui/last_tab": 1} and new.synced
-    assert old.values == {"ui/theme": "dark", "ui/last_tab": 1}
+    assert sorted(migrate.migrate_settings(old, new)) == ["ui/geometry", "ui/theme"]
+    assert new.values == {"ui/theme": "dark", "ui/geometry": b"\x01\x02"} and new.synced
+    assert old.values == {"ui/theme": "dark", "ui/geometry": b"\x01\x02"}
+
+
+def test_last_tab_is_not_migrated_because_the_sidebar_indexes_changed():
+    # Old index 2 was File Tools; in Safekeep it is Settings.
+    old = FakeSettings({"ui/theme": "dark", "ui/last_tab": 2})
+    new = FakeSettings()
+    assert migrate.migrate_settings(old, new) == ["ui/theme"]
+    assert "ui/last_tab" not in new.values
 
 
 def test_settings_never_replace_a_value_already_chosen_in_the_new_app():

@@ -31,6 +31,9 @@ from utils.fs_utils import LEGACY_APP_NAME, app_dir, app_dir_for
 DATA_MARKER = ".migrated-data"
 TASKS_MARKER = ".migrated-tasks"
 
+# Pre-rename settings whose meaning changed, so copying them would mislead.
+NOT_MIGRATED_SETTINGS = ("ui/last_tab",)
+
 
 def _mark(directory: str, marker: str) -> None:
     """Record that a migration step finished in `directory`."""
@@ -158,7 +161,10 @@ def migrate_settings(old, new) -> List[str]:
     """
     if new.allKeys():
         return []
-    keys = list(old.allKeys())
+    # ui/last_tab is a sidebar index, and the sidebar lost three of its five
+    # entries in the rename: an old 1 (Image Tools) would open on Backup and
+    # an old 2 (File Tools) on Settings. Not carried over; Home is the default.
+    keys = [key for key in old.allKeys() if key not in NOT_MIGRATED_SETTINGS]
     for key in keys:
         new.setValue(key, old.value(key))
     new.sync()

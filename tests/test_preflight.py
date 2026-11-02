@@ -233,3 +233,19 @@ def test_nearest_existing_ancestor_walks_up_to_a_real_folder(tmp_path):
     deep = tmp_path / "a" / "b" / "c"
     assert backup_utils.nearest_existing_ancestor(str(deep)) == str(tmp_path)
     assert backup_utils.nearest_existing_ancestor(str(tmp_path)) == str(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume serials")
+def test_windows_volume_id_is_the_32_bit_serial_every_python_reports(tmp_path):
+    raw = os.stat(str(tmp_path)).st_dev
+    assert backup_utils.volume_id(str(tmp_path)) == str(raw & 0xFFFFFFFF)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume serials")
+def test_a_recorded_64_bit_serial_still_matches_its_volume(tree, monkeypatch):
+    job, _, _ = tree
+    job["target_volume"] = str((0x8A68984A << 32) | 0x68983743)
+    monkeypatch.setattr(backup_utils, "volume_id", lambda path: str(0x68983743))
+    assert backup_utils.preflight(job) is None
+    monkeypatch.setattr(backup_utils, "volume_id", lambda path: str(0x11111111))
+    assert "not the same drive" in backup_utils.preflight(job)
