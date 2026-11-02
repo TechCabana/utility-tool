@@ -4,10 +4,8 @@ from pathlib import Path
 from PySide6 import QtWidgets, QtCore, QtGui
 
 from styles import tokens
+from tabs.backup_tab import BackupTab
 from tabs.home_tab import HomeTab
-from tabs.image_tab import ImageTab
-from tabs.file_tab import FileTab
-from tabs.disk_tab import DiskTab
 from tabs.settings_tab import SettingsTab
 from widgets import icons
 from widgets.motion import fade_in, motion_enabled
@@ -28,10 +26,8 @@ APP_NAME = "UtilityTool"
 # apart the way a hand-numbered second list does.
 NAV = (
     ("Home", "house", 0),
-    ("Image Tools", "image", 1),
-    ("File Tools", "files", 2),
-    ("Disk", "hard-drive", 3),
-    ("Settings", "settings", 4),
+    ("Backup", "hard-drive", 1),
+    ("Settings", "settings", 2),
 )
 
 
@@ -81,7 +77,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stacked = QtWidgets.QStackedWidget()
         self.home_tab = HomeTab()
         self.settings_tab = SettingsTab(self.settings)
-        for page in (self.home_tab, ImageTab(), FileTab(), DiskTab(), self.settings_tab):
+        for page in (self.home_tab, BackupTab(), self.settings_tab):
             self.stacked.addWidget(page)
         root.addWidget(self.stacked, 1)
 
@@ -117,8 +113,8 @@ class MainWindow(QtWidgets.QMainWindow):
         version.setObjectName("AppVersion")
         layout.addWidget(version)
 
-        # A button group so the five entries are announced as one selection
-        # rather than five unrelated checkable buttons.
+        # A button group so the entries are announced as one selection
+        # rather than unrelated checkable buttons.
         self.nav_group = QtWidgets.QButtonGroup(self)
         self.nav_group.setExclusive(True)
 

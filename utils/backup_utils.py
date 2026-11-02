@@ -4,14 +4,13 @@ comparison, restore, and the Windows Task Scheduler registration behind the
 "schedule" field.
 
 Qt-free by design (CLAUDE.md §3/§8) -- plain paths and plain dicts in, plain
-dicts out. `tabs/disk_tab.py` runs the long ones from a QThread worker and
+dicts out. `tabs/backup_tab.py` runs the long ones from a QThread worker and
 renders what comes back; nothing here knows that. `main.py --run-backup-job`
 calls `run_job` directly, with no QApplication at all, which is what the
 scheduled task invokes.
 
-Storage mirrors `utils/presets.py` exactly -- one JSON file in the OS
-app-data directory, via that module's own `app_dir()`. Unlike presets there
-is no first-run default set: a machine with no backup jobs has none, and the
+Storage is one JSON file in the OS app-data directory, via
+`utils/fs_utils.app_dir()`. There is no first-run default set: a machine with no backup jobs has none, and the
 Backup screen's EmptyState is the correct rendering of that.
 
 **Scheduling is handed to the OS, and the OS differs.** Configuration lives
@@ -41,8 +40,7 @@ import uuid
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
-from utils.disk_utils import _is_link_like
-from utils.presets import app_dir
+from utils.fs_utils import _is_link_like, app_dir
 
 JOBS_FILE = os.path.join(app_dir(), "backup_jobs.json")
 
@@ -74,7 +72,7 @@ class BackupAborted(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Job storage (same shape as utils/presets.py)
+# Job storage
 # ---------------------------------------------------------------------------
 
 def new_job(name: str, source: str, target: str, schedule: str = "daily",
@@ -211,7 +209,7 @@ def prune_versions(job: Dict) -> List[str]:
 def _ignore_links(directory: str, names) -> set:
     """`shutil.copytree`'s ignore hook, dropping symlinks and junctions.
 
-    Reuses `disk_utils._is_link_like` rather than a second link predicate:
+    Reuses `fs_utils._is_link_like` rather than a second link predicate:
     `is_symlink()` is False for a Windows junction, and the reparse-point
     attribute alone wrongly catches cloud-sync roots, so the name-surrogate
     test lives in exactly one place. Copying a junction that points at an
@@ -230,7 +228,7 @@ def walk_tree(root: str) -> Tuple[Dict[str, Tuple[int, float]], int]:
     Relative paths are normalised with forward slashes and lowercased case
     only for the *key*, so a source and its backup compare correctly on
     Windows' case-insensitive filesystem. Unreadable entries are counted, not
-    raised -- same contract as `disk_utils.folder_size`.
+    raised.
     """
     files: Dict[str, Tuple[int, float]] = {}
     skipped = 0

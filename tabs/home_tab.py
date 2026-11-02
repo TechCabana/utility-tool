@@ -63,9 +63,8 @@ class HomeTab(QtWidgets.QWidget):
     switch_requested = QtCore.Signal(int)
 
     ENTRIES = (
-        ("Image Tools", "Compress, resize and convert a batch of images.", "image", 1),
-        ("File Tools", "Rename, move, copy or delete a batch of files.", "files", 2),
-        ("Disk", "See what is using space, clean up, and back folders up.", "hard-drive", 3),
+        ("Back up", "Copy folders to another drive on a schedule, and restore them.",
+         "hard-drive", 1),
     )
 
     def __init__(self):
@@ -77,7 +76,7 @@ class HomeTab(QtWidgets.QWidget):
 
         layout.addWidget(PageHeader(
             "UtilityTool",
-            "Batch tools for the files already on this machine. Nothing is uploaded."))
+            "Back up the folders on this machine to another drive. Nothing is uploaded."))
 
         cards = QtWidgets.QHBoxLayout()
         cards.setSpacing(tokens.SPACE_FIELD)
@@ -87,6 +86,9 @@ class HomeTab(QtWidgets.QWidget):
             entry = EntryCard(title, description, icon_name)
             entry.clicked.connect(lambda i=index: self.switch_requested.emit(i))
             cards.addWidget(entry, 1)
+        # Keeps a lone entry card at the width it had beside its old siblings
+        # instead of stretching it across the whole page.
+        cards.addStretch(2)
 
         self._activity_card, self._activity_body = card(
             "Recent activity", "The last batches this app ran, newest first.")
@@ -98,7 +100,7 @@ class HomeTab(QtWidgets.QWidget):
 
         self._empty = EmptyState(
             title="Nothing run yet",
-            hint="Batches you run from Image Tools, File Tools or Disk are listed here.",
+            hint="Recent batches this app has run are listed here.",
             icon="clock",
         )
         self._activity_body.addWidget(self._empty)

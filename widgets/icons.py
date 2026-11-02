@@ -31,7 +31,7 @@ import weakref
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from utils.presets import app_dir
+from utils.fs_utils import app_dir
 
 ICON_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "icons")
 CACHE_DIR = os.path.join(app_dir(), "icon-cache")

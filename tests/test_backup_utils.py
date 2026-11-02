@@ -3,11 +3,8 @@
 # retention pruning, the changes-since comparison, restore, and the schtasks
 # argument builder.
 #
-# Its own file rather than an extension of test_disk_utils.py: that suite is
-# already 700 lines about scanning and hashing, and this module is about
-# writing files somewhere else. Same convention as tests/test_presets.py for
-# the storage half -- JOBS_FILE is monkeypatched to tmp_path so a test run
-# never touches the real user's backup_jobs.json.
+# JOBS_FILE is monkeypatched to tmp_path so a test run never touches the real
+# user's backup_jobs.json.
 #
 # The schtasks calls are tested through `schtasks_args`, which builds the
 # argv without running it. Registering a real scheduled task from a test
