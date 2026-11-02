@@ -536,6 +536,10 @@ class BackupTab(QtWidgets.QWidget):
         self.backup_worker: Optional[BackupWorker] = None
         self.jobs: List[dict] = []
         self._changes: dict = {}
+        # True while the jobs file is damaged: the tables are replaced by a
+        # notice, and nothing may be written until it is restored.
+        self._jobs_damaged = False
+        self._can_restore_jobs = False   # a usable .bak copy exists
         self._backup_loaded = False
         self._backup_done = None      # the handler for the run in flight
         self._remeasure = False       # a backup just ran; its drift is stale
@@ -640,6 +644,21 @@ class BackupTab(QtWidgets.QWidget):
         )
         jv.addWidget(self.jobs_empty)
 
+        # Shown instead of the tables when backup_jobs.json is damaged. Same
+        # EmptyState the empty case uses, with its one action: bring back the
+        # last good copy. Hidden until refresh_backup() meets a bad file.
+        self.jobs_damaged = EmptyState(
+            title="The backup jobs file is damaged",
+            hint="Your jobs could not be read, so nothing has been changed or "
+                 "run. Restoring brings back the last good copy, which may "
+                 "not include your most recent edit; the damaged file is "
+                 "kept beside it, not deleted.",
+            cta_text="Restore from backup copy",
+        )
+        self.jobs_damaged.cta.clicked.connect(self.restore_jobs_file)
+        self.jobs_damaged.setVisible(False)
+        jv.addWidget(self.jobs_damaged)
+
         self.backup_bar = QtWidgets.QProgressBar()
         self.backup_bar.setObjectName("WithText")
         self.backup_bar.setVisible(False)
@@ -740,8 +759,18 @@ class BackupTab(QtWidgets.QWidget):
         return header
 
     def refresh_backup(self):
-        """Re-read the jobs file and rebuild both tables."""
-        self.jobs = backup_utils.load_jobs()
+        """Re-read the jobs file and rebuild both tables.
+
+        A damaged file is not "no jobs": the tables give way to a notice with
+        a restore action instead, and nothing is written.
+        """
+        try:
+            self.jobs = backup_utils.load_jobs()
+        except backup_utils.JobsFileCorrupt as exc:
+            self._show_jobs_damaged(exc)
+            return
+        self._jobs_damaged = False
+        self.jobs_damaged.setVisible(False)
         self._clear_layout(self.jobs_layout)
         self._clear_layout(self.restore_layout)
 
@@ -770,6 +799,40 @@ class BackupTab(QtWidgets.QWidget):
             self.restore_layout.addWidget(row)
         self._set_backup_controls(enabled=self.backup_thread is None)
 
+    def _show_jobs_damaged(self, exc: "backup_utils.JobsFileCorrupt"):
+        """Swap both tables for the damaged-file notice and say why."""
+        self.jobs = []
+        self._changes = {}
+        self._jobs_damaged = True
+        self._can_restore_jobs = exc.has_backup
+        self._clear_layout(self.jobs_layout)
+        self._clear_layout(self.restore_layout)
+        for widget in (self.jobs_empty, self.job_header,
+                       self.restore_empty, self.restore_header):
+            widget.setVisible(False)
+        self.jobs_damaged.setVisible(True)
+        self._set_backup_controls(enabled=self.backup_thread is None)
+        self._say(str(exc), ok=False)
+
+    def restore_jobs_file(self):
+        """Put the last good copy of the jobs file back, then reload."""
+        if self.backup_thread is not None:
+            return
+        try:
+            count = backup_utils.restore_jobs_from_backup()
+        except (backup_utils.JobsFileCorrupt, OSError) as exc:
+            self._say(f"{exc} Nothing was changed.", ok=False)
+            return
+        message = (f"Restored {count} job(s) from the backup copy. The damaged "
+                   "file was kept beside it with a .corrupt- name.")
+        self._jobs_damaged = False
+        self._backup_notice = message
+        self.refresh_backup()
+        self.refresh_changes()
+        if self.backup_thread is None:   # no worker started to show it later
+            self._backup_notice = ""
+            self._say(message)
+
     def _clear_layout(self, layout: QtWidgets.QLayout):
         while layout.count():
             item = layout.takeAt(0)
@@ -787,8 +850,9 @@ class BackupTab(QtWidgets.QWidget):
         after each operation, so unlocking only has to release the two
         screen-level buttons.
         """
-        self.job_add_btn.setEnabled(enabled)
+        self.job_add_btn.setEnabled(enabled and not self._jobs_damaged)
         self.restore_refresh_btn.setEnabled(enabled)
+        self.jobs_damaged.cta.setEnabled(enabled and self._can_restore_jobs)
         if enabled:
             return
         for host in (self.jobs_host, self.restore_host):
@@ -823,7 +887,16 @@ class BackupTab(QtWidgets.QWidget):
         not be scheduled is still a usable job (Run Now works), and saying so
         is more useful than one combined "failed".
         """
-        backup_utils.save_job(job)
+        try:
+            backup_utils.save_job(job)
+        except backup_utils.JobsFileCorrupt as exc:
+            # Nothing was written; the job is not stored or scheduled.
+            self.refresh_backup()
+            self._say(f"\"{job['name']}\" was not saved. {exc}", ok=False)
+            return
+        except OSError as exc:
+            self._say(f"\"{job['name']}\" was not saved: {exc}", ok=False)
+            return
         ok, detail = backup_utils.sync_task(job)
         message = f"{verb} job \"{job['name']}\"."
         if job.get("schedule") == "manual":
@@ -842,6 +915,11 @@ class BackupTab(QtWidgets.QWidget):
         Leaving the task behind would run a backup for a job the user
         believes they deleted, so the two are removed in one action.
         """
+        try:
+            backup_utils.load_jobs()   # before anything is unscheduled
+        except backup_utils.JobsFileCorrupt:
+            self.refresh_backup()
+            return
         if not ConfirmDialog.ask(
             self,
             "Remove this backup job?",
@@ -852,7 +930,13 @@ class BackupTab(QtWidgets.QWidget):
         ):
             return
         task_ok, task_detail = backup_utils.unregister_task(job["id"])
-        backup_utils.remove_job(job["id"])
+        try:
+            backup_utils.remove_job(job["id"])
+        except (backup_utils.JobsFileCorrupt, OSError) as exc:
+            self.refresh_backup()
+            self._say(f"\"{job.get('name')}\" was not removed from the "
+                      f"list: {exc}", ok=False)
+            return
         self._changes.pop(job["id"], None)
         name = job.get("name")
         if job.get("schedule") == "manual":
@@ -920,7 +1004,11 @@ class BackupTab(QtWidgets.QWidget):
         """
         if self.backup_thread is not None:
             return
-        jobs = backup_utils.load_jobs()
+        try:
+            jobs = backup_utils.load_jobs()
+        except backup_utils.JobsFileCorrupt:
+            self.refresh_backup()   # shows the damaged-file notice
+            return
         if not jobs:
             self.refresh_backup()
             return
@@ -982,8 +1070,13 @@ class BackupTab(QtWidgets.QWidget):
         `_backup_notice` so the pass that follows does not overwrite the
         result line the user is reading.
         """
-        backup_utils.record_run(job["id"], result)
         message = result.get("message", "")
+        try:
+            backup_utils.record_run(job["id"], result)
+        except (backup_utils.JobsFileCorrupt, OSError) as exc:
+            self._say(f"{message} The result could not be recorded: {exc}",
+                      ok=False)
+            return
         self._say(message, ok=result.get("ok", False))
         if result.get("ok"):
             self._backup_notice = message

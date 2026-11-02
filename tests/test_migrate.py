@@ -244,3 +244,16 @@ def test_settings_never_replace_a_value_already_chosen_in_the_new_app():
     new = FakeSettings({"ui/theme": "light"})
     assert migrate.migrate_settings(old, new) == []
     assert new.values == {"ui/theme": "light"}
+
+
+def test_migrate_tasks_reports_a_corrupt_jobs_file_instead_of_no_jobs(dirs, tmp_path, monkeypatch):
+    from utils import backup_utils
+    old, new = dirs
+    bad = tmp_path / "bad.json"
+    bad.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(bad))
+    results = migrate.migrate_tasks(old_dir=str(old), new_dir=str(new),
+                                    register=lambda job: pytest.fail("must not register"))
+    assert len(results) == 1 and results[0]["ok"] is False
+    assert "damaged" in results[0]["message"]
+    assert not (new / migrate.TASKS_MARKER).exists()

@@ -85,7 +85,8 @@ def migrate_tasks(jobs: Optional[List[Dict]] = None,
     """Re-register every scheduled job under the new task name, once.
 
     Returns one `{"id", "name", "ok", "message"}` per daily/weekly job; manual
-    jobs have no task and produce nothing. Order per job is the whole point:
+    jobs have no task and produce nothing. A damaged jobs file comes back as a
+    single not-ok result rather than raising or reading as "no jobs". Order per job is the whole point:
     register the new task, and only if that succeeds delete the old one. A
     failed registration leaves the old task in place (the job keeps running
     under its old name) and comes back `ok=False`. A new task that registered
@@ -107,7 +108,15 @@ def migrate_tasks(jobs: Optional[List[Dict]] = None,
     if not os.path.isdir(old_dir) or os.path.exists(os.path.join(new_dir, TASKS_MARKER)):
         return []
 
-    jobs = backup_utils.load_jobs() if jobs is None else jobs
+    if jobs is None:
+        try:
+            jobs = backup_utils.load_jobs()
+        except backup_utils.JobsFileCorrupt as exc:
+            # Not "no jobs": the scheduled tasks cannot be re-registered
+            # until the file is restored. No marker is written, so the step
+            # runs again on the next start.
+            return [{"id": "", "name": backup_utils.JOBS_FILENAME,
+                     "ok": False, "message": str(exc)}]
     register = register or backup_utils.register_task
     legacy_exists = legacy_exists or (lambda job_id: backup_utils.task_exists(job_id, legacy=True))
     remove_legacy = remove_legacy or (lambda job_id: backup_utils.unregister_task(job_id, legacy=True))

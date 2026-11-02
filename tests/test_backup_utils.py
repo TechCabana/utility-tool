@@ -72,16 +72,13 @@ def test_get_and_remove_job():
     assert backup_utils.get_job(job["id"]) is None
 
 
-def test_load_jobs_survives_corrupt_json():
+def test_load_jobs_reports_a_corrupt_file_instead_of_no_jobs():
+    # The old behaviour (return []) let the next save wipe every job; the full
+    # corruption suite lives in tests/test_jobs_file.py.
     with open(backup_utils.JOBS_FILE, "w", encoding="utf-8") as handle:
         handle.write("{not a list")
-    assert backup_utils.load_jobs() == []
-
-
-def test_load_jobs_rejects_a_non_list_document():
-    with open(backup_utils.JOBS_FILE, "w", encoding="utf-8") as handle:
-        json.dump({"jobs": []}, handle)
-    assert backup_utils.load_jobs() == []
+    with pytest.raises(backup_utils.JobsFileCorrupt):
+        backup_utils.load_jobs()
 
 
 # ---------------------------------------------------------------------------

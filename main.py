@@ -308,7 +308,8 @@ def run_backup_job_cli(job_id):
     feature. Everything it needs is in utils/backup_utils.py, which is
     Qt-free by design, so nothing here touches the widget layer.
 
-    Exit codes: 0 backed up, 1 the backup failed, 2 no such job.
+    Exit codes: 0 backed up, 1 the backup failed, 2 no such job, 3 the jobs
+    file is damaged (nothing was run or written).
     """
     from utils import backup_utils
 
@@ -318,12 +319,22 @@ def run_backup_job_cli(job_id):
     # tasks is the GUI's job, and an unattended run must not touch the
     # scheduler.
     migrate.migrate_data()
-    job = backup_utils.get_job(job_id)
+    try:
+        job = backup_utils.get_job(job_id)
+    except backup_utils.JobsFileCorrupt as exc:
+        hint = f" Open {APP_NAME} to restore it." if exc.has_backup else ""
+        print(f"[ERROR] {exc}{hint}", file=sys.stderr)
+        return 3
     if job is None:
         print(f"[ERROR] No backup job with id '{job_id}'")
         return 2
     result = backup_utils.run_job(job)
-    backup_utils.record_run(job_id, result)
+    try:
+        backup_utils.record_run(job_id, result)
+    except backup_utils.JobsFileCorrupt as exc:
+        print(f"[ERROR] The backup ran ({result.get('message', '')}) but its "
+              f"result could not be recorded: {exc}", file=sys.stderr)
+        return 3
     print(("[OK] " if result.get("ok") else "[ERROR] ") + result.get("message", ""))
     return 0 if result.get("ok") else 1
 

@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
@@ -75,6 +76,21 @@ class BackupAborted(Exception):
     """
 
 
+class JobsFileCorrupt(Exception):
+    """The jobs file exists but cannot be trusted as a list of jobs.
+
+    Raised instead of returning an empty list: "no jobs" and "a file I could
+    not read" are different facts, and treating the second as the first made
+    the next save overwrite every job the user had. `has_backup` says whether
+    `restore_jobs_from_backup()` has a usable `.bak` to work from.
+    """
+
+    def __init__(self, message: str, path: str = "", has_backup: bool = False):
+        super().__init__(message)
+        self.path = path
+        self.has_backup = has_backup
+
+
 # ---------------------------------------------------------------------------
 # Job storage
 # ---------------------------------------------------------------------------
@@ -95,28 +111,133 @@ def new_job(name: str, source: str, target: str, schedule: str = "daily",
     }
 
 
-def load_jobs() -> List[Dict]:
-    """Every configured job, or an empty list.
+def _backup_path() -> str:
+    """Where the last good copy of the jobs file is kept."""
+    return JOBS_FILE + ".bak"
 
-    A missing or corrupt file reads as "no jobs" rather than raising: the
-    Backup screen must still open on a machine whose jobs.json was hand-edited
-    into invalid JSON, and an EmptyState is a truthful rendering of a file
-    that cannot be read.
+
+def _read_valid(path: str) -> Tuple[bytes, List[Dict]]:
+    """Read `path` and return (raw bytes, parsed jobs).
+
+    A missing file propagates as FileNotFoundError. Anything else wrong with
+    it -- unreadable, invalid JSON, not a list of objects -- is a ValueError
+    carrying a human reason, so callers decide what that means for them.
     """
     try:
-        with open(JOBS_FILE, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"it cannot be read: {exc}") from exc
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError
+        raise ValueError(f"it is not valid JSON: {exc}") from exc
+    if not isinstance(data, list) or not all(isinstance(j, dict) for j in data):
+        raise ValueError("it is not a list of jobs")
+    return raw, data
+
+
+def _has_usable_backup() -> bool:
+    """True when the `.bak` copy exists and parses as a jobs list."""
+    try:
+        _read_valid(_backup_path())
+    except (FileNotFoundError, ValueError):
+        return False
+    return True
+
+
+def load_jobs() -> List[Dict]:
+    """Every configured job; an empty list only when there is no jobs file.
+
+    A file that exists but cannot be read, is not valid JSON, or is not a list
+    raises `JobsFileCorrupt` -- never `[]`, because the very next `save_job`
+    would then overwrite the damaged file and every job in it with one job.
+    """
+    try:
+        return _read_valid(JOBS_FILE)[1]
+    except FileNotFoundError:
         return []
-    return data if isinstance(data, list) else []
+    except ValueError as exc:
+        has_backup = _has_usable_backup()
+        raise JobsFileCorrupt(
+            f"The backup jobs file '{JOBS_FILE}' is damaged: {exc}. "
+            + ("A backup copy of it is available to restore."
+               if has_backup else "No usable backup copy of it exists."),
+            JOBS_FILE, has_backup) from exc
+
+
+def _write_atomic(path: str, data: bytes) -> None:
+    """Replace `path` with `data` so a crash leaves the old file or the new.
+
+    Written to a temp file in the same directory (os.replace is only atomic
+    within one volume), flushed and fsynced, then swapped in. The temp file is
+    removed on any failure; an OSError comes back naming the file.
+
+    ponytail: a hard kill between mkstemp and os.replace leaves a stray
+    ``*.tmp`` in the app-data directory; sweep them on startup if it ever
+    matters.
+    """
+    fd, temp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                                prefix=os.path.basename(path) + ".",
+                                suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException as exc:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            raise OSError(f"Could not write '{path}': {exc}") from exc
+        raise
 
 
 def save_jobs(jobs: List[Dict]) -> None:
-    with open(JOBS_FILE, "w", encoding="utf-8") as handle:
-        json.dump(jobs, handle, indent=2)
+    """Atomically store `jobs`, keeping the previous good version as `.bak`.
+
+    Refuses (raises `JobsFileCorrupt`) when the file on disk is damaged, so a
+    save can never run on top of one -- and so the `.bak` can never be
+    replaced by a corrupt current file.
+    """
+    load_jobs()  # raises JobsFileCorrupt on a damaged file; [] if missing
+    data = json.dumps(jobs, indent=2).encode("utf-8")
+    try:
+        previous = _read_valid(JOBS_FILE)[0]
+    except FileNotFoundError:
+        previous = None
+    if previous is not None:
+        _write_atomic(_backup_path(), previous)
+    _write_atomic(JOBS_FILE, data)
+
+
+def restore_jobs_from_backup() -> int:
+    """Put the `.bak` copy back as the jobs file; return how many jobs.
+
+    The damaged file is kept first as ``<jobs file>.corrupt-<timestamp>`` so
+    nothing is destroyed. Raises `JobsFileCorrupt` when there is no usable
+    `.bak`, having written nothing.
+    """
+    try:
+        raw, jobs = _read_valid(_backup_path())
+    except (FileNotFoundError, ValueError) as exc:
+        raise JobsFileCorrupt(
+            f"There is no usable backup copy ('{_backup_path()}') to restore "
+            "the jobs file from.", JOBS_FILE, False) from exc
+    if os.path.exists(JOBS_FILE):
+        kept = f"{JOBS_FILE}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+        shutil.copyfile(JOBS_FILE, kept)
+    _write_atomic(JOBS_FILE, raw)
+    return len(jobs)
 
 
 def get_job(job_id: str) -> Optional[Dict]:
+    """The stored job with this id, or None. Raises JobsFileCorrupt."""
     for job in load_jobs():
         if job.get("id") == job_id:
             return job
@@ -126,7 +247,8 @@ def get_job(job_id: str) -> Optional[Dict]:
 def save_job(job: Dict) -> None:
     """Insert or replace `job` by id. Does not touch the OS scheduler --
     `sync_task()` is called separately so a storage failure and a scheduler
-    failure are reported distinctly."""
+    failure are reported distinctly. Raises JobsFileCorrupt, writing nothing,
+    if the stored file is damaged."""
     jobs = load_jobs()
     for index, existing in enumerate(jobs):
         if existing.get("id") == job["id"]:
@@ -138,6 +260,7 @@ def save_job(job: Dict) -> None:
 
 
 def remove_job(job_id: str) -> None:
+    """Drop the job with this id. Raises JobsFileCorrupt if the file is damaged."""
     save_jobs([job for job in load_jobs() if job.get("id") != job_id])
 
 
@@ -369,7 +492,8 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
 
     Re-read from disk rather than mutating the caller's copy: the headless CLI
     and the GUI can both be looking at this file, and the run is the only
-    field either of them writes during a run.
+    field either of them writes during a run. Raises JobsFileCorrupt if the
+    jobs file has been damaged since the run began.
     """
     job = get_job(job_id)
     if job is None:
