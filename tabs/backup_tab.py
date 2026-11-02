@@ -212,23 +212,28 @@ class BackupJobDialog(QtWidgets.QDialog):
         if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", at):
             return self._fail("Run at must be a 24-hour time, e.g. 20:00.")
 
-        # Backing a folder up into itself copies the previous run's copies on
-        # every run, so the target grows without bound and no error is ever
-        # raised. Compared with normcase/abspath because Windows paths differ
-        # in case and separators without differing at all.
-        source_norm = os.path.normcase(os.path.abspath(source))
-        target_norm = os.path.normcase(os.path.abspath(target))
-        if target_norm == source_norm or target_norm.startswith(source_norm + os.sep):
+        # The rule lives in backup_utils so run_job enforces the same one.
+        if backup_utils.target_inside_source(source, target):
             return self._fail("The target cannot be inside the source folder.")
+
+        # Record which drive the target is on, so a later run can tell if a
+        # different one is now mounted there. Kept as-is when only the name or
+        # schedule changed, so editing never re-trusts a swapped drive.
+        if (self.job is None or self.job.get("target") != target
+                or not self.job.get("target_volume")):
+            volume = backup_utils.target_volume(target)
+        else:
+            volume = self.job["target_volume"]
 
         schedule = ("manual", "daily", "weekly")[self.schedule.currentIndex()]
         if self.job is None:
             self.job = backup_utils.new_job(name, source, target, schedule, at,
-                                            self.retention.value())
+                                            self.retention.value(), volume)
         else:
             self.job.update({"name": name, "source": source, "target": target,
                              "schedule": schedule, "at": at,
-                             "retention": self.retention.value()})
+                             "retention": self.retention.value(),
+                             "target_volume": volume})
         self.accept()
 
 

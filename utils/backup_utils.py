@@ -41,7 +41,7 @@ import uuid
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
-from utils.fs_utils import _is_link_like, app_dir
+from utils.fs_utils import _is_link_like, app_dir, human_size
 
 # A path, not a snapshot: nothing is read until load_jobs() opens it, so
 # utils/migrate.py copying a pre-rename jobs file into app_dir() any time
@@ -62,6 +62,11 @@ DEFAULT_RETENTION = 5
 # on NTFS. The tolerance is for filesystems that store a coarser timestamp
 # (FAT32 on a USB backup drive rounds to 2 seconds), not for slack.
 MTIME_TOLERANCE = 2.0
+
+# Pre-flight wants this much free space over the source's total size: the new
+# version is written alongside the old ones (no dedup), and filesystem
+# overhead (cluster rounding, metadata) makes a bare sum of sizes optimistic.
+SPACE_MARGIN = 1.10
 
 # Windows only: keep schtasks' console window from flashing over the app.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -96,8 +101,14 @@ class JobsFileCorrupt(Exception):
 # ---------------------------------------------------------------------------
 
 def new_job(name: str, source: str, target: str, schedule: str = "daily",
-            at: str = "20:00", retention: int = DEFAULT_RETENTION) -> Dict:
-    """A job dict with a fresh id. Nothing is written to disk here."""
+            at: str = "20:00", retention: int = DEFAULT_RETENTION,
+            target_volume: str = "") -> Dict:
+    """A job dict with a fresh id. Nothing is written to disk here.
+
+    `target_volume` is the identity of the drive `target` was on when the job
+    was set up (see `target_volume()`); "" means not recorded yet, and the
+    first successful run records it.
+    """
     return {
         "id": uuid.uuid4().hex[:8],
         "name": name,
@@ -106,6 +117,7 @@ def new_job(name: str, source: str, target: str, schedule: str = "daily",
         "schedule": schedule if schedule in SCHEDULES else "manual",
         "at": at,
         "retention": max(1, int(retention)),
+        "target_volume": target_volume,
         "last_run": "",
         "last_result": "",
     }
@@ -426,6 +438,131 @@ def copy_tree(source: str, destination: str,
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight: refuse to start a run that cannot succeed or could do harm
+# ---------------------------------------------------------------------------
+
+def target_inside_source(source: str, target: str) -> bool:
+    """True if `target` is `source` or lies anywhere beneath it.
+
+    Backing a folder up into itself copies the previous run's copies on every
+    run, so the target grows without bound and no error is ever raised. Both
+    paths are resolved (`realpath`, so a junction cannot hide the overlap) and
+    case-folded (`normcase`; Windows paths differ in case without differing at
+    all). The comparison is on a separator boundary, so `data2` is not
+    "inside" `data`.
+    """
+    source_norm = os.path.normcase(os.path.realpath(source))
+    target_norm = os.path.normcase(os.path.realpath(target))
+    prefix = source_norm if source_norm.endswith(os.sep) else source_norm + os.sep
+    return target_norm == source_norm or target_norm.startswith(prefix)
+
+
+def nearest_existing_ancestor(path: str) -> Optional[str]:
+    """`path` itself, or its closest parent that exists; None if none does.
+
+    None means even the root is missing (an unplugged drive letter), which
+    ends the walk instead of looping on a root that is its own parent.
+    """
+    current = os.path.abspath(path)
+    while not os.path.exists(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    return current
+
+
+def volume_id(path: str) -> str:
+    """Identity of the volume holding existing `path`, as a string.
+
+    `os.stat().st_dev`. On Windows that is the volume serial number, which
+    follows the drive across letter changes. On macOS/Linux it is the device
+    number, which is NOT guaranteed stable across remounts or reboots, so
+    there the check is best-effort and unverified: it can wrongly block a
+    legitimate remount (re-save the job to re-record it) and is not relied on
+    to catch every swapped drive. Raises OSError.
+    """
+    return str(os.stat(path).st_dev)
+
+
+def target_volume(target: str) -> str:
+    """`volume_id` of `target`'s nearest existing ancestor, or "" if the
+    drive is unavailable. For recording on a job; never raises."""
+    anchor = nearest_existing_ancestor(target)
+    if anchor is None:
+        return ""
+    try:
+        return volume_id(anchor)
+    except OSError:
+        return ""
+
+
+def _free_bytes(path: str) -> int:
+    """Free bytes on the volume holding existing `path`. Raises OSError."""
+    return shutil.disk_usage(path).free
+
+
+def preflight(job: Dict,
+              free_space: Optional[Callable[[str], int]] = None,
+              volume: Optional[Callable[[str], str]] = None) -> Optional[str]:
+    """Check `job` before anything is written. None if safe, else why not.
+
+    Runs before the job root is created, so a refused run leaves the target
+    untouched. Guards, in order: source exists, is a directory and holds at
+    least one file (a blank or unplugged source must not drive a prune of
+    good history); target is not the source or inside it; the target drive is
+    present; free space covers the source plus `SPACE_MARGIN`; and, when the
+    job recorded one, the target is on the same volume as before (an unplugged
+    drive must not cause a backup into a folder on C:). A job with no recorded
+    volume is not blocked -- `run_job` reports the current one for
+    `record_run` to store (trust on first use).
+
+    `free_space(path) -> bytes` and `volume(path) -> str` are injectable for
+    tests; they default to the real disk and `volume_id`.
+    """
+    free_space = free_space or _free_bytes
+    volume = volume or volume_id
+    source = job.get("source", "")
+    target = job.get("target", "")
+    if not source or not os.path.isdir(source):
+        return f"Source folder not found: {source or '(not set)'}"
+    if not target:
+        return "No target folder is set for this job"
+
+    files, _ = walk_tree(source)
+    if not files:
+        return ("The source folder is empty (or none of its files can be "
+                "read), so nothing was backed up. Check that its drive is "
+                "connected.")
+    if target_inside_source(source, target):
+        return "The target cannot be inside the source folder."
+
+    anchor = nearest_existing_ancestor(target)
+    if anchor is None:
+        return f"The target drive is not available, so nothing was backed up: {target}"
+
+    need = int(sum(size for size, _ in files.values()) * SPACE_MARGIN)
+    try:
+        free = free_space(anchor)
+    except OSError as exc:
+        return f"Could not read the free space on the target drive: {exc}"
+    if free < need:
+        return (f"Not enough free space on the target drive: the backup needs "
+                f"about {human_size(need)} but only {human_size(free)} is free.")
+
+    recorded = job.get("target_volume")
+    if recorded:
+        try:
+            current = volume(anchor)
+        except OSError as exc:
+            return f"Could not identify the target drive: {exc}"
+        if current != recorded:
+            return ("The backup drive is not the same drive as before. Connect "
+                    "the original drive or edit the job.")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Running a job
 # ---------------------------------------------------------------------------
 
@@ -444,13 +581,14 @@ def run_job(job: Dict,
     it completes. An interrupted run therefore leaves nothing that
     `version_names()` will offer as a restore point, and nothing that the
     changes-since comparison would measure against.
+
+    `preflight()` runs first and nothing is created until it passes. On
+    success the result carries `target_volume` for `record_run` to store.
     """
-    source = job.get("source", "")
-    target = job.get("target", "")
-    if not source or not os.path.isdir(source):
-        return {"ok": False, "message": f"Source folder not found: {source or '(not set)'}"}
-    if not target:
-        return {"ok": False, "message": "No target folder is set for this job"}
+    problem = preflight(job)
+    if problem:
+        return {"ok": False, "message": problem}
+    source, target = job["source"], job["target"]
 
     stamp = datetime.now().strftime(VERSION_FORMAT)
     root = job_root(job)
@@ -484,7 +622,8 @@ def run_job(job: Dict,
     if pruned:
         message += f". Removed {len(pruned)} old version(s)"
     return {"ok": True, "message": message, "version": stamp, "files": files,
-            "bytes": copied_bytes, "pruned": pruned, "errors": errors}
+            "bytes": copied_bytes, "pruned": pruned, "errors": errors,
+            "target_volume": target_volume(target)}
 
 
 def record_run(job_id: str, result: Dict) -> Optional[Dict]:
@@ -498,6 +637,11 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
     job = get_job(job_id)
     if job is None:
         return None
+    if result.get("ok") and result.get("target_volume") and not job.get("target_volume"):
+        # Trust on first use: a job made before volume identity existed learns
+        # its drive from its first successful run, and is checked against it
+        # from then on.
+        job["target_volume"] = result["target_volume"]
     job["last_run"] = datetime.now().isoformat(timespec="seconds")
     job["last_result"] = ("ok" if result.get("ok") else "failed") + \
         (f": {result.get('message', '')}" if not result.get("ok") else "")
