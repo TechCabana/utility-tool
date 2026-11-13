@@ -42,7 +42,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from utils import locks
@@ -785,6 +785,12 @@ def target_volume(target: str) -> str:
         return ""
 
 
+# The start of preflight's insufficient-space message. `_run_job` matches on it
+# to tell "the target is full" (which a sweep of abandoned leftovers may cure)
+# from every other refusal (which it cannot).
+LOW_SPACE_PREFIX = "Not enough free space on the target drive"
+
+
 def _free_bytes(path: str) -> int:
     """Free bytes on the volume holding existing `path`. Raises OSError."""
     return shutil.disk_usage(path).free
@@ -835,7 +841,7 @@ def preflight(job: Dict,
     except OSError as exc:
         return f"Could not read the free space on the target drive: {exc}"
     if free < need:
-        return (f"Not enough free space on the target drive: the backup needs "
+        return (f"{LOW_SPACE_PREFIX}: the backup needs "
                 f"about {human_size(need)} but only {human_size(free)} is free.")
 
     recorded = job.get("target_volume")
@@ -935,6 +941,96 @@ def _discard(partial: str, manifest_tmp: str) -> None:
         os.remove(manifest_tmp)
     except OSError:
         pass
+
+
+# Leftovers of failed or crashed runs, matched by exact name so a user's own
+# files in the target are never candidates. `[0-9]`, not `\d`: no Unicode digits.
+SWEEP_MAX_AGE_DAYS = 7
+_STAMP = r"[0-9]{8}-[0-9]{6}"
+_PARTIAL_RE = re.compile(rf"({_STAMP})\.partial")
+_MANIFEST_TMP_RE = re.compile(rf"({_STAMP}){re.escape(MANIFEST_SUFFIX)}\.tmp")
+_MANIFEST_RE = re.compile(rf"({_STAMP}){re.escape(MANIFEST_SUFFIX)}")
+
+
+def sweep_stale(job: Dict, now: Optional[datetime] = None,
+                max_age_days: int = SWEEP_MAX_AGE_DAYS) -> Dict:
+    """Delete abandoned run leftovers in `job`'s root older than `max_age_days`.
+
+    A failed verification deliberately keeps its `<stamp>.partial` folder and
+    `<stamp>.manifest.jsonl.tmp`, and a crash can leave a `<stamp>.manifest.jsonl`
+    with no `<stamp>` folder (an orphan). Nothing else removes them, so they
+    pile up and eat the free space the next run's pre-flight needs.
+
+    Only three exact name shapes are candidates (see the `_*_RE` patterns);
+    anything else, every promoted version `<stamp>`, and any manifest whose
+    `<stamp>` entry exists are never touched. Links and junctions are never
+    followed or removed. Age comes from the stamp in the name (strictly older
+    than `now - max_age_days`), not from file times, so it is deterministic.
+
+    The newest `.partial` is always kept, with its manifests, so one failed
+    attempt stays inspectable; it is reported as `kept_for_inspection` when it
+    is old enough that it would otherwise have been swept (else None).
+
+    Returns `{"removed": [names], "errors": [str], "kept_for_inspection": ...}`.
+    Never raises: one item that cannot be deleted goes in `errors` and the
+    sweep carries on. The caller must hold the job's run lock.
+    """
+    result: Dict = {"removed": [], "errors": [], "kept_for_inspection": None}
+    cutoff = (now or datetime.now()) - timedelta(days=max_age_days)
+    partials: Dict[str, str] = {}
+    tmps: Dict[str, str] = {}
+    manifests: Dict[str, str] = {}
+    taken = set()
+    try:
+        with os.scandir(job_root(job)) as entries:
+            for entry in entries:
+                taken.add(entry.name)
+                if _is_link_like(entry):
+                    continue
+                for pattern, found, is_dir in ((_PARTIAL_RE, partials, True),
+                                               (_MANIFEST_TMP_RE, tmps, False),
+                                               (_MANIFEST_RE, manifests, False)):
+                    match = pattern.fullmatch(entry.name)
+                    if match and version_datetime(match.group(1)) is not None:
+                        shape_ok = (entry.is_dir(follow_symlinks=False) if is_dir
+                                    else entry.is_file(follow_symlinks=False))
+                        if shape_ok:
+                            found[match.group(1)] = entry.name
+    except FileNotFoundError:
+        return result  # no job root yet: nothing to sweep
+    except OSError as exc:
+        result["errors"].append(f"{job_root(job)}: {exc}")
+        return result
+
+    def old(stamp: str) -> bool:
+        """True when the stamp is strictly older than the cutoff."""
+        return version_datetime(stamp) < cutoff
+
+    keep = max(partials, default=None)  # stamps sort chronologically
+    if keep is not None and old(keep):
+        result["kept_for_inspection"] = partials[keep]
+    else:
+        keep = None
+    doomed = [(partials[s], True) for s in partials if s != keep and old(s)]
+    doomed += [(tmps[s], False) for s in tmps if s != keep and old(s)]
+    doomed += [(manifests[s], False) for s in manifests
+               if s != keep and s not in taken and old(s)]
+    for name, is_dir in sorted(doomed):
+        path = os.path.join(job_root(job), name)
+        try:
+            if is_dir:
+                _rmtree(path)
+            else:
+                try:
+                    os.unlink(path)
+                except PermissionError:  # read-only bit: clear it, retry once
+                    os.chmod(path, stat.S_IWRITE)
+                    os.unlink(path)
+        except OSError as exc:
+            result["errors"].append(f"{name}: {exc}")
+        else:
+            result["removed"].append(name)
+    return result
 
 
 # How many one-second stamps `_claim_stamp` tries before giving up.
@@ -1075,10 +1171,59 @@ def _run_job(job: Dict,
              on_progress: Optional[Callable[[int, int], None]],
              should_abort: Optional[Callable[[], bool]],
              on_phase: Optional[Callable[[str], None]]) -> Dict:
-    """The backup itself; `run_job` wraps it in the per-job lock."""
-    problem = preflight(job)
+    """Pre-flight, sweep leftovers, then the backup; `run_job` holds the lock."""
+    problem, sweep = _preflight_and_sweep(job)
     if problem:
-        return {"ok": False, "message": problem}
+        result = {"ok": False, "message": problem}
+    else:
+        result = _backup(job, on_progress, should_abort, on_phase)
+    return _with_sweep(result, sweep)
+
+
+def _preflight_and_sweep(job: Dict) -> Tuple[Optional[str], Optional[Dict]]:
+    """Run pre-flight and `sweep_stale`; return `(problem, sweep or None)`.
+
+    The sweep runs once pre-flight passes. It also runs when pre-flight fails
+    ONLY on free space -- abandoned partials can be what fills the target --
+    after which pre-flight is re-run once. Any other refusal (wrong drive,
+    missing source, ...) deletes nothing. Sweeping only ever deletes, so the
+    "nothing is created before the guards pass" guarantee holds.
+    """
+    problem = preflight(job)
+    if problem is None:
+        return None, sweep_stale(job)
+    if not problem.startswith(LOW_SPACE_PREFIX):
+        return problem, None
+    sweep = sweep_stale(job)
+    if sweep["removed"]:
+        return preflight(job), sweep
+    return problem, sweep
+
+
+def _with_sweep(result: Dict, sweep: Optional[Dict]) -> Dict:
+    """Add `swept` and a plain-English cleanup note to `result` if a sweep ran."""
+    if sweep is None:
+        return result
+    result["swept"] = list(sweep["removed"])
+    notes = []
+    if sweep["removed"]:
+        notes.append(f"Cleaned up {len(sweep['removed'])} abandoned leftover(s) "
+                     "from earlier runs.")
+    if sweep["errors"]:
+        notes.append(f"{len(sweep['errors'])} leftover(s) could not be removed.")
+    if notes:
+        message = result.get("message", "")
+        if not message.endswith((".", "!")):
+            message += "."
+        result["message"] = f"{message} {' '.join(notes)}"
+    return result
+
+
+def _backup(job: Dict,
+            on_progress: Optional[Callable[[int, int], None]],
+            should_abort: Optional[Callable[[], bool]],
+            on_phase: Optional[Callable[[str], None]]) -> Dict:
+    """The copy, verify, promote and prune steps, after pre-flight has passed."""
     source, target = job["source"], job["target"]
 
     root = job_root(job)
