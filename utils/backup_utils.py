@@ -30,6 +30,7 @@ tests/test_backup_utils.py; loading it with `launchctl` is not. A failure
 there reports the real error rather than claiming success, which is the most
 that can honestly be promised until someone runs it.
 """
+import contextlib
 import hashlib
 import json
 import os
@@ -44,6 +45,7 @@ import uuid
 from datetime import datetime
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
+from utils import locks
 from utils.fs_utils import _is_link_like, app_dir, human_size
 
 # A path, not a snapshot: nothing is read until load_jobs() opens it, so
@@ -213,6 +215,35 @@ def _write_atomic(path: str, data: bytes) -> None:
         raise
 
 
+def _locks_dir() -> str:
+    """`<app data>/locks`, created. Lives in the app-data folder rather than
+    the backup target so a lock works with the target drive absent, never
+    writes to the target before pre-flight passes, and is shared by the GUI
+    and the headless run (both use `app_dir()`)."""
+    path = os.path.join(app_dir(), "locks")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+@contextlib.contextmanager
+def _jobs_file_lock() -> Iterator[None]:
+    """Hold the jobs-file lock for one load -> modify -> save.
+
+    Without it two processes (the GUI and a scheduled headless run) can both
+    load the file, each change a different job, and the later save silently
+    erases the earlier one. Short-lived: waits up to ~5 s for the holder, then
+    raises OSError. Taken once per top-level operation by `save_job`,
+    `remove_job`, `record_run` and `restore_jobs_from_backup`; they call the
+    unlocked `_save_job` internally, so nothing ever waits on itself.
+    """
+    lock = locks.acquire_wait(os.path.join(_locks_dir(), "jobs-file.lock"),
+                              "jobs file update")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def save_jobs(jobs: List[Dict]) -> None:
     """Atomically store `jobs`, keeping the previous good version as `.bak`.
 
@@ -238,16 +269,17 @@ def restore_jobs_from_backup() -> int:
     nothing is destroyed. Raises `JobsFileCorrupt` when there is no usable
     `.bak`, having written nothing.
     """
-    try:
-        raw, jobs = _read_valid(_backup_path())
-    except (FileNotFoundError, ValueError) as exc:
-        raise JobsFileCorrupt(
-            f"There is no usable backup copy ('{_backup_path()}') to restore "
-            "the jobs file from.", JOBS_FILE, False) from exc
-    if os.path.exists(JOBS_FILE):
-        kept = f"{JOBS_FILE}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
-        shutil.copyfile(JOBS_FILE, kept)
-    _write_atomic(JOBS_FILE, raw)
+    with _jobs_file_lock():
+        try:
+            raw, jobs = _read_valid(_backup_path())
+        except (FileNotFoundError, ValueError) as exc:
+            raise JobsFileCorrupt(
+                f"There is no usable backup copy ('{_backup_path()}') to restore "
+                "the jobs file from.", JOBS_FILE, False) from exc
+        if os.path.exists(JOBS_FILE):
+            kept = f"{JOBS_FILE}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+            shutil.copyfile(JOBS_FILE, kept)
+        _write_atomic(JOBS_FILE, raw)
     return len(jobs)
 
 
@@ -259,11 +291,8 @@ def get_job(job_id: str) -> Optional[Dict]:
     return None
 
 
-def save_job(job: Dict) -> None:
-    """Insert or replace `job` by id. Does not touch the OS scheduler --
-    `sync_task()` is called separately so a storage failure and a scheduler
-    failure are reported distinctly. Raises JobsFileCorrupt, writing nothing,
-    if the stored file is damaged."""
+def _save_job(job: Dict) -> None:
+    """`save_job` without taking the jobs-file lock; the caller holds it."""
     jobs = load_jobs()
     for index, existing in enumerate(jobs):
         if existing.get("id") == job["id"]:
@@ -274,9 +303,19 @@ def save_job(job: Dict) -> None:
     save_jobs(jobs)
 
 
+def save_job(job: Dict) -> None:
+    """Insert or replace `job` by id. Does not touch the OS scheduler --
+    `sync_task()` is called separately so a storage failure and a scheduler
+    failure are reported distinctly. Raises JobsFileCorrupt, writing nothing,
+    if the stored file is damaged; OSError if the jobs-file lock times out."""
+    with _jobs_file_lock():
+        _save_job(job)
+
+
 def remove_job(job_id: str) -> None:
     """Drop the job with this id. Raises JobsFileCorrupt if the file is damaged."""
-    save_jobs([job for job in load_jobs() if job.get("id") != job_id])
+    with _jobs_file_lock():
+        save_jobs([job for job in load_jobs() if job.get("id") != job_id])
 
 
 # ---------------------------------------------------------------------------
@@ -914,9 +953,9 @@ def _claim_stamp(root: str, job: Dict) -> Optional[str]:
     released and the next second tried. Raises OSError if the target cannot
     be written.
 
-    ponytail: per-stamp claim only. Two runs of one job in different seconds
-    still run side by side (each in its own folder, both verified); a per-job
-    lock is the upgrade if that ever needs preventing.
+    This is the second line of defence: `run_job` holds a per-job lock, so two
+    runs of one job normally never reach here together; the stamp claim still
+    covers a lock that was taken over as stale while its owner was alive.
     """
     for attempt in range(CLAIM_ATTEMPTS):
         if attempt:
@@ -970,8 +1009,73 @@ def run_job(job: Dict,
     restarts from 0 for the verify pass. Cancelling (`should_abort`) in
     either phase removes the `.partial` folder and the `.tmp` manifest.
 
-    `preflight()` runs first and nothing is created until it passes.
+    A per-job lock (`<app data>/locks/<job id>.lock`) is taken before
+    anything else, including pre-flight, and released in `finally` however the
+    run ends. If another live run of this job holds it the result is
+    `{"ok": False, "busy": True, ...}` and nothing was touched -- callers must
+    NOT `record_run` a busy result, or it would overwrite the real last result.
+    A lock left by a dead process (or older than 24 h) is taken over, and the
+    result message says so.
+
+    `preflight()` runs after the lock and nothing is created until it passes.
     """
+    lock_path = _job_lock_path(job)
+    if lock_path is None:
+        return {"ok": False, "message": "This backup job has no usable id, so "
+                "it cannot run. Nothing was changed."}
+    try:
+        lock = locks.acquire(lock_path, f"backup job {job['id']}")
+    except locks.LockBusy as busy:
+        return {"ok": False, "busy": True, "message": _busy_message(busy.holder)}
+    except OSError as exc:
+        return {"ok": False, "message": f"Could not take the backup lock: {exc}. "
+                "Nothing was changed."}
+    try:
+        result = _run_job(job, on_progress, should_abort, on_phase)
+    finally:
+        lock.release()
+    if lock.recovered is not None:
+        who = (f"process {lock.recovered}" if lock.recovered > 0
+               else "an earlier run")
+        message = result.get("message", "")
+        if not message.endswith((".", "!")):
+            message += "."
+        result["message"] = f"{message} Recovered a stale lock left by {who}."
+    return result
+
+
+def _job_lock_path(job: Dict) -> Optional[str]:
+    """Where `job`'s run lock lives, or None if it has no usable id.
+
+    The id is a hex string we generate, but the jobs file is hand-editable:
+    an id with a path separator or `..` must not point the lock outside the
+    locks folder, so anything but plain word characters is hashed instead.
+    """
+    job_id = job.get("id")
+    if not isinstance(job_id, str) or not job_id:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id):
+        job_id = "id-" + hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(_locks_dir(), job_id + ".lock")
+
+
+def _busy_message(holder: Optional[Dict]) -> str:
+    """The plain-English refusal for a run that found its job already running."""
+    if not holder:
+        return "This backup job is already running. Nothing was changed."
+    try:
+        started = datetime.fromisoformat(holder["started"]).strftime("%H:%M")
+    except (KeyError, TypeError, ValueError):
+        started = "earlier"
+    return (f"This backup job is already running (started {started}, process "
+            f"{holder.get('pid')}). Nothing was changed.")
+
+
+def _run_job(job: Dict,
+             on_progress: Optional[Callable[[int, int], None]],
+             should_abort: Optional[Callable[[], bool]],
+             on_phase: Optional[Callable[[str], None]]) -> Dict:
+    """The backup itself; `run_job` wraps it in the per-job lock."""
     problem = preflight(job)
     if problem:
         return {"ok": False, "message": problem}
@@ -1080,20 +1184,21 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
     Re-read from disk rather than mutating the caller's copy: the headless CLI
     and the GUI can both be looking at this file, and the run is the only
     field either of them writes during a run. Raises JobsFileCorrupt if the
-    jobs file has been damaged since the run began.
+    jobs file has been damaged since the run began, OSError if the jobs-file
+    lock cannot be taken. Do not call this for a `busy` result from `run_job`.
     """
-    job = get_job(job_id)
-    if job is None:
-        return None
-    if result.get("ok") and result.get("target_volume") and not job.get("target_volume"):
-        # Trust on first use: a job made before volume identity existed learns
-        # its drive from its first successful run, and is checked against it
-        # from then on.
-        job["target_volume"] = result["target_volume"]
-    job["last_run"] = datetime.now().isoformat(timespec="seconds")
-    job["last_result"] = ("ok" if result.get("ok") else "failed") + \
-        (f": {result.get('message', '')}" if not result.get("ok") else "")
-    save_job(job)
+    with _jobs_file_lock():
+        job = get_job(job_id)
+        if job is None:
+            return None
+        if result.get("ok") and result.get("target_volume") and not job.get("target_volume"):
+            # Trust on first use: a job made before volume identity existed learns
+            # its drive from its first successful run, and is checked against it
+            # from then on.
+            job["target_volume"] = result["target_volume"]
+        job["last_run"] = datetime.now().isoformat(timespec="seconds")
+        job["last_result"] = ("ok" if result.get("ok") else "failed") +             (f": {result.get('message', '')}" if not result.get("ok") else "")
+        _save_job(job)
     return job
 
 

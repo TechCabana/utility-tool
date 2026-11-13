@@ -1101,6 +1101,11 @@ class BackupTab(QtWidgets.QWidget):
         result line the user is reading.
         """
         message = result.get("message", "")
+        if result.get("busy"):
+            # Another run of this job holds its lock (e.g. the scheduled task
+            # fired). Show why, and leave the job's real last_result alone.
+            self._say(message, ok=False)
+            return
         try:
             backup_utils.record_run(job["id"], result)
         except (backup_utils.JobsFileCorrupt, OSError) as exc:
