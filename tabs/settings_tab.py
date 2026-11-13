@@ -1,9 +1,8 @@
 from PySide6 import QtCore, QtWidgets
 
 from styles import tokens
-from utils.presets import load_all, delete_preset, describe_preset
-from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
-                            card, divider, icon_button, section_header)
+from utils.fs_utils import APP_NAME, app_dir
+from widgets.common import ElidedLabel, PageHeader, card, section_header
 
 THEME_CHOICES = (
     ("Match the system", "system"),
@@ -13,7 +12,7 @@ THEME_CHOICES = (
 
 
 class SettingsTab(QtWidgets.QWidget):
-    """Appearance, the shared preset library, and what this app is.
+    """Appearance, and what this app is.
 
     This screen used to open with a card reading "Global settings coming
     soon...", which is a note to the developer shown to the user. A shipped
@@ -49,15 +48,11 @@ class SettingsTab(QtWidgets.QWidget):
         layout.setSpacing(tokens.SPACE_BLOCK)
         scroll.setWidget(body)
 
-        layout.addWidget(PageHeader("Settings",
-                                    "Appearance, saved presets, and what this app is."))
+        layout.addWidget(PageHeader("Settings", "Appearance, and what this app is."))
 
         layout.addWidget(self._appearance_card())
-        layout.addWidget(self._presets_card())
         layout.addWidget(self._about_card())
         layout.addStretch(1)
-
-        self.refresh_presets()
 
     # -- appearance ------------------------------------------------------
     def _appearance_card(self) -> QtWidgets.QFrame:
@@ -95,100 +90,6 @@ class SettingsTab(QtWidgets.QWidget):
         body.addWidget(hint)
         return panel
 
-    # -- presets ---------------------------------------------------------
-    def _presets_card(self) -> QtWidgets.QFrame:
-        panel, body = card("Presets")
-
-        lede = QtWidgets.QLabel(
-            "Saved settings from Image Tools and File Tools. Pick one from the "
-            "Preset field on either screen to apply it.")
-        lede.setObjectName("Hint")
-        lede.setWordWrap(True)
-        body.addWidget(lede)
-
-        self._rows_layout = QtWidgets.QVBoxLayout()
-        self._rows_layout.setSpacing(0)
-        body.addLayout(self._rows_layout)
-
-        self._empty_state = EmptyState(
-            title="No presets yet",
-            hint="Set up a batch in Image Tools or File Tools, then press Save preset.",
-            icon="bookmark",
-        )
-        body.addWidget(self._empty_state)
-        return panel
-
-    def refresh_presets(self):
-        """Rebuild the preset rows from disk (initial load, and after a delete)."""
-        while self._rows_layout.count():
-            item = self._rows_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-
-        data = load_all()
-        rows = []
-        for kind, label in (("image", "Image"), ("file", "File")):
-            for index, preset in enumerate(data.get(kind, [])):
-                rows.append((kind, index, label, preset))
-
-        self._empty_state.setVisible(not rows)
-
-        for position, (kind, index, label, preset) in enumerate(rows):
-            if position:
-                self._rows_layout.addWidget(divider())
-            self._rows_layout.addWidget(self._preset_row(kind, index, label, preset))
-
-    def _preset_row(self, kind: str, index: int, label: str,
-                    preset: dict) -> QtWidgets.QWidget:
-        row = QtWidgets.QWidget()
-        # Without this the base QWidget rule paints the page ground over the
-        # card's surface, which is what produced the grey banding this list
-        # used to show.
-        row.setObjectName("CardBody")
-        layout = QtWidgets.QHBoxLayout(row)
-        layout.setContentsMargins(0, 10, 0, 10)
-        layout.setSpacing(12)
-
-        text = QtWidgets.QVBoxLayout()
-        text.setSpacing(2)
-
-        name = QtWidgets.QLabel(preset.get("name", "(unnamed)"))
-        name.setObjectName("H2")
-        text.addWidget(name)
-
-        summary = QtWidgets.QLabel(describe_preset(kind, preset))
-        summary.setObjectName("Hint")
-        summary.setWordWrap(True)
-        text.addWidget(summary)
-        layout.addLayout(text, 1)
-
-        tag = QtWidgets.QLabel(label)
-        tag.setObjectName("Tag")
-        layout.addWidget(tag, 0, QtCore.Qt.AlignTop)
-
-        # A row action, not an alarm: filled red is reserved for the confirm
-        # button of the dialog this opens. A list of eleven filled red
-        # buttons teaches people to stop reading red.
-        remove = icon_button("trash", f"Delete the preset \"{preset.get('name', '')}\"",
-                             f"Delete preset {preset.get('name', '')}")
-        remove.clicked.connect(
-            lambda _checked=False, k=kind, i=index, n=preset.get("name", ""): self._delete(k, i, n))
-        layout.addWidget(remove, 0, QtCore.Qt.AlignTop)
-        return row
-
-    def _delete(self, kind: str, index: int, name: str):
-        if not ConfirmDialog.ask(
-            self,
-            "Delete this preset?",
-            f"\"{name}\" will be removed from the preset list. Files you have "
-            f"already processed are not affected.",
-            confirm_text="Delete preset",
-        ):
-            return
-        delete_preset(kind, index)
-        self.refresh_presets()
-
     # -- about -----------------------------------------------------------
     def _about_card(self) -> QtWidgets.QFrame:
         panel, body = card("About")
@@ -199,7 +100,7 @@ class SettingsTab(QtWidgets.QWidget):
 
         for label, value in (
             ("Version", f"v{__version__}"),
-            ("Presets stored in", _presets_location()),
+            ("Data stored in", app_dir()),
         ):
             row = QtWidgets.QWidget()
             row.setObjectName("CardBody")
@@ -212,7 +113,7 @@ class SettingsTab(QtWidgets.QWidget):
             caption.setMinimumWidth(120)
             line.addWidget(caption)
 
-            # Elided, not plain: the presets path is one unbreakable word,
+            # Elided, not plain: the data path is one unbreakable word,
             # and at the app's minimum window it set a minimum width wider
             # than the card, pushing this screen's content off its own
             # viewport. The full path stays in the tooltip.
@@ -223,7 +124,7 @@ class SettingsTab(QtWidgets.QWidget):
 
         body.addWidget(section_header("Privacy"))
         privacy = QtWidgets.QLabel(
-            "UtilityTool makes no network calls. Every image, file and folder it "
+            f"{APP_NAME} makes no network calls. Every file and folder it "
             "touches stays on this machine, and nothing is uploaded, logged or "
             "shared. It needs no account and works with the network switched off.")
         privacy.setObjectName("Hint")
@@ -232,16 +133,10 @@ class SettingsTab(QtWidgets.QWidget):
 
         body.addWidget(section_header("Licences"))
         licences = QtWidgets.QLabel(
-            "UtilityTool is MIT licensed. It bundles the Manrope and Geist Mono "
+            f"{APP_NAME} is MIT licensed. It bundles the Manrope and Geist Mono "
             "typefaces (SIL Open Font License 1.1) and Lucide icons (ISC) — the "
             "full licence texts ship in assets/fonts/ and assets/icons/.")
         licences.setObjectName("Hint")
         licences.setWordWrap(True)
         body.addWidget(licences)
         return panel
-
-
-def _presets_location() -> str:
-    from utils.presets import PRESETS_FILE
-
-    return PRESETS_FILE

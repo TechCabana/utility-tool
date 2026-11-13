@@ -6,7 +6,7 @@ called, so the panel was permanently empty -- a dashboard whose only content
 is an empty-state message. This is the missing half: the tool tabs record a
 line when a batch finishes, and Home reads it back.
 
-Kept deliberately small. It is a JSON list beside presets.json, capped at
+Kept deliberately small. It is a JSON list in the app-data directory, capped at
 `LIMIT` entries, holding a timestamp and a sentence. It is not an audit log
 and it does not record file paths: the point is "did that batch run, and
 when", answerable at a glance.
@@ -20,7 +20,7 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List
 
-from utils.presets import app_dir
+from utils.fs_utils import app_dir
 
 ACTIVITY_FILE = os.path.join(app_dir(), "activity.json")
 

@@ -3,11 +3,8 @@
 # retention pruning, the changes-since comparison, restore, and the schtasks
 # argument builder.
 #
-# Its own file rather than an extension of test_disk_utils.py: that suite is
-# already 700 lines about scanning and hashing, and this module is about
-# writing files somewhere else. Same convention as tests/test_presets.py for
-# the storage half -- JOBS_FILE is monkeypatched to tmp_path so a test run
-# never touches the real user's backup_jobs.json.
+# JOBS_FILE is monkeypatched to tmp_path so a test run never touches the real
+# user's backup_jobs.json.
 #
 # The schtasks calls are tested through `schtasks_args`, which builds the
 # argv without running it. Registering a real scheduled task from a test
@@ -75,16 +72,13 @@ def test_get_and_remove_job():
     assert backup_utils.get_job(job["id"]) is None
 
 
-def test_load_jobs_survives_corrupt_json():
+def test_load_jobs_reports_a_corrupt_file_instead_of_no_jobs():
+    # The old behaviour (return []) let the next save wipe every job; the full
+    # corruption suite lives in tests/test_jobs_file.py.
     with open(backup_utils.JOBS_FILE, "w", encoding="utf-8") as handle:
         handle.write("{not a list")
-    assert backup_utils.load_jobs() == []
-
-
-def test_load_jobs_rejects_a_non_list_document():
-    with open(backup_utils.JOBS_FILE, "w", encoding="utf-8") as handle:
-        json.dump({"jobs": []}, handle)
-    assert backup_utils.load_jobs() == []
+    with pytest.raises(backup_utils.JobsFileCorrupt):
+        backup_utils.load_jobs()
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +100,8 @@ def test_run_job_reports_progress_for_every_file(tree):
     job, _, _ = tree
     seen = []
     backup_utils.run_job(job, on_progress=lambda done, total: seen.append((done, total)))
-    assert seen == [(1, 2), (2, 2)]
+    # The copy, then the verify pass restarting from 0 over the same files.
+    assert seen == [(1, 2), (2, 2), (0, 2), (1, 2), (2, 2)]
 
 
 def test_two_runs_make_two_versions(tree):
@@ -342,7 +337,20 @@ def test_walk_tree_of_a_missing_directory_counts_it_as_skipped(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_task_name_is_prefixed_and_keyed_on_the_job_id():
-    assert backup_utils.task_name("abc123") == "UtilityTool_Backup_abc123"
+    assert backup_utils.task_name("abc123") == "Safekeep_Backup_abc123"
+    # The pre-rename name, which the migration needs to find and remove.
+    assert backup_utils.task_name("abc123", legacy=True) == "UtilityTool_Backup_abc123"
+
+
+def test_unregister_and_exists_target_the_legacy_task_only_when_asked(monkeypatch):
+    calls = []
+    monkeypatch.setattr(backup_utils.sys, "platform", "win32")
+    monkeypatch.setattr(backup_utils, "_run", lambda args: calls.append(args) or (True, ""))
+    backup_utils.unregister_task("abc", legacy=True)
+    backup_utils.task_exists("abc", legacy=True)
+    backup_utils.unregister_task("abc")
+    assert [args[args.index("/tn") + 1] for args in calls] == [
+        "UtilityTool_Backup_abc", "UtilityTool_Backup_abc", "Safekeep_Backup_abc"]
 
 
 def test_job_command_invokes_the_headless_cli_flag():
@@ -453,6 +461,25 @@ def test_launchd_label_and_path_are_per_job():
     path = backup_utils.launchd_plist_path("abc")
     assert path.endswith(".plist")
     assert "LaunchAgents" in path
+
+
+def test_launchd_legacy_unregister_boots_out_and_removes_the_old_label(tmp_path, monkeypatch):
+    # Driven through injection on any OS: the macOS path has never run on a
+    # Mac, so this pins what it would ASK launchd to do, not that launchd does it.
+    monkeypatch.setattr(backup_utils.sys, "platform", "darwin")
+    monkeypatch.setattr(backup_utils.os.path, "expanduser", lambda p: str(tmp_path))
+    calls = []
+    monkeypatch.setattr(backup_utils, "_launchctl", lambda args: calls.append(args) or (True, ""))
+    old_plist = tmp_path / "Library" / "LaunchAgents" / "com.techcabana.utilitytool.backup.abc.plist"
+    old_plist.parent.mkdir(parents=True)
+    old_plist.write_text("<plist/>", encoding="utf-8")
+
+    assert backup_utils.task_exists("abc", legacy=True) is True
+    assert backup_utils.task_exists("abc") is False
+    backup_utils.unregister_task("abc", legacy=True)
+    assert calls[-1][-1] == "com.techcabana.utilitytool.backup.abc"
+    assert not old_plist.exists()
+    assert backup_utils.launchd_label("abc") == "com.techcabana.safekeep.backup.abc"
 
 
 def test_job_argv_and_job_command_describe_the_same_run():

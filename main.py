@@ -4,11 +4,11 @@ from pathlib import Path
 from PySide6 import QtWidgets, QtCore, QtGui
 
 from styles import tokens
+from tabs.backup_tab import BackupTab
 from tabs.home_tab import HomeTab
-from tabs.image_tab import ImageTab
-from tabs.file_tab import FileTab
-from tabs.disk_tab import DiskTab
 from tabs.settings_tab import SettingsTab
+from utils import migrate
+from utils.fs_utils import APP_NAME, LEGACY_APP_NAME
 from widgets import icons
 from widgets.motion import fade_in, motion_enabled
 
@@ -20,7 +20,6 @@ __version__ = "1.0.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 ORG_NAME = "TechCabana"
-APP_NAME = "UtilityTool"
 
 # One row per sidebar entry: label, icon, and the stacked-widget index. The
 # tuple is the single definition of navigation -- the buttons, the Ctrl+N
@@ -28,10 +27,8 @@ APP_NAME = "UtilityTool"
 # apart the way a hand-numbered second list does.
 NAV = (
     ("Home", "house", 0),
-    ("Image Tools", "image", 1),
-    ("File Tools", "files", 2),
-    ("Disk", "hard-drive", 3),
-    ("Settings", "settings", 4),
+    ("Backup", "hard-drive", 1),
+    ("Settings", "settings", 2),
 )
 
 
@@ -81,7 +78,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stacked = QtWidgets.QStackedWidget()
         self.home_tab = HomeTab()
         self.settings_tab = SettingsTab(self.settings)
-        for page in (self.home_tab, ImageTab(), FileTab(), DiskTab(), self.settings_tab):
+        for page in (self.home_tab, BackupTab(), self.settings_tab):
             self.stacked.addWidget(page)
         root.addWidget(self.stacked, 1)
 
@@ -117,8 +114,8 @@ class MainWindow(QtWidgets.QMainWindow):
         version.setObjectName("AppVersion")
         layout.addWidget(version)
 
-        # A button group so the five entries are announced as one selection
-        # rather than five unrelated checkable buttons.
+        # A button group so the entries are announced as one selection
+        # rather than unrelated checkable buttons.
         self.nav_group = QtWidgets.QButtonGroup(self)
         self.nav_group.setExclusive(True)
 
@@ -311,16 +308,33 @@ def run_backup_job_cli(job_id):
     feature. Everything it needs is in utils/backup_utils.py, which is
     Qt-free by design, so nothing here touches the widget layer.
 
-    Exit codes: 0 backed up, 1 the backup failed, 2 no such job.
+    Exit codes: 0 backed up, 1 the backup failed, 2 no such job, 3 the jobs
+    file is damaged (nothing was run or written).
     """
     from utils import backup_utils
 
-    job = backup_utils.get_job(job_id)
+    # A task registered before the rename can fire before the renamed app has
+    # ever been opened, so the jobs file it needs may still be in the old
+    # app-data directory. Copy it across first. Only the data: re-registering
+    # tasks is the GUI's job, and an unattended run must not touch the
+    # scheduler.
+    migrate.migrate_data()
+    try:
+        job = backup_utils.get_job(job_id)
+    except backup_utils.JobsFileCorrupt as exc:
+        hint = f" Open {APP_NAME} to restore it." if exc.has_backup else ""
+        print(f"[ERROR] {exc}{hint}", file=sys.stderr)
+        return 3
     if job is None:
         print(f"[ERROR] No backup job with id '{job_id}'")
         return 2
     result = backup_utils.run_job(job)
-    backup_utils.record_run(job_id, result)
+    try:
+        backup_utils.record_run(job_id, result)
+    except backup_utils.JobsFileCorrupt as exc:
+        print(f"[ERROR] The backup ran ({result.get('message', '')}) but its "
+              f"result could not be recorded: {exc}", file=sys.stderr)
+        return 3
     print(("[OK] " if result.get("ok") else "[ERROR] ") + result.get("message", ""))
     return 0 if result.get("ok") else 1
 
@@ -333,6 +347,11 @@ def main() -> int:
     app.setApplicationVersion(__version__)
 
     settings = QtCore.QSettings(ORG_NAME, APP_NAME)
+    # Before any window is built: the settings carry the theme and last tab,
+    # and the Backup screen reads the jobs file as it is constructed.
+    migrate.migrate_settings(QtCore.QSettings(ORG_NAME, LEGACY_APP_NAME), settings)
+    migrate.migrate_data()
+    task_failures = report_task_migration(migrate.migrate_tasks())
     load_fonts()
     apply_theme(app, str(settings.value("ui/theme", "system")))
 
@@ -340,7 +359,30 @@ def main() -> int:
     window.show()
     if motion_enabled():
         fade_in(window.centralWidget())
+    if task_failures:
+        # Queued so it opens over the window once the event loop is running.
+        QtCore.QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.warning(
+            window, "Scheduled backups not moved",
+            "Some scheduled backups could not be moved to their new "
+            f"{APP_NAME} task. They keep running under their old name, and "
+            f"{APP_NAME} will try again next time it starts.\n\n"
+            + "\n".join(task_failures)))
     return app.exec()
+
+
+def report_task_migration(results) -> list:
+    """Print each scheduled-task migration result; return the failure lines.
+
+    The console line is for a run from source; the failures also go to a
+    dialog in main(), because a packaged build has no console to read.
+    """
+    failures = []
+    for result in results:
+        line = f"{result['name']}: {result['message']}"
+        print(("[OK] " if result["ok"] else "[WARN] ") + line)
+        if not result["ok"]:
+            failures.append(line)
+    return failures
 
 
 if __name__ == "__main__":

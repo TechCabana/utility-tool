@@ -37,3 +37,5 @@ Thumbs.db
 # Assistant working-agreement file - describes how the owner works, not how
 # the app runs (W11)
 CLAUDE.md
+# Design specs and plans - development notes, not needed to run the app (W11)
+docs/

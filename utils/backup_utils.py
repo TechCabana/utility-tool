@@ -4,14 +4,13 @@ comparison, restore, and the Windows Task Scheduler registration behind the
 "schedule" field.
 
 Qt-free by design (CLAUDE.md §3/§8) -- plain paths and plain dicts in, plain
-dicts out. `tabs/disk_tab.py` runs the long ones from a QThread worker and
+dicts out. `tabs/backup_tab.py` runs the long ones from a QThread worker and
 renders what comes back; nothing here knows that. `main.py --run-backup-job`
 calls `run_job` directly, with no QApplication at all, which is what the
 scheduled task invokes.
 
-Storage mirrors `utils/presets.py` exactly -- one JSON file in the OS
-app-data directory, via that module's own `app_dir()`. Unlike presets there
-is no first-run default set: a machine with no backup jobs has none, and the
+Storage is one JSON file in the OS app-data directory, via
+`utils/fs_utils.app_dir()`. There is no first-run default set: a machine with no backup jobs has none, and the
 Backup screen's EmptyState is the correct rendering of that.
 
 **Scheduling is handed to the OS, and the OS differs.** Configuration lives
@@ -31,20 +30,27 @@ tests/test_backup_utils.py; loading it with `launchctl` is not. A failure
 there reports the real error rather than claiming success, which is the most
 that can honestly be promised until someone runs it.
 """
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 import uuid
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from utils.disk_utils import _is_link_like
-from utils.presets import app_dir
+from utils.fs_utils import _is_link_like, app_dir, human_size
 
-JOBS_FILE = os.path.join(app_dir(), "backup_jobs.json")
+# A path, not a snapshot: nothing is read until load_jobs() opens it, so
+# utils/migrate.py copying a pre-rename jobs file into app_dir() any time
+# before that first read is enough for it to be found here.
+JOBS_FILENAME = "backup_jobs.json"
+JOBS_FILE = os.path.join(app_dir(), JOBS_FILENAME)
 
 # A version directory is named for the moment the backup started. Matched by
 # this pattern when versions are listed, so a half-written ".partial" copy or
@@ -55,10 +61,15 @@ _VERSION_RE = re.compile(r"^\d{8}-\d{6}$")
 SCHEDULES = ("manual", "daily", "weekly")
 DEFAULT_RETENTION = 5
 
-# copy2 preserves mtime, so an untouched file compares equal to the nanosecond
+# The copy preserves mtime (copystat, as copy2 does), so an untouched file compares equal to the nanosecond
 # on NTFS. The tolerance is for filesystems that store a coarser timestamp
 # (FAT32 on a USB backup drive rounds to 2 seconds), not for slack.
 MTIME_TOLERANCE = 2.0
+
+# Pre-flight wants this much free space over the source's total size: the new
+# version is written alongside the old ones (no dedup), and filesystem
+# overhead (cluster rounding, metadata) makes a bare sum of sizes optimistic.
+SPACE_MARGIN = 1.10
 
 # Windows only: keep schtasks' console window from flashing over the app.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -73,13 +84,34 @@ class BackupAborted(Exception):
     """
 
 
+class JobsFileCorrupt(Exception):
+    """The jobs file exists but cannot be trusted as a list of jobs.
+
+    Raised instead of returning an empty list: "no jobs" and "a file I could
+    not read" are different facts, and treating the second as the first made
+    the next save overwrite every job the user had. `has_backup` says whether
+    `restore_jobs_from_backup()` has a usable `.bak` to work from.
+    """
+
+    def __init__(self, message: str, path: str = "", has_backup: bool = False):
+        super().__init__(message)
+        self.path = path
+        self.has_backup = has_backup
+
+
 # ---------------------------------------------------------------------------
-# Job storage (same shape as utils/presets.py)
+# Job storage
 # ---------------------------------------------------------------------------
 
 def new_job(name: str, source: str, target: str, schedule: str = "daily",
-            at: str = "20:00", retention: int = DEFAULT_RETENTION) -> Dict:
-    """A job dict with a fresh id. Nothing is written to disk here."""
+            at: str = "20:00", retention: int = DEFAULT_RETENTION,
+            target_volume: str = "") -> Dict:
+    """A job dict with a fresh id. Nothing is written to disk here.
+
+    `target_volume` is the identity of the drive `target` was on when the job
+    was set up (see `target_volume()`); "" means not recorded yet, and the
+    first successful run records it.
+    """
     return {
         "id": uuid.uuid4().hex[:8],
         "name": name,
@@ -88,33 +120,139 @@ def new_job(name: str, source: str, target: str, schedule: str = "daily",
         "schedule": schedule if schedule in SCHEDULES else "manual",
         "at": at,
         "retention": max(1, int(retention)),
+        "target_volume": target_volume,
         "last_run": "",
         "last_result": "",
     }
 
 
-def load_jobs() -> List[Dict]:
-    """Every configured job, or an empty list.
+def _backup_path() -> str:
+    """Where the last good copy of the jobs file is kept."""
+    return JOBS_FILE + ".bak"
 
-    A missing or corrupt file reads as "no jobs" rather than raising: the
-    Backup screen must still open on a machine whose jobs.json was hand-edited
-    into invalid JSON, and an EmptyState is a truthful rendering of a file
-    that cannot be read.
+
+def _read_valid(path: str) -> Tuple[bytes, List[Dict]]:
+    """Read `path` and return (raw bytes, parsed jobs).
+
+    A missing file propagates as FileNotFoundError. Anything else wrong with
+    it -- unreadable, invalid JSON, not a list of objects -- is a ValueError
+    carrying a human reason, so callers decide what that means for them.
     """
     try:
-        with open(JOBS_FILE, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"it cannot be read: {exc}") from exc
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError
+        raise ValueError(f"it is not valid JSON: {exc}") from exc
+    if not isinstance(data, list) or not all(isinstance(j, dict) for j in data):
+        raise ValueError("it is not a list of jobs")
+    return raw, data
+
+
+def _has_usable_backup() -> bool:
+    """True when the `.bak` copy exists and parses as a jobs list."""
+    try:
+        _read_valid(_backup_path())
+    except (FileNotFoundError, ValueError):
+        return False
+    return True
+
+
+def load_jobs() -> List[Dict]:
+    """Every configured job; an empty list only when there is no jobs file.
+
+    A file that exists but cannot be read, is not valid JSON, or is not a list
+    raises `JobsFileCorrupt` -- never `[]`, because the very next `save_job`
+    would then overwrite the damaged file and every job in it with one job.
+    """
+    try:
+        return _read_valid(JOBS_FILE)[1]
+    except FileNotFoundError:
         return []
-    return data if isinstance(data, list) else []
+    except ValueError as exc:
+        has_backup = _has_usable_backup()
+        raise JobsFileCorrupt(
+            f"The backup jobs file '{JOBS_FILE}' is damaged: {exc}. "
+            + ("A backup copy of it is available to restore."
+               if has_backup else "No usable backup copy of it exists."),
+            JOBS_FILE, has_backup) from exc
+
+
+def _write_atomic(path: str, data: bytes) -> None:
+    """Replace `path` with `data` so a crash leaves the old file or the new.
+
+    Written to a temp file in the same directory (os.replace is only atomic
+    within one volume), flushed and fsynced, then swapped in. The temp file is
+    removed on any failure; an OSError comes back naming the file.
+
+    ponytail: a hard kill between mkstemp and os.replace leaves a stray
+    ``*.tmp`` in the app-data directory; sweep them on startup if it ever
+    matters.
+    """
+    fd, temp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                                prefix=os.path.basename(path) + ".",
+                                suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException as exc:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        if isinstance(exc, OSError):
+            raise OSError(f"Could not write '{path}': {exc}") from exc
+        raise
 
 
 def save_jobs(jobs: List[Dict]) -> None:
-    with open(JOBS_FILE, "w", encoding="utf-8") as handle:
-        json.dump(jobs, handle, indent=2)
+    """Atomically store `jobs`, keeping the previous good version as `.bak`.
+
+    Refuses (raises `JobsFileCorrupt`) when the file on disk is damaged, so a
+    save can never run on top of one -- and so the `.bak` can never be
+    replaced by a corrupt current file.
+    """
+    load_jobs()  # raises JobsFileCorrupt on a damaged file; [] if missing
+    data = json.dumps(jobs, indent=2).encode("utf-8")
+    try:
+        previous = _read_valid(JOBS_FILE)[0]
+    except FileNotFoundError:
+        previous = None
+    if previous is not None:
+        _write_atomic(_backup_path(), previous)
+    _write_atomic(JOBS_FILE, data)
+
+
+def restore_jobs_from_backup() -> int:
+    """Put the `.bak` copy back as the jobs file; return how many jobs.
+
+    The damaged file is kept first as ``<jobs file>.corrupt-<timestamp>`` so
+    nothing is destroyed. Raises `JobsFileCorrupt` when there is no usable
+    `.bak`, having written nothing.
+    """
+    try:
+        raw, jobs = _read_valid(_backup_path())
+    except (FileNotFoundError, ValueError) as exc:
+        raise JobsFileCorrupt(
+            f"There is no usable backup copy ('{_backup_path()}') to restore "
+            "the jobs file from.", JOBS_FILE, False) from exc
+    if os.path.exists(JOBS_FILE):
+        kept = f"{JOBS_FILE}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+        shutil.copyfile(JOBS_FILE, kept)
+    _write_atomic(JOBS_FILE, raw)
+    return len(jobs)
 
 
 def get_job(job_id: str) -> Optional[Dict]:
+    """The stored job with this id, or None. Raises JobsFileCorrupt."""
     for job in load_jobs():
         if job.get("id") == job_id:
             return job
@@ -124,7 +262,8 @@ def get_job(job_id: str) -> Optional[Dict]:
 def save_job(job: Dict) -> None:
     """Insert or replace `job` by id. Does not touch the OS scheduler --
     `sync_task()` is called separately so a storage failure and a scheduler
-    failure are reported distinctly."""
+    failure are reported distinctly. Raises JobsFileCorrupt, writing nothing,
+    if the stored file is damaged."""
     jobs = load_jobs()
     for index, existing in enumerate(jobs):
         if existing.get("id") == job["id"]:
@@ -136,6 +275,7 @@ def save_job(job: Dict) -> None:
 
 
 def remove_job(job_id: str) -> None:
+    """Drop the job with this id. Raises JobsFileCorrupt if the file is damaged."""
     save_jobs([job for job in load_jobs() if job.get("id") != job_id])
 
 
@@ -169,19 +309,98 @@ def version_names(job: Dict) -> List[str]:
 
 
 def latest_version(job: Dict) -> Optional[str]:
+    """The newest version stamp of `job` (verified or not), or None."""
     names = version_names(job)
     return names[-1] if names else None
 
 
 def version_path(job: Dict, name: str) -> str:
+    """The folder holding version `name` of `job`."""
     return os.path.join(job_root(job), name)
 
 
 def version_datetime(name: str) -> Optional[datetime]:
+    """The local time a version stamp names, or None if it is not one."""
     try:
         return datetime.strptime(name, VERSION_FORMAT)
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Manifests
+# ---------------------------------------------------------------------------
+# Each version has a JSON Lines manifest BESIDE its folder, never inside it:
+# `<job root>/<stamp>.manifest.jsonl`. Inside, it would be a file the source
+# does not have -- changes_since would count it as removed and a restore would
+# bring it back as a stray file -- and the version folder must stay an
+# ordinary copy of the source. version_names() only lists directories, so the
+# sibling file is never mistaken for a version.
+#
+# Line 1 is a header, then one line per copied file, then -- only once every
+# file has been re-read and matched -- an end trailer with "verified": true.
+# A version is verified iff its folder exists and its manifest ends in that
+# trailer. Legacy versions (made before manifests) have none and are simply
+# unverified.
+
+MANIFEST_SUFFIX = ".manifest.jsonl"
+MANIFEST_VERSION = 1
+
+
+def manifest_path(job: Dict, stamp: str) -> str:
+    """Where version `stamp`'s manifest lives: a sibling of its folder."""
+    return os.path.join(job_root(job), stamp + MANIFEST_SUFFIX)
+
+
+def _last_line(path: str, limit: int = 4096) -> Optional[bytes]:
+    """The last non-empty line of `path`, reading only its tail.
+
+    None if the file cannot be read or the last line is longer than `limit`
+    (a real trailer is under 100 bytes, so that is garbage, not a trailer).
+    """
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            start = max(0, end - limit)
+            handle.seek(start)
+            tail = handle.read().rstrip(b"\r\n")
+    except OSError:
+        return None
+    cut = tail.rfind(b"\n")
+    if cut < 0 and start > 0:
+        return None
+    return tail[cut + 1:]
+
+
+def read_manifest_summary(job: Dict, stamp: str) -> Optional[Dict]:
+    """Version `stamp`'s end trailer, or None if it has no valid one.
+
+    Missing, truncated (a run that died mid-write) or garbage manifests all
+    come back None -- "not verified", never an exception.
+    """
+    line = _last_line(manifest_path(job, stamp))
+    if not line:
+        return None
+    try:
+        trailer = json.loads(line.decode("utf-8"))
+    except ValueError:
+        return None
+    if (not isinstance(trailer, dict) or trailer.get("type") != "end"
+            or trailer.get("verified") is not True):
+        return None
+    return trailer
+
+
+def is_verified(job: Dict, stamp: str) -> bool:
+    """True iff version `stamp` exists and its manifest ends verified."""
+    return (os.path.isdir(version_path(job, stamp))
+            and read_manifest_summary(job, stamp) is not None)
+
+
+def verified_versions(job: Dict) -> List[str]:
+    """The verified subset of `version_names(job)`, oldest first."""
+    return [name for name in version_names(job) if is_verified(job, name)]
 
 
 def prune_versions(job: Dict) -> List[str]:
@@ -191,16 +410,34 @@ def prune_versions(job: Dict) -> List[str]:
     file in it is open, the drive went away) is left in place and simply not
     reported as removed -- a failed prune must never fail the backup that
     just succeeded.
+
+    The newest VERIFIED version is never deleted, even when retention says
+    it should be: if every newer version is a legacy (manifest-less) copy,
+    it is still the last one known to match what was copied. Legacy versions
+    otherwise prune by retention as before. A pruned version's manifest goes
+    with it.
     """
     keep = max(1, int(job.get("retention", DEFAULT_RETENTION)))
     names = version_names(job)
+    protected = next((name for name in reversed(names)
+                      if is_verified(job, name)), None)
     removed = []
     for name in names[:max(0, len(names) - keep)]:
+        if name == protected:
+            continue
+        # Manifest first: a version whose folder deletion fails halfway must
+        # not keep claiming to be verified.
         try:
-            shutil.rmtree(version_path(job, name))
-            removed.append(name)
+            os.remove(manifest_path(job, name))
+        except FileNotFoundError:
+            pass  # a legacy version has none
         except OSError:
             continue
+        try:
+            _rmtree(version_path(job, name))
+        except OSError:
+            continue
+        removed.append(name)
     return removed
 
 
@@ -211,7 +448,7 @@ def prune_versions(job: Dict) -> List[str]:
 def _ignore_links(directory: str, names) -> set:
     """`shutil.copytree`'s ignore hook, dropping symlinks and junctions.
 
-    Reuses `disk_utils._is_link_like` rather than a second link predicate:
+    Reuses `fs_utils._is_link_like` rather than a second link predicate:
     `is_symlink()` is False for a Windows junction, and the reparse-point
     attribute alone wrongly catches cloud-sync roots, so the name-surrogate
     test lives in exactly one place. Copying a junction that points at an
@@ -224,16 +461,13 @@ def _ignore_links(directory: str, names) -> set:
         return set()
 
 
-def walk_tree(root: str) -> Tuple[Dict[str, Tuple[int, float]], int]:
-    """`({relative path: (size, mtime)}, unreadable_count)` for a whole tree.
+def _iter_tree(root: str) -> Iterator[Optional[Tuple[str, int, float]]]:
+    """Yield `(relative path, size, mtime)` per file, or None per unreadable
+    entry. Relative paths use forward slashes and keep their case.
 
-    Relative paths are normalised with forward slashes and lowercased case
-    only for the *key*, so a source and its backup compare correctly on
-    Windows' case-insensitive filesystem. Unreadable entries are counted, not
-    raised -- same contract as `disk_utils.folder_size`.
+    A generator so a caller that only needs a count or a total (pre-flight,
+    the copy's progress total) never holds the whole tree in memory.
     """
-    files: Dict[str, Tuple[int, float]] = {}
-    skipped = 0
     stack = [root]
     while stack:
         current = stack.pop()
@@ -248,17 +482,129 @@ def walk_tree(root: str) -> Tuple[Dict[str, Tuple[int, float]], int]:
                             continue
                         stat = entry.stat(follow_symlinks=False)
                         rel = os.path.relpath(entry.path, root).replace("\\", "/")
-                        files[rel.lower()] = (stat.st_size, stat.st_mtime)
+                        yield rel, stat.st_size, stat.st_mtime
                     except OSError:
-                        skipped += 1
+                        yield None
         except OSError:
+            yield None
+
+
+def walk_tree(root: str) -> Tuple[Dict[str, Tuple[int, float]], int]:
+    """`({relative path: (size, mtime)}, unreadable_count)` for a whole tree.
+
+    Relative paths are normalised with forward slashes and lowercased case
+    only for the *key*, so a source and its backup compare correctly on
+    Windows' case-insensitive filesystem. Unreadable entries are counted, not
+    raised.
+    """
+    files: Dict[str, Tuple[int, float]] = {}
+    skipped = 0
+    for item in _iter_tree(root):
+        if item is None:
             skipped += 1
+        else:
+            files[item[0].lower()] = (item[1], item[2])
     return files, skipped
+
+
+def tree_totals(root: str) -> Tuple[int, int]:
+    """`(file count, total bytes)` of a tree, in constant memory."""
+    count = size = 0
+    for item in _iter_tree(root):
+        if item is not None:
+            count += 1
+            size += item[1]
+    return count, size
+
+
+# Read/write chunk for the hashing copy and the verify pass. 1 MiB is
+# shutil's own Windows buffer size.
+CHUNK = 1024 * 1024
+
+
+# Windows file attributes `_hash_copy` carries over. copy2 (CopyFile2) kept
+# these for free; copystat only carries read-only (through chmod), so without
+# this a backed-up hidden or system file came back as an ordinary one.
+# Compressed/encrypted/sparse are not settable through SetFileAttributesW and
+# are deliberately absent. Alternate data streams are NOT copied either.
+_KEPT_ATTRIBUTES = (0x1 | 0x2 | 0x4 | 0x20 | 0x2000)  # RO, HIDDEN, SYSTEM, ARCHIVE, NOT_CONTENT_INDEXED
+_FILE_ATTRIBUTE_NORMAL = 0x80
+
+
+def _copy_windows_attributes(src: str, dst: str) -> None:
+    """Give `dst` the hidden/system/archive/read-only bits `src` has.
+
+    Windows only; a no-op elsewhere. Best effort, like copy2's own metadata
+    copy: a failure here leaves a correct copy with plainer attributes, which
+    is not a reason to fail the file.
+    """
+    if os.name != "nt":
+        return
+    try:
+        wanted = os.stat(src).st_file_attributes & _KEPT_ATTRIBUTES
+        import ctypes
+        ctypes.windll.kernel32.SetFileAttributesW(dst, wanted or _FILE_ATTRIBUTE_NORMAL)
+    except (OSError, AttributeError):
+        pass
+
+
+def _make_writable_and_retry(func, path, _error) -> None:
+    """`shutil.rmtree` error hook: clear read-only, then retry once.
+
+    Windows refuses to delete a read-only file, and a backup keeps the
+    source's read-only bit, so without this one read-only file in the source
+    made every older version of the job undeletable and retention silently
+    stopped working. A second failure propagates to the caller.
+    """
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def _rmtree(path: str) -> None:
+    """`shutil.rmtree` that also removes read-only files. Raises OSError."""
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_make_writable_and_retry)
+    else:  # onexc does not exist before 3.12; onerror is deprecated from it
+        shutil.rmtree(path, onerror=_make_writable_and_retry)
+
+
+def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
+    """Copy `src` to `dst`, hashing the bytes as they pass through.
+
+    Returns `(bytes read, source mtime, sha256 hex)`. Metadata is then copied
+    with `copystat`, as `copy2` does, so the mtime the changes-since
+    comparison relies on is preserved. If anything fails once `dst` exists,
+    the half-written file is deleted before the error propagates, so it can
+    never sit in a version looking like a real copy.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    with open(src, "rb") as fsrc:
+        mtime = os.fstat(fsrc.fileno()).st_mtime
+        try:
+            with open(dst, "wb") as fdst:
+                while True:
+                    chunk = fsrc.read(CHUNK)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    fdst.write(chunk)
+                    size += len(chunk)
+            shutil.copystat(src, dst)
+            _copy_windows_attributes(src, dst)
+        except BaseException:
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+            raise
+    return size, mtime, digest.hexdigest()
 
 
 def copy_tree(source: str, destination: str,
               on_progress: Optional[Callable[[int, int], None]] = None,
-              should_abort: Optional[Callable[[], bool]] = None
+              should_abort: Optional[Callable[[], bool]] = None,
+              on_copied: Optional[Callable[[str, int, float, str], None]] = None
               ) -> Tuple[int, int, List[str]]:
     """Copy `source` into `destination`, reporting `(done, total)` per file.
 
@@ -268,19 +614,40 @@ def copy_tree(source: str, destination: str,
     on, which is exactly the "a permission error must not abandon the batch"
     behaviour the rest of this app has, and it already handles directory
     creation and metadata.
+
+    With `on_copied`, each file is copied by `_hash_copy` and
+    `on_copied(relative path, size, mtime, sha256)` is called once it has
+    landed -- `run_job` streams that into the version's manifest. Without it
+    (restore), files are copied with plain `copy2`. If `on_copied` fails the
+    file just copied is deleted, so the tree never holds a file its manifest
+    does not list.
     """
-    total = len(walk_tree(source)[0])
+    total = tree_totals(source)[0]
     state = {"done": 0, "bytes": 0}
 
     def copy_one(src: str, dst: str) -> str:
+        """copytree's per-file hook: abort check, copy, count, report."""
         if should_abort is not None and should_abort():
             raise BackupAborted()
-        shutil.copy2(src, dst)
+        if on_copied is None:
+            shutil.copy2(src, dst)
+            try:
+                state["bytes"] += os.path.getsize(dst)
+            except OSError:
+                pass
+        else:
+            size, mtime, sha = _hash_copy(src, dst)
+            try:
+                on_copied(os.path.relpath(src, source).replace("\\", "/"),
+                          size, mtime, sha)
+            except BaseException:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                raise
+            state["bytes"] += size
         state["done"] += 1
-        try:
-            state["bytes"] += os.path.getsize(dst)
-        except OSError:
-            pass
         if on_progress is not None:
             on_progress(state["done"], total)
         return dst
@@ -301,65 +668,410 @@ def copy_tree(source: str, destination: str,
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight: refuse to start a run that cannot succeed or could do harm
+# ---------------------------------------------------------------------------
+
+def target_inside_source(source: str, target: str) -> bool:
+    """True if `target` is `source` or lies anywhere beneath it.
+
+    Backing a folder up into itself copies the previous run's copies on every
+    run, so the target grows without bound and no error is ever raised. Both
+    paths are resolved (`realpath`, so a junction cannot hide the overlap) and
+    case-folded (`normcase`; Windows paths differ in case without differing at
+    all). The comparison is on a separator boundary, so `data2` is not
+    "inside" `data`.
+    """
+    source_norm = os.path.normcase(os.path.realpath(source))
+    target_norm = os.path.normcase(os.path.realpath(target))
+    prefix = source_norm if source_norm.endswith(os.sep) else source_norm + os.sep
+    return target_norm == source_norm or target_norm.startswith(prefix)
+
+
+def nearest_existing_ancestor(path: str) -> Optional[str]:
+    """`path` itself, or its closest parent that exists; None if none does.
+
+    None means even the root is missing (an unplugged drive letter), which
+    ends the walk instead of looping on a root that is its own parent.
+    """
+    current = os.path.abspath(path)
+    while not os.path.exists(current):
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    return current
+
+
+def volume_id(path: str) -> str:
+    """Identity of the volume holding existing `path`, as a string.
+
+    `os.stat().st_dev`. On Windows that is the volume serial number, which
+    follows the drive across letter changes. On macOS/Linux it is the device
+    number, which is NOT guaranteed stable across remounts or reboots, so
+    there the check is best-effort and unverified: it can wrongly block a
+    legitimate remount (re-save the job to re-record it) and is not relied on
+    to catch every swapped drive. Raises OSError.
+
+    On Windows only the low 32 bits are kept: that is the serial `vol`
+    prints, and the only part every Python agrees on. 3.12+ reports NTFS's
+    64-bit serial in `st_dev` while earlier versions (README says 3.9+)
+    report the 32-bit one, so the raw value recorded under one interpreter
+    would read as "a different drive" under the other and block every run.
+    """
+    dev = os.stat(path).st_dev
+    return str(dev & 0xFFFFFFFF if os.name == "nt" else dev)
+
+
+def _same_volume(recorded: str, current: str) -> bool:
+    """True if a recorded volume id names the `current` volume.
+
+    Also accepts a recorded raw 64-bit Windows serial (stored before
+    `volume_id` masked it) whose low 32 bits match.
+    """
+    if recorded == current:
+        return True
+    return (os.name == "nt" and recorded.isdigit() and current.isdigit()
+            and int(recorded) & 0xFFFFFFFF == int(current))
+
+
+def target_volume(target: str) -> str:
+    """`volume_id` of `target`'s nearest existing ancestor, or "" if the
+    drive is unavailable. For recording on a job; never raises."""
+    anchor = nearest_existing_ancestor(target)
+    if anchor is None:
+        return ""
+    try:
+        return volume_id(anchor)
+    except OSError:
+        return ""
+
+
+def _free_bytes(path: str) -> int:
+    """Free bytes on the volume holding existing `path`. Raises OSError."""
+    return shutil.disk_usage(path).free
+
+
+def preflight(job: Dict,
+              free_space: Optional[Callable[[str], int]] = None,
+              volume: Optional[Callable[[str], str]] = None) -> Optional[str]:
+    """Check `job` before anything is written. None if safe, else why not.
+
+    Runs before the job root is created, so a refused run leaves the target
+    untouched. Guards, in order: source exists, is a directory and holds at
+    least one file (a blank or unplugged source must not drive a prune of
+    good history); target is not the source or inside it; the target drive is
+    present; free space covers the source plus `SPACE_MARGIN`; and, when the
+    job recorded one, the target is on the same volume as before (an unplugged
+    drive must not cause a backup into a folder on C:). A job with no recorded
+    volume is not blocked -- `run_job` reports the current one for
+    `record_run` to store (trust on first use).
+
+    `free_space(path) -> bytes` and `volume(path) -> str` are injectable for
+    tests; they default to the real disk and `volume_id`.
+    """
+    free_space = free_space or _free_bytes
+    volume = volume or volume_id
+    source = job.get("source", "")
+    target = job.get("target", "")
+    if not source or not os.path.isdir(source):
+        return f"Source folder not found: {source or '(not set)'}"
+    if not target:
+        return "No target folder is set for this job"
+
+    file_count, source_bytes = tree_totals(source)
+    if not file_count:
+        return ("The source folder is empty (or none of its files can be "
+                "read), so nothing was backed up. Check that its drive is "
+                "connected.")
+    if target_inside_source(source, target):
+        return "The target cannot be inside the source folder."
+
+    anchor = nearest_existing_ancestor(target)
+    if anchor is None:
+        return f"The target drive is not available, so nothing was backed up: {target}"
+
+    need = int(source_bytes * SPACE_MARGIN)
+    try:
+        free = free_space(anchor)
+    except OSError as exc:
+        return f"Could not read the free space on the target drive: {exc}"
+    if free < need:
+        return (f"Not enough free space on the target drive: the backup needs "
+                f"about {human_size(need)} but only {human_size(free)} is free.")
+
+    recorded = job.get("target_volume")
+    if recorded:
+        try:
+            current = volume(anchor)
+        except OSError as exc:
+            return f"Could not identify the target drive: {exc}"
+        if not _same_volume(str(recorded), current):
+            return ("The backup drive is not the same drive as before. Connect "
+                    "the original drive or edit the job.")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Running a job
 # ---------------------------------------------------------------------------
 
+class _ManifestWriteFailed(Exception):
+    """A manifest line could not be written. Not an OSError on purpose, for
+    the same reason as BackupAborted: copytree would swallow an OSError as one
+    skipped file and carry on, leaving a copied file the manifest omits."""
+
+
+# How many offending files a failed verification names in its message.
+VERIFY_NAMED = 5
+
+
+def _verify_copy(partial: str, manifest: str,
+                 on_progress: Optional[Callable[[int, int], None]],
+                 should_abort: Optional[Callable[[], bool]],
+                 total: int) -> Tuple[int, int, List[str]]:
+    """Re-read every file the manifest lists from `partial`; compare.
+
+    Streams the manifest a line at a time and returns `(files checked, bad
+    count, the first VERIFY_NAMED bad paths)`, so memory stays flat however
+    many files there are. A file is bad if it is missing, unreadable, a different size
+    or a different SHA-256 from what was recorded while copying.
+
+    The re-read is a fresh open of the copied file, not the hash computed
+    during the copy, so it catches a fault anywhere on the write path. It
+    does not prove the bytes are on the platter: the OS file cache can serve
+    this read from memory. Bit rot on the stored disk is a later scheduled
+    deep-verify's job, not this one's.
+    """
+    bad = 0
+    named: List[str] = []
+    done = 0
+    if on_progress is not None:
+        on_progress(0, total)
+    with open(manifest, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if should_abort is not None and should_abort():
+                raise BackupAborted()
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                entry = None
+            if not isinstance(entry, dict):
+                bad += 1
+                if len(named) < VERIFY_NAMED:
+                    named.append("(damaged manifest line)")
+                continue
+            if entry.get("type") != "file":
+                continue
+            rel = entry.get("path", "")
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                with open(os.path.join(partial, *rel.split("/")), "rb") as copied:
+                    while True:
+                        chunk = copied.read(CHUNK)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        size += len(chunk)
+                ok = size == entry.get("size") and digest.hexdigest() == entry.get("sha256")
+            except OSError:
+                ok = False
+            if not ok:
+                bad += 1
+                if len(named) < VERIFY_NAMED:
+                    named.append(rel)
+            done += 1
+            if on_progress is not None:
+                on_progress(done, total)
+    return done, bad, named
+
+
+def _discard(partial: str, manifest_tmp: str) -> None:
+    """Remove an abandoned run's `.partial` folder and its temp manifest."""
+    try:
+        _rmtree(partial)
+    except OSError:
+        pass  # best effort: a leftover .partial is never listed as a version
+    try:
+        os.remove(manifest_tmp)
+    except OSError:
+        pass
+
+
+# How many one-second stamps `_claim_stamp` tries before giving up.
+CLAIM_ATTEMPTS = 3
+
+
+def _claim_stamp(root: str, job: Dict) -> Optional[str]:
+    """Reserve a version stamp no other run of this job holds; None if none.
+
+    Version names have one-second resolution, so two runs in the same second
+    (a quick run then Run now again, or the scheduled task firing during a
+    manual run) used to share a `.partial` folder and a manifest -- and the
+    loser's cleanup deleted the winner's verified manifest, silently demoting
+    a good version to unverified. `os.mkdir` of the `.partial` folder is the
+    atomic claim; a stamp whose version or manifest already exists is
+    released and the next second tried. Raises OSError if the target cannot
+    be written.
+
+    ponytail: per-stamp claim only. Two runs of one job in different seconds
+    still run side by side (each in its own folder, both verified); a per-job
+    lock is the upgrade if that ever needs preventing.
+    """
+    for attempt in range(CLAIM_ATTEMPTS):
+        if attempt:
+            time.sleep(1)
+        stamp = datetime.now().strftime(VERSION_FORMAT)
+        partial = os.path.join(root, stamp + ".partial")
+        try:
+            os.mkdir(partial)
+        except FileExistsError:
+            continue
+        if (os.path.exists(os.path.join(root, stamp))
+                or os.path.exists(manifest_path(job, stamp))):
+            os.rmdir(partial)
+            continue
+        return stamp
+    return None
+
+
 def run_job(job: Dict,
             on_progress: Optional[Callable[[int, int], None]] = None,
-            should_abort: Optional[Callable[[], bool]] = None) -> Dict:
-    """Take one versioned copy of `job`'s source and prune old versions.
+            should_abort: Optional[Callable[[], bool]] = None,
+            on_phase: Optional[Callable[[str], None]] = None) -> Dict:
+    """Take one versioned, verified copy of `job`'s source; prune old versions.
 
     Returns a plain result dict: `ok`, `message`, and on success `version`,
-    `files`, `bytes`, `pruned`, `errors`. Never raises for a filesystem
+    `files`, `bytes`, `pruned`, `errors`, `verified` (always True on
+    success), `manifest` and `target_volume`. Never raises for a filesystem
     problem the user can see and fix -- a missing source, an unwritable
     target and a drive that is not mounted all come back as `ok=False` with a
     message, per CLAUDE.md §5's "a destination failure degrades cleanly".
 
-    The copy lands in `<stamp>.partial` and is renamed to `<stamp>` only once
-    it completes. An interrupted run therefore leaves nothing that
-    `version_names()` will offer as a restore point, and nothing that the
-    changes-since comparison would measure against.
-    """
-    source = job.get("source", "")
-    target = job.get("target", "")
-    if not source or not os.path.isdir(source):
-        return {"ok": False, "message": f"Source folder not found: {source or '(not set)'}"}
-    if not target:
-        return {"ok": False, "message": "No target folder is set for this job"}
+    The sequence, and why it is in this order:
 
-    stamp = datetime.now().strftime(VERSION_FORMAT)
+    1. Copy into `<stamp>.partial`, hashing each file as it is copied and
+       streaming one manifest line per file into `<stamp>.manifest.jsonl.tmp`.
+    2. Re-read every copied file and compare it to the manifest
+       (`_verify_copy`). Any mismatch fails the run: nothing is promoted,
+       nothing is pruned, and the `.partial` folder and `.tmp` manifest are
+       KEPT so the failure can be inspected.
+    3. Append the verified trailer, fsync, rename the manifest into place,
+       and only then rename `.partial` to `<stamp>` -- so a version folder
+       never exists without its finished manifest.
+    4. Prune, which never removes the newest verified version.
+
+    Source files that could not be read are reported in `errors` and left
+    out of the manifest; the run is still ok. "Verified" means every file
+    that was copied matches, not that every source file was copied -- the
+    message says how many were skipped.
+
+    `on_phase` is called with "copying" and then "verifying"; `on_progress`
+    restarts from 0 for the verify pass. Cancelling (`should_abort`) in
+    either phase removes the `.partial` folder and the `.tmp` manifest.
+
+    `preflight()` runs first and nothing is created until it passes.
+    """
+    problem = preflight(job)
+    if problem:
+        return {"ok": False, "message": problem}
+    source, target = job["source"], job["target"]
+
     root = job_root(job)
-    partial = os.path.join(root, stamp + ".partial")
-    final = os.path.join(root, stamp)
     try:
         os.makedirs(root, exist_ok=True)
+        stamp = _claim_stamp(root, job)
     except OSError as exc:
         return {"ok": False, "message": f"Target folder is not writable: {exc}"}
+    if stamp is None:
+        return {"ok": False, "message": (
+            "Another backup of this job is starting at the same moment, so this "
+            "one did not start. Nothing was written; try again.")}
+    partial = os.path.join(root, stamp + ".partial")
+    final = os.path.join(root, stamp)
+    manifest = manifest_path(job, stamp)
+    manifest_tmp = manifest + ".tmp"
 
+    if on_phase is not None:
+        on_phase("copying")
     try:
-        files, copied_bytes, errors = copy_tree(
-            source, partial, on_progress=on_progress, should_abort=should_abort)
+        with open(manifest_tmp, "w", encoding="utf-8", newline="\n") as out:
+            out.write(json.dumps({"type": "header", "version": MANIFEST_VERSION,
+                                  "stamp": stamp, "source": source}) + "\n")
+
+            def record(rel: str, size: int, mtime: float, sha: str) -> None:
+                """Stream one file's manifest line straight to disk."""
+                try:
+                    out.write(json.dumps({"type": "file", "path": rel, "size": size,
+                                          "mtime": mtime, "sha256": sha}) + "\n")
+                    out.flush()
+                except OSError as exc:
+                    raise _ManifestWriteFailed(str(exc)) from exc
+
+            files, copied_bytes, errors = copy_tree(
+                source, partial, on_progress=on_progress,
+                should_abort=should_abort, on_copied=record)
     except BackupAborted:
-        shutil.rmtree(partial, ignore_errors=True)
+        _discard(partial, manifest_tmp)
         return {"ok": False, "message": "Backup cancelled"}
-    except OSError as exc:
-        shutil.rmtree(partial, ignore_errors=True)
+    except (OSError, _ManifestWriteFailed) as exc:
+        _discard(partial, manifest_tmp)
         return {"ok": False, "message": f"Backup failed: {exc}"}
 
+    if on_phase is not None:
+        on_phase("verifying")
+    problem = None
     try:
+        checked, bad, named = _verify_copy(partial, manifest_tmp, on_progress,
+                                           should_abort, files)
+    except BackupAborted:
+        _discard(partial, manifest_tmp)
+        return {"ok": False, "message": "Backup cancelled"}
+    except OSError as exc:
+        problem = f"its manifest could not be read back ({exc})"
+    else:
+        if bad:
+            more = ", ..." if bad > len(named) else ""
+            problem = (f"{bad} file(s) did not match what was copied "
+                       f"({', '.join(named)}{more})")
+        elif checked != files:
+            problem = (f"the manifest lists {checked} file(s) but {files} "
+                       "were copied")
+    if problem:
+        return {"ok": False,
+                "message": (f"Backup verification failed: {problem}. Nothing was "
+                            "pruned and earlier backups are untouched. The "
+                            f"unverified copy was kept for inspection at {partial}"),
+                "verified": False, "partial": partial, "manifest": manifest_tmp,
+                "files": files, "errors": errors}
+
+    try:
+        with open(manifest_tmp, "a", encoding="utf-8", newline="\n") as out:
+            out.write(json.dumps({"type": "end", "files": files,
+                                  "bytes": copied_bytes, "verified": True}) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(manifest_tmp, manifest)
         os.replace(partial, final)
     except OSError as exc:
-        shutil.rmtree(partial, ignore_errors=True)
+        _discard(partial, manifest_tmp)
+        try:
+            os.remove(manifest)
+        except OSError:
+            pass
         return {"ok": False, "message": f"Could not finalise the backup: {exc}"}
 
     pruned = prune_versions(job)
-    message = f"Backed up {files} file(s) to {final}"
+    message = f"Backed up {files} file(s) to {final} and verified every copied file"
     if errors:
-        message += f". {len(errors)} file(s) could not be read"
+        message += (f". {len(errors)} file(s) could not be read and were "
+                    "skipped, so they are not in this backup")
     if pruned:
         message += f". Removed {len(pruned)} old version(s)"
     return {"ok": True, "message": message, "version": stamp, "files": files,
-            "bytes": copied_bytes, "pruned": pruned, "errors": errors}
+            "bytes": copied_bytes, "pruned": pruned, "errors": errors,
+            "verified": True, "manifest": manifest,
+            "target_volume": target_volume(target)}
 
 
 def record_run(job_id: str, result: Dict) -> Optional[Dict]:
@@ -367,11 +1079,17 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
 
     Re-read from disk rather than mutating the caller's copy: the headless CLI
     and the GUI can both be looking at this file, and the run is the only
-    field either of them writes during a run.
+    field either of them writes during a run. Raises JobsFileCorrupt if the
+    jobs file has been damaged since the run began.
     """
     job = get_job(job_id)
     if job is None:
         return None
+    if result.get("ok") and result.get("target_volume") and not job.get("target_volume"):
+        # Trust on first use: a job made before volume identity existed learns
+        # its drive from its first successful run, and is checked against it
+        # from then on.
+        job["target_volume"] = result["target_volume"]
     job["last_run"] = datetime.now().isoformat(timespec="seconds")
     job["last_result"] = ("ok" if result.get("ok") else "failed") + \
         (f": {result.get('message', '')}" if not result.get("ok") else "")
@@ -392,7 +1110,7 @@ def changes_since(job: Dict,
     `removed`, `changed` (their sum) and `bytes` (the size of everything
     added or modified, i.e. what the next backup would have to write).
 
-    **Comparison is by size and mtime, not by content hash.** `copy2`
+    **Comparison is by size and mtime, not by content hash.** The copy
     preserves mtime, so an untouched file matches its backup exactly and any
     ordinary edit changes one or both. Hashing both trees would be certain but
     reads every byte of both -- minutes for the kind of folder people back up,
@@ -492,11 +1210,18 @@ def restore_version(job: Dict, version: str, destination: str,
 # Windows Task Scheduler
 # ---------------------------------------------------------------------------
 
-def task_name(job_id: str) -> str:
+# Task Scheduler name prefixes. The legacy one is what tasks were registered
+# under before the Safekeep rename; only utils/migrate.py asks for it, to
+# remove an old task once its replacement has registered.
+TASK_PREFIX = "Safekeep_Backup_"
+LEGACY_TASK_PREFIX = "UtilityTool_Backup_"
+
+
+def task_name(job_id: str, legacy: bool = False) -> str:
     """The scheduled task's name. Prefixed so every task this app owns is
     identifiable in Task Scheduler, and keyed on the job id so a rename never
-    strands one."""
-    return f"UtilityTool_Backup_{job_id}"
+    strands one. `legacy=True` gives the pre-rename name."""
+    return f"{LEGACY_TASK_PREFIX if legacy else TASK_PREFIX}{job_id}"
 
 
 def job_command(job_id: str) -> str:
@@ -559,7 +1284,9 @@ def schtasks_args(job: Dict) -> Optional[List[str]]:
 # macOS (launchd)
 # ------------------------------
 # A launchd label has to be unique per user and is conventionally reverse-DNS.
-LAUNCHD_PREFIX = "com.techcabana.utilitytool.backup"
+# The legacy prefix is the pre-rename label, used only by the migration.
+LAUNCHD_PREFIX = "com.techcabana.safekeep.backup"
+LEGACY_LAUNCHD_PREFIX = "com.techcabana.utilitytool.backup"
 
 # launchd's own weekday numbering: 0 and 7 are both Sunday, 1 is Monday. The
 # Windows path pins a weekly job to Monday, so this does too -- the two
@@ -567,14 +1294,15 @@ LAUNCHD_PREFIX = "com.techcabana.utilitytool.backup"
 LAUNCHD_MONDAY = 1
 
 
-def launchd_label(job_id: str) -> str:
-    return f"{LAUNCHD_PREFIX}.{job_id}"
+def launchd_label(job_id: str, legacy: bool = False) -> str:
+    """The launchd label for `job_id`; `legacy=True` gives the pre-rename one."""
+    return f"{LEGACY_LAUNCHD_PREFIX if legacy else LAUNCHD_PREFIX}.{job_id}"
 
 
-def launchd_plist_path(job_id: str) -> str:
+def launchd_plist_path(job_id: str, legacy: bool = False) -> str:
     """Where the agent's plist lives. Per-user, so no admin rights needed."""
     return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents",
-                        f"{launchd_label(job_id)}.plist")
+                        f"{launchd_label(job_id, legacy)}.plist")
 
 
 def launchd_plist(job: Dict) -> Optional[str]:
@@ -621,6 +1349,7 @@ def launchd_plist(job: Dict) -> Optional[str]:
 
 
 def _xml_escape(text: str) -> str:
+    """Escape `text` for a plist <string> element."""
     return (text.replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;"))
 
@@ -649,20 +1378,23 @@ def _launchd_register(job: Dict) -> Tuple[bool, str]:
 
 
 def _launchd_domain() -> str:
+    """The per-user launchd domain the agents are loaded into."""
     return f"gui/{os.getuid()}" if hasattr(os, "getuid") else "gui/501"
 
 
-def _launchd_unregister(job_id: str) -> Tuple[bool, str]:
-    ok, output = _launchctl(["bootout", _launchd_domain(), launchd_label(job_id)])
+def _launchd_unregister(job_id: str, legacy: bool = False) -> Tuple[bool, str]:
+    """Unload the launchd agent for `job_id` and delete its plist."""
+    ok, output = _launchctl(["bootout", _launchd_domain(), launchd_label(job_id, legacy)])
     try:
-        os.remove(launchd_plist_path(job_id))
+        os.remove(launchd_plist_path(job_id, legacy))
     except OSError:
         pass  # never registered, or already gone
     return ok, output
 
 
-def _launchd_exists(job_id: str) -> bool:
-    return os.path.isfile(launchd_plist_path(job_id))
+def _launchd_exists(job_id: str, legacy: bool = False) -> bool:
+    """Whether a plist for `job_id` is installed."""
+    return os.path.isfile(launchd_plist_path(job_id, legacy))
 
 
 def _launchctl(args: List[str]) -> Tuple[bool, str]:
@@ -713,19 +1445,21 @@ def register_task(job: Dict) -> Tuple[bool, str]:
     return _run(args)
 
 
-def unregister_task(job_id: str) -> Tuple[bool, str]:
+def unregister_task(job_id: str, legacy: bool = False) -> Tuple[bool, str]:
     """Delete the OS scheduled task for `job_id`. A job that never had one
     reports failure from schtasks, which the caller treats as "nothing to
-    remove" rather than an error."""
+    remove" rather than an error. `legacy=True` targets the pre-rename task."""
     if sys.platform == "darwin":
-        return _launchd_unregister(job_id)
-    return _run(["schtasks", "/delete", "/tn", task_name(job_id), "/f"])
+        return _launchd_unregister(job_id, legacy)
+    return _run(["schtasks", "/delete", "/tn", task_name(job_id, legacy), "/f"])
 
 
-def task_exists(job_id: str) -> bool:
+def task_exists(job_id: str, legacy: bool = False) -> bool:
+    """Whether the OS scheduler holds a task for `job_id` (or, with
+    `legacy=True`, one under the pre-rename name)."""
     if sys.platform == "darwin":
-        return _launchd_exists(job_id)
-    ok, _ = _run(["schtasks", "/query", "/tn", task_name(job_id)])
+        return _launchd_exists(job_id, legacy)
+    ok, _ = _run(["schtasks", "/query", "/tn", task_name(job_id, legacy)])
     return ok
 
 
