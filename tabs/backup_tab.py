@@ -18,7 +18,8 @@ from PySide6.QtCore import Qt
 from utils import backup_utils
 from utils.fs_utils import human_size
 from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
-                            divider, icon_button, section, table_header)
+                            add_field, divider, icon_button, section,
+                            section_header, table_header)
 
 
 class BackupWorker(QtCore.QObject):
@@ -147,6 +148,30 @@ class BackupJobDialog(QtWidgets.QDialog):
         hint.setWordWrap(True)
         v.addWidget(hint)
 
+        # Advanced: settings most people never change. A plain labelled
+        # section until the Simple/Advanced switch (batch 4) can hide it.
+        v.addWidget(section_header("Advanced"))
+        advanced = QtWidgets.QFormLayout()
+        advanced.setSpacing(8)
+        advanced.setLabelAlignment(Qt.AlignLeft)
+        self.verify = QtWidgets.QComboBox()
+        # Same order as backup_utils.VERIFY_MODES; the index is the mode.
+        self.verify.addItems(["Full - re-read every file (slowest, safest)",
+                              "Quick - check sizes and a sample of files",
+                              "Off - do not re-read the copy"])
+        self.verify.setCurrentIndex(backup_utils.VERIFY_MODES.index(
+            backup_utils.job_verify_mode(job or {})))
+        # One short line on purpose: the dialog must still fit a 1366x768
+        # laptop at 125% scaling (~614 px tall), and the item texts already
+        # say what each mode does.
+        field = add_field(advanced, "Verification", self.verify, hint=(
+            "Quick and Off finish sooner but check less. Off versions are "
+            "marked not verified."))
+        # Line the field up with the form above (its widest label).
+        advanced.labelForField(field).setMinimumWidth(
+            form.labelForField(self.retention).sizeHint().width())
+        v.addLayout(advanced)
+
         self.error = QtWidgets.QLabel()
         self.error.setObjectName("StatusError")
         self.error.setWordWrap(True)
@@ -229,14 +254,15 @@ class BackupJobDialog(QtWidgets.QDialog):
             volume = self.job["target_volume"]
 
         schedule = ("manual", "daily", "weekly")[self.schedule.currentIndex()]
+        verify = backup_utils.VERIFY_MODES[self.verify.currentIndex()]
         if self.job is None:
             self.job = backup_utils.new_job(name, source, target, schedule, at,
-                                            self.retention.value(), volume)
+                                            self.retention.value(), volume, verify)
         else:
             self.job.update({"name": name, "source": source, "target": target,
                              "schedule": schedule, "at": at,
                              "retention": self.retention.value(),
-                             "target_volume": volume})
+                             "target_volume": volume, "verify": verify})
         self.accept()
 
 
@@ -455,6 +481,14 @@ class RestoreRow(QtWidgets.QWidget):
         when = changes.get("when") if changes.get("ok") else None
         last = QtWidgets.QLabel(when or "Never backed up")
         last.setObjectName("Hint")
+        if when and changes.get("verified") is False:
+            # The version Restore would use was never checked after copying
+            # (verification off, or made before checking existed). Say so
+            # rather than let it pass for a verified one.
+            last.setText(f"{when}\nnot verified")
+            last.setObjectName("StatusWarn")
+            last.setToolTip("This backup was not read back and checked after "
+                            "it was copied.")
 
         text, style = self._changes(changes)
         changed = QtWidgets.QLabel(text)

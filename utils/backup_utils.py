@@ -33,7 +33,9 @@ that can honestly be promised until someone runs it.
 import contextlib
 import hashlib
 import json
+import math
 import os
+import random
 import re
 import shutil
 import stat
@@ -62,6 +64,28 @@ _VERSION_RE = re.compile(r"^\d{8}-\d{6}$")
 
 SCHEDULES = ("manual", "daily", "weekly")
 DEFAULT_RETENTION = 5
+
+# How hard a run checks its own copy before the version counts (card 42).
+# "full" re-reads every copied file; "quick" checks every file's size and
+# re-reads a sample; "off" skips the re-read and the version is never counted
+# as verified. A missing or unknown value is "full": the safe default, and an
+# old or hand-edited jobs file must never weaken or crash a run.
+VERIFY_MODES = ("full", "quick", "off")
+DEFAULT_VERIFY = "full"
+
+# Quick mode's sample: about this fraction of the files, at least one, at
+# most QUICK_SAMPLE_CAP, plus the largest and the most recently modified
+# file. The cap keeps a quick check of a huge tree bounded (500 files at the
+# ~1 MB/s small-file re-read speed measured here is well under a minute); the
+# size check still covers every file.
+QUICK_SAMPLE_FRACTION = 0.05
+QUICK_SAMPLE_CAP = 500
+
+
+def job_verify_mode(job: Dict) -> str:
+    """`job`'s verification mode; "full" when it is missing or unknown."""
+    mode = job.get("verify")
+    return mode if mode in VERIFY_MODES else DEFAULT_VERIFY
 
 # The copy preserves mtime (copystat, as copy2 does), so an untouched file compares equal to the nanosecond
 # on NTFS. The tolerance is for filesystems that store a coarser timestamp
@@ -107,12 +131,13 @@ class JobsFileCorrupt(Exception):
 
 def new_job(name: str, source: str, target: str, schedule: str = "daily",
             at: str = "20:00", retention: int = DEFAULT_RETENTION,
-            target_volume: str = "") -> Dict:
+            target_volume: str = "", verify: str = DEFAULT_VERIFY) -> Dict:
     """A job dict with a fresh id. Nothing is written to disk here.
 
     `target_volume` is the identity of the drive `target` was on when the job
     was set up (see `target_volume()`); "" means not recorded yet, and the
-    first successful run records it.
+    first successful run records it. `verify` is one of `VERIFY_MODES`;
+    anything else is stored as "full".
     """
     return {
         "id": uuid.uuid4().hex[:8],
@@ -123,6 +148,7 @@ def new_job(name: str, source: str, target: str, schedule: str = "daily",
         "at": at,
         "retention": max(1, int(retention)),
         "target_volume": target_volume,
+        "verify": verify if verify in VERIFY_MODES else DEFAULT_VERIFY,
         "last_run": "",
         "last_result": "",
     }
@@ -376,11 +402,14 @@ def version_datetime(name: str) -> Optional[datetime]:
 # ordinary copy of the source. version_names() only lists directories, so the
 # sibling file is never mistaken for a version.
 #
-# Line 1 is a header, then one line per copied file, then -- only once every
-# file has been re-read and matched -- an end trailer with "verified": true.
-# A version is verified iff its folder exists and its manifest ends in that
-# trailer. Legacy versions (made before manifests) have none and are simply
-# unverified.
+# Line 1 is a header, then one line per copied file, then -- only once the
+# job's verification mode has passed -- an end trailer
+# `{"type": "end", "files", "bytes", "verify": mode, "verified": bool}`.
+# "verified" is true for "full" and "quick" and false for "off". A trailer
+# written before modes existed has no "verify" key and reads as "full".
+# A version is verified iff its folder exists and its manifest ends in a
+# verified trailer. Legacy versions (made before manifests) have none and are
+# simply unverified, as is an "off" version.
 
 MANIFEST_SUFFIX = ".manifest.jsonl"
 MANIFEST_VERSION = 1
@@ -415,8 +444,12 @@ def _last_line(path: str, limit: int = 4096) -> Optional[bytes]:
 def read_manifest_summary(job: Dict, stamp: str) -> Optional[Dict]:
     """Version `stamp`'s end trailer, or None if it has no valid one.
 
-    Missing, truncated (a run that died mid-write) or garbage manifests all
-    come back None -- "not verified", never an exception.
+    The returned trailer always carries "verify" (one of `VERIFY_MODES`;
+    "full" for a trailer written before modes existed) and a boolean
+    "verified". Missing, truncated (a run that died mid-write) or garbage
+    manifests all come back None -- "not verified", never an exception -- and
+    so does a trailer whose mode is unknown or disagrees with its "verified"
+    flag, since only a run of this code writes one and it never writes that.
     """
     line = _last_line(manifest_path(job, stamp))
     if not line:
@@ -425,16 +458,27 @@ def read_manifest_summary(job: Dict, stamp: str) -> Optional[Dict]:
         trailer = json.loads(line.decode("utf-8"))
     except ValueError:
         return None
-    if (not isinstance(trailer, dict) or trailer.get("type") != "end"
-            or trailer.get("verified") is not True):
+    if not isinstance(trailer, dict) or trailer.get("type") != "end":
         return None
-    return trailer
+    mode = trailer.get("verify", "full")
+    if mode not in VERIFY_MODES or trailer.get("verified") is not (mode != "off"):
+        return None
+    return dict(trailer, verify=mode)
+
+
+def verify_mode(job: Dict, stamp: str) -> Optional[str]:
+    """How version `stamp` was checked ("full", "quick" or "off"), or None
+    when it has no readable, complete manifest (legacy, crashed, damaged)."""
+    summary = read_manifest_summary(job, stamp)
+    return summary["verify"] if summary else None
 
 
 def is_verified(job: Dict, stamp: str) -> bool:
-    """True iff version `stamp` exists and its manifest ends verified."""
+    """True iff version `stamp` exists and its manifest ends verified -- a
+    "full" or "quick" run. An "off" version is complete but never verified."""
+    summary = read_manifest_summary(job, stamp)
     return (os.path.isdir(version_path(job, stamp))
-            and read_manifest_summary(job, stamp) is not None)
+            and summary is not None and summary["verified"] is True)
 
 
 def verified_versions(job: Dict) -> List[str]:
@@ -451,10 +495,10 @@ def prune_versions(job: Dict) -> List[str]:
     just succeeded.
 
     The newest VERIFIED version is never deleted, even when retention says
-    it should be: if every newer version is a legacy (manifest-less) copy,
-    it is still the last one known to match what was copied. Legacy versions
-    otherwise prune by retention as before. A pruned version's manifest goes
-    with it.
+    it should be: if every newer version is a legacy (manifest-less) copy or
+    one made with verification "off", it is still the last one known to match
+    what was copied. Legacy and "off" versions otherwise prune by retention
+    like any other. A pruned version's manifest goes with it.
     """
     keep = max(1, int(job.get("retention", DEFAULT_RETENTION)))
     names = version_names(job)
@@ -892,6 +936,29 @@ def _verify_copy(partial: str, manifest: str,
     done = 0
     if on_progress is not None:
         on_progress(0, total)
+    for entry in _manifest_files(manifest, should_abort):
+        if entry is None:
+            bad += 1
+            if len(named) < VERIFY_NAMED:
+                named.append("(damaged manifest line)")
+            continue
+        if not _rehash_matches(partial, entry):
+            bad += 1
+            if len(named) < VERIFY_NAMED:
+                named.append(entry.get("path", ""))
+        done += 1
+        if on_progress is not None:
+            on_progress(done, total)
+    return done, bad, named
+
+
+def _manifest_files(manifest: str, should_abort: Optional[Callable[[], bool]]
+                    ) -> Iterator[Optional[Dict]]:
+    """Stream a manifest's file entries; None for each damaged line.
+
+    Checks `should_abort` per line (raising BackupAborted) so both verify
+    passes cancel promptly. Raises OSError if the manifest cannot be read.
+    """
     with open(manifest, "r", encoding="utf-8") as handle:
         for line in handle:
             if should_abort is not None and should_abort():
@@ -901,34 +968,128 @@ def _verify_copy(partial: str, manifest: str,
             except ValueError:
                 entry = None
             if not isinstance(entry, dict):
-                bad += 1
-                if len(named) < VERIFY_NAMED:
-                    named.append("(damaged manifest line)")
-                continue
-            if entry.get("type") != "file":
-                continue
-            rel = entry.get("path", "")
-            digest = hashlib.sha256()
-            size = 0
-            try:
-                with open(os.path.join(partial, *rel.split("/")), "rb") as copied:
-                    while True:
-                        chunk = copied.read(CHUNK)
-                        if not chunk:
-                            break
-                        digest.update(chunk)
-                        size += len(chunk)
-                ok = size == entry.get("size") and digest.hexdigest() == entry.get("sha256")
-            except OSError:
-                ok = False
-            if not ok:
-                bad += 1
-                if len(named) < VERIFY_NAMED:
-                    named.append(rel)
-            done += 1
-            if on_progress is not None:
-                on_progress(done, total)
-    return done, bad, named
+                yield None
+            elif entry.get("type") == "file":
+                yield entry
+
+
+def _copied_path(partial: str, entry: Dict) -> str:
+    """Where a manifest entry's file sits inside the `.partial` folder."""
+    return os.path.join(partial, *entry.get("path", "").split("/"))
+
+
+def _rehash(path: str) -> Tuple[int, str]:
+    """Re-read `path` from disk: `(bytes read, sha256 hex)`. Raises OSError.
+
+    The one place verification reads a copied file's content, so tests can
+    count exactly how many files a mode re-read.
+    """
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as copied:
+        while True:
+            chunk = copied.read(CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def _rehash_matches(partial: str, entry: Dict) -> bool:
+    """True if the copied file re-reads to the size and hash recorded."""
+    try:
+        size, sha = _rehash(_copied_path(partial, entry))
+    except OSError:
+        return False
+    return size == entry.get("size") and sha == entry.get("sha256")
+
+
+def _quick_sample(count: int, largest: int, newest: int, seed: str) -> set:
+    """Indexes (into the manifest's file entries) quick mode re-hashes.
+
+    About QUICK_SAMPLE_FRACTION of `count`, at least 1 and at most
+    QUICK_SAMPLE_CAP, always including `largest` and `newest` (which can make
+    it one or two over a tiny target). Drawn with `random.Random(seed)` -- the
+    version stamp -- so a given run's sample is reproducible.
+    """
+    if count <= 0:
+        return set()
+    want = min(count, QUICK_SAMPLE_CAP,
+               max(1, math.ceil(count * QUICK_SAMPLE_FRACTION)))
+    chosen = {largest, newest}
+    extra = [i for i in random.Random(seed).sample(range(count), min(count, want + 2))
+             if i not in chosen]
+    chosen.update(extra[:max(0, want - len(chosen))])
+    return chosen
+
+
+def _quick_verify(partial: str, manifest: str,
+                  on_progress: Optional[Callable[[int, int], None]],
+                  should_abort: Optional[Callable[[], bool]],
+                  seed: str) -> Tuple[int, int, List[str], int]:
+    """Quick mode: every file's size, a sample's content.
+
+    Pass 1 stats every file the manifest lists (no content read) and
+    requires it to exist as a file of the recorded size, noting the largest
+    and the most recently modified (by manifest mtime). Pass 2 re-reads only
+    `_quick_sample`'s files and compares their SHA-256. If pass 1 already
+    found a bad file the run fails anyway, so pass 2 is skipped.
+
+    Returns `(files checked, bad count, the first VERIFY_NAMED bad paths,
+    files re-hashed)`. Progress (`on_progress`) runs over the sample only;
+    it reports `(0, 0)` -- an indeterminate bar -- while pass 1 stats.
+
+    The honest limit: a file outside the sample whose bytes are wrong but
+    whose size is right is NOT caught. That is the trade the owner chose for
+    speed; "full" catches it.
+    """
+    bad = 0
+    named: List[str] = []
+    count = 0
+    largest = newest = (None, -1)  # (key, index)
+    if on_progress is not None:
+        on_progress(0, 0)
+    for entry in _manifest_files(manifest, should_abort):
+        if entry is None:
+            bad += 1
+            if len(named) < VERIFY_NAMED:
+                named.append("(damaged manifest line)")
+            continue
+        try:
+            info = os.stat(_copied_path(partial, entry))
+            ok = stat.S_ISREG(info.st_mode) and info.st_size == entry.get("size")
+        except OSError:
+            ok = False
+        if not ok:
+            bad += 1
+            if len(named) < VERIFY_NAMED:
+                named.append(entry.get("path", ""))
+        size, mtime = entry.get("size"), entry.get("mtime")
+        if isinstance(size, int) and (largest[0] is None or size > largest[0]):
+            largest = (size, count)
+        if (isinstance(mtime, (int, float))
+                and (newest[0] is None or mtime > newest[0])):
+            newest = (mtime, count)
+        count += 1
+    if bad:
+        return count, bad, named, 0
+
+    sample = _quick_sample(count, max(largest[1], 0), max(newest[1], 0), seed)
+    done = 0
+    if on_progress is not None:
+        on_progress(0, len(sample))
+    for index, entry in enumerate(_manifest_files(manifest, should_abort)):
+        if index not in sample:
+            continue
+        if not _rehash_matches(partial, entry):
+            bad += 1
+            if len(named) < VERIFY_NAMED:
+                named.append(entry.get("path", ""))
+        done += 1
+        if on_progress is not None:
+            on_progress(done, len(sample))
+    return count, bad, named, done
 
 
 def _discard(partial: str, manifest_tmp: str) -> None:
@@ -1074,11 +1235,12 @@ def run_job(job: Dict,
             on_progress: Optional[Callable[[int, int], None]] = None,
             should_abort: Optional[Callable[[], bool]] = None,
             on_phase: Optional[Callable[[str], None]] = None) -> Dict:
-    """Take one versioned, verified copy of `job`'s source; prune old versions.
+    """Take one versioned, checked copy of `job`'s source; prune old versions.
 
     Returns a plain result dict: `ok`, `message`, and on success `version`,
-    `files`, `bytes`, `pruned`, `errors`, `verified` (always True on
-    success), `manifest` and `target_volume`. Never raises for a filesystem
+    `files`, `bytes`, `pruned`, `errors`, `verified` (True for the "full" and
+    "quick" modes, False for "off"), `verify_mode`, `manifest` and
+    `target_volume`. Never raises for a filesystem
     problem the user can see and fix -- a missing source, an unwritable
     target and a drive that is not mounted all come back as `ok=False` with a
     message, per CLAUDE.md §5's "a destination failure degrades cleanly".
@@ -1087,13 +1249,16 @@ def run_job(job: Dict,
 
     1. Copy into `<stamp>.partial`, hashing each file as it is copied and
        streaming one manifest line per file into `<stamp>.manifest.jsonl.tmp`.
-    2. Re-read every copied file and compare it to the manifest
-       (`_verify_copy`). Any mismatch fails the run: nothing is promoted,
-       nothing is pruned, and the `.partial` folder and `.tmp` manifest are
-       KEPT so the failure can be inspected.
-    3. Append the verified trailer, fsync, rename the manifest into place,
-       and only then rename `.partial` to `<stamp>` -- so a version folder
-       never exists without its finished manifest.
+    2. Check the copy, per the job's `verify` mode (`job_verify_mode`):
+       "full" re-reads every copied file and compares it to the manifest
+       (`_verify_copy`); "quick" checks every file's size and re-reads a
+       sample (`_quick_verify`); "off" skips this step. Any mismatch fails
+       the run: nothing is promoted, nothing is pruned, and the `.partial`
+       folder and `.tmp` manifest are KEPT so the failure can be inspected.
+    3. Append the end trailer (recording the mode, and `verified` false for
+       "off"), fsync, rename the manifest into place, and only then rename
+       `.partial` to `<stamp>` -- so a version folder never exists without
+       its finished manifest. An "off" version is promoted like any other.
     4. Prune, which never removes the newest verified version.
 
     Source files that could not be read are reported in `errors` and left
@@ -1101,8 +1266,9 @@ def run_job(job: Dict,
     that was copied matches, not that every source file was copied -- the
     message says how many were skipped.
 
-    `on_phase` is called with "copying" and then "verifying"; `on_progress`
-    restarts from 0 for the verify pass. Cancelling (`should_abort`) in
+    `on_phase` is called with "copying" and then, unless the mode is "off",
+    "verifying"; `on_progress` restarts from 0 for the verify pass (over the
+    sample, for "quick"). Cancelling (`should_abort`) in
     either phase removes the `.partial` folder and the `.tmp` manifest.
 
     A per-job lock (`<app data>/locks/<job id>.lock`) is taken before
@@ -1267,37 +1433,45 @@ def _backup(job: Dict,
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": f"Backup failed: {exc}"}
 
-    if on_phase is not None:
-        on_phase("verifying")
+    mode = job_verify_mode(job)
+    sampled = 0
     problem = None
-    try:
-        checked, bad, named = _verify_copy(partial, manifest_tmp, on_progress,
-                                           should_abort, files)
-    except BackupAborted:
-        _discard(partial, manifest_tmp)
-        return {"ok": False, "message": "Backup cancelled"}
-    except OSError as exc:
-        problem = f"its manifest could not be read back ({exc})"
-    else:
-        if bad:
-            more = ", ..." if bad > len(named) else ""
-            problem = (f"{bad} file(s) did not match what was copied "
-                       f"({', '.join(named)}{more})")
-        elif checked != files:
-            problem = (f"the manifest lists {checked} file(s) but {files} "
-                       "were copied")
+    if mode != "off":
+        if on_phase is not None:
+            on_phase("verifying")
+        try:
+            if mode == "quick":
+                checked, bad, named, sampled = _quick_verify(
+                    partial, manifest_tmp, on_progress, should_abort, stamp)
+            else:
+                checked, bad, named = _verify_copy(partial, manifest_tmp, on_progress,
+                                                   should_abort, files)
+        except BackupAborted:
+            _discard(partial, manifest_tmp)
+            return {"ok": False, "message": "Backup cancelled"}
+        except OSError as exc:
+            problem = f"its manifest could not be read back ({exc})"
+        else:
+            if bad:
+                more = ", ..." if bad > len(named) else ""
+                problem = (f"{bad} file(s) did not match what was copied "
+                           f"({', '.join(named)}{more})")
+            elif checked != files:
+                problem = (f"the manifest lists {checked} file(s) but {files} "
+                           "were copied")
     if problem:
         return {"ok": False,
                 "message": (f"Backup verification failed: {problem}. Nothing was "
                             "pruned and earlier backups are untouched. The "
                             f"unverified copy was kept for inspection at {partial}"),
-                "verified": False, "partial": partial, "manifest": manifest_tmp,
-                "files": files, "errors": errors}
+                "verified": False, "verify_mode": mode, "partial": partial,
+                "manifest": manifest_tmp, "files": files, "errors": errors}
 
     try:
         with open(manifest_tmp, "a", encoding="utf-8", newline="\n") as out:
             out.write(json.dumps({"type": "end", "files": files,
-                                  "bytes": copied_bytes, "verified": True}) + "\n")
+                                  "bytes": copied_bytes, "verify": mode,
+                                  "verified": mode != "off"}) + "\n")
             out.flush()
             os.fsync(out.fileno())
         os.replace(manifest_tmp, manifest)
@@ -1311,7 +1485,14 @@ def _backup(job: Dict,
         return {"ok": False, "message": f"Could not finalise the backup: {exc}"}
 
     pruned = prune_versions(job)
-    message = f"Backed up {files} file(s) to {final} and verified every copied file"
+    if mode == "quick":
+        message = (f"Backed up {files} file(s) to {final} and quick-checked "
+                   f"{sampled} of {files} file(s) (sizes of all, hashes of a sample)")
+    elif mode == "off":
+        message = (f"Backed up {files} file(s) to {final}, NOT verified: "
+                   "verification is turned off for this job")
+    else:
+        message = f"Backed up {files} file(s) to {final} and verified every copied file"
     if errors:
         message += (f". {len(errors)} file(s) could not be read and were "
                     "skipped, so they are not in this backup")
@@ -1319,7 +1500,7 @@ def _backup(job: Dict,
         message += f". Removed {len(pruned)} old version(s)"
     return {"ok": True, "message": message, "version": stamp, "files": files,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
-            "verified": True, "manifest": manifest,
+            "verified": mode != "off", "verify_mode": mode, "manifest": manifest,
             "target_volume": target_volume(target)}
 
 
@@ -1356,7 +1537,8 @@ def changes_since(job: Dict,
                   should_abort: Optional[Callable[[], bool]] = None) -> Dict:
     """How much of `job`'s source differs from its most recent version.
 
-    Returns `ok`, `message`, `version`, `when`, plus `added`, `modified`,
+    Returns `ok`, `message`, `version`, `when`, `verified` (`is_verified` of
+    that version), plus `added`, `modified`,
     `removed`, `changed` (their sum) and `bytes` (the size of everything
     added or modified, i.e. what the next backup would have to write).
 
@@ -1413,6 +1595,9 @@ def changes_since(job: Dict,
         "when": when.strftime("%Y-%m-%d %H:%M") if when else version,
         "added": added, "modified": modified, "removed": removed,
         "changed": changed, "bytes": changed_bytes,
+        # The version a Restore would use; False for an "off" or legacy one,
+        # so the Restore table never makes it look checked.
+        "verified": is_verified(job, version),
         "message": ("No changes since the last backup" if changed == 0 else
                     f"{changed} file(s) changed since the last backup"),
     }
