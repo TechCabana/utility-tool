@@ -147,6 +147,7 @@ class TargetWriteFailed(Exception):
     """
 
     def __init__(self, path: str, error: OSError):
+        """Classify `error`, raised while writing destination `path`."""
         self.path, self.error = path, error
         cause = (_WINERROR_CAUSES.get(getattr(error, "winerror", None))
                  or _ERRNO_CAUSES.get(error.errno) or "target_write_failed")
@@ -186,7 +187,7 @@ def _writing(path: str) -> Iterator[None]:
 # went away, a drive dropped mid-run) must not become the newest verified
 # backup and prune a complete one. The floor stops one locked file in a tiny
 # tree from being "more than 30%". A vanished source ROOT always fails,
-# whatever the counts.
+# whatever the counts, and so does a copy that holds no files at all.
 SHORTFALL_TOLERANCE = 0.30
 SHORTFALL_MIN_FILES = 3
 
@@ -204,6 +205,7 @@ class SourceUnavailable(Exception):
     """
 
     def __init__(self, source: str, copied: int, expected: int, cause: str):
+        """Record how far the copy of `source` got and why it stopped."""
         self.source, self.copied, self.expected, self.cause = (
             source, copied, expected, cause)
         super().__init__(self.reason("source folder", "backup"))
@@ -754,6 +756,29 @@ def _rmtree(path: str) -> None:
         shutil.rmtree(path, onerror=_make_writable_and_retry)
 
 
+def _open_for_write(dst: str):
+    """Open `dst` for writing, replacing a read-only or hidden file there.
+
+    Windows refuses to truncate a file that is read-only, hidden or system
+    (PermissionError). A fresh `.partial` never holds one, but a restore into
+    a folder an earlier restore filled does: that restore carried those
+    attributes over from the source, so without this a second restore of any
+    folder holding a git repo or a desktop.ini failed outright. Clear them
+    and try once more -- `_hash_copy` puts the source's attributes back when
+    the copy finishes. Any other failure, or a second one, propagates.
+    """
+    try:
+        return open(dst, "wb")
+    except PermissionError:
+        if os.path.islink(dst) or not os.path.isfile(dst):
+            raise
+        os.chmod(dst, stat.S_IWRITE)
+        if os.name == "nt":
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(dst, _FILE_ATTRIBUTE_NORMAL)
+        return open(dst, "wb")
+
+
 def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
     """Copy `src` to `dst`, hashing the bytes as they pass through.
 
@@ -775,7 +800,7 @@ def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
         mtime = os.fstat(fsrc.fileno()).st_mtime
         try:
             with _writing(dst):
-                with open(dst, "wb") as fdst:
+                with _open_for_write(dst) as fdst:
                     while True:
                         try:
                             chunk = fsrc.read(CHUNK)
@@ -841,9 +866,9 @@ def copy_tree(source: str, destination: str,
     as soon as a source error shows up, so a vanished drive stops the copy
     instead of grinding through one error per remaining file, and again when
     the walk ends -- or if the files copied fall short of that count by
-    `SHORTFALL_MIN_FILES` or more AND more than `SHORTFALL_TOLERANCE`, it
-    raises SourceUnavailable. A smaller shortfall is just the locked files
-    in `errors`. `stats`, if given, gets "expected" (that starting count) and
+    `SHORTFALL_MIN_FILES` or more AND more than `SHORTFALL_TOLERANCE`, or if
+    not one file was copied at all, it raises SourceUnavailable. A smaller
+    shortfall is just the locked files in `errors`. `stats`, if given, gets "expected" (that starting count) and
     "not_copied" (how many of them did not land): `errors` has one entry for
     a whole unreadable folder, so its length under-reports the files missed.
     """
@@ -912,7 +937,11 @@ def copy_tree(source: str, destination: str,
     missing = max(0, total - state["done"])
     if stats is not None:
         stats["expected"], stats["not_copied"] = total, missing
-    if missing >= SHORTFALL_MIN_FILES and missing > SHORTFALL_TOLERANCE * total:
+    # A copy holding NOTHING is never a backup, whatever the floor says: a
+    # two-file source with both files locked is under SHORTFALL_MIN_FILES,
+    # and promoting its empty copy as "verified" pruned the last real one.
+    if not state["done"] or (missing >= SHORTFALL_MIN_FILES
+                             and missing > SHORTFALL_TOLERANCE * total):
         raise SourceUnavailable(source, state["done"], total, "source_incomplete")
     return state["done"], state["bytes"], errors
 
@@ -1016,10 +1045,10 @@ def preflight(job: Dict,
     untouched. Guards, in order: source exists, is a directory and holds at
     least one file (a blank or unplugged source must not drive a prune of
     good history); target is not the source or inside it; the target drive is
-    present; free space covers the source plus `SPACE_MARGIN`; and, when the
-    job recorded one, the target is on the same volume as before (an unplugged
-    drive must not cause a backup into a folder on C:). A job with no recorded
-    volume is not blocked -- `run_job` reports the current one for
+    present; when the job recorded one, the target is on the same volume as
+    before (an unplugged drive must not cause a backup into a folder on C:);
+    and free space covers the source plus `SPACE_MARGIN`. A job with no
+    recorded volume is not blocked -- `run_job` reports the current one for
     `record_run` to store (trust on first use).
 
     `free_space(path) -> bytes` and `volume(path) -> str` are injectable for
@@ -1046,15 +1075,9 @@ def preflight(job: Dict,
     if anchor is None:
         return f"The target drive is not available, so nothing was backed up: {target}"
 
-    need = int(source_bytes * SPACE_MARGIN)
-    try:
-        free = free_space(anchor)
-    except OSError as exc:
-        return f"Could not read the free space on the target drive: {exc}"
-    if free < need:
-        return (f"{LOW_SPACE_PREFIX}: the backup needs "
-                f"about {human_size(need)} but only {human_size(free)} is free.")
-
+    # Drive identity before free space: a low-space refusal lets `_run_job`
+    # sweep old leftovers, and it must never sweep (or report the space of) a
+    # drive this job does not recognise.
     recorded = job.get("target_volume")
     if recorded:
         try:
@@ -1064,18 +1087,21 @@ def preflight(job: Dict,
         if not _same_volume(str(recorded), current):
             return ("The backup drive is not the same drive as before. Connect "
                     "the original drive or edit the job.")
+
+    need = int(source_bytes * SPACE_MARGIN)
+    try:
+        free = free_space(anchor)
+    except OSError as exc:
+        return f"Could not read the free space on the target drive: {exc}"
+    if free < need:
+        return (f"{LOW_SPACE_PREFIX}: the backup needs "
+                f"about {human_size(need)} but only {human_size(free)} is free.")
     return None
 
 
 # ---------------------------------------------------------------------------
 # Running a job
 # ---------------------------------------------------------------------------
-
-class _ManifestWriteFailed(Exception):
-    """A manifest line could not be written. Not an OSError on purpose, for
-    the same reason as BackupAborted: copy_tree would swallow an OSError as one
-    skipped file and carry on, leaving a copied file the manifest omits."""
-
 
 # How many offending files a failed verification names in its message.
 VERIFY_NAMED = 5
@@ -1443,7 +1469,10 @@ def run_job(job: Dict,
     at the first source error or at the end of the copy) or
     "source_incomplete" (the folder is there but at least
     `SHORTFALL_MIN_FILES` files and more than `SHORTFALL_TOLERANCE` of the
-    count taken before the copy did not land). The check is made when the
+    count taken before the copy did not land, or not one file was copied).
+    A failure to write the manifest is a target failure too, and when the
+    backup drive itself is gone the message says the incomplete copy could
+    not be removed rather than claiming it was. The check is made when the
     COPY ends: a source that disappears afterwards, during verification,
     changes nothing -- verification reads the copy, and every file was
     already copied.
@@ -1593,18 +1622,27 @@ def _backup(job: Dict,
         on_phase("copying")
     stats: Dict[str, int] = {}
     try:
-        with open(manifest_tmp, "w", encoding="utf-8", newline="\n") as out:
-            out.write(json.dumps({"type": "header", "version": MANIFEST_VERSION,
-                                  "stamp": stamp, "source": source}) + "\n")
+        # The manifest lives on the target, so failing to create or write it
+        # is a target write failure like any other (a full drive refuses a
+        # manifest line as readily as a data file) and is reported the same.
+        with _writing(manifest_tmp):
+            out = open(manifest_tmp, "w", encoding="utf-8", newline="\n")
+        with out:
+            with _writing(manifest_tmp):
+                out.write(json.dumps({"type": "header", "version": MANIFEST_VERSION,
+                                      "stamp": stamp, "source": source}) + "\n")
 
             def record(rel: str, size: int, mtime: float, sha: str) -> None:
-                """Stream one file's manifest line straight to disk."""
-                try:
+                """Stream one file's manifest line straight to disk.
+
+                Raises TargetWriteFailed, not OSError: copy_tree would count
+                an OSError as one skipped file and carry on, leaving a copied
+                file the manifest omits.
+                """
+                with _writing(manifest_tmp):
                     out.write(json.dumps({"type": "file", "path": rel, "size": size,
                                           "mtime": mtime, "sha256": sha}) + "\n")
                     out.flush()
-                except OSError as exc:
-                    raise _ManifestWriteFailed(str(exc)) from exc
 
             files, copied_bytes, errors = copy_tree(
                 source, partial, on_progress=on_progress,
@@ -1620,12 +1658,19 @@ def _backup(job: Dict,
         # be promoted, or it would prune the last complete backup.
         _discard(partial, manifest_tmp)
         leftover = [p for p in (partial, manifest_tmp) if os.path.exists(p)]
-        cleanup = ("the incomplete copy was removed" if not leftover else
-                   "the incomplete copy could not be removed: " + ", ".join(leftover))
+        if not os.path.isdir(root):
+            # The drive itself went away: "does not exist" here means "cannot
+            # be seen", and the half-written copy is still on it.
+            cleanup = ("the incomplete copy could not be removed because the "
+                       "backup drive is unavailable")
+        elif leftover:
+            cleanup = "the incomplete copy could not be removed: " + ", ".join(leftover)
+        else:
+            cleanup = "the incomplete copy was removed"
         return {"ok": False, "cause": exc.cause,
                 "message": (f"Backup failed: {exc}. Nothing was saved or pruned "
                             f"and earlier backups are untouched; {cleanup}.")}
-    except (OSError, _ManifestWriteFailed) as exc:
+    except OSError as exc:
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": f"Backup failed: {exc}"}
 

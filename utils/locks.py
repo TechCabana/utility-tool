@@ -38,6 +38,7 @@ class LockBusy(Exception):
     `{pid, started, what}`, or None when the file could not be parsed yet."""
 
     def __init__(self, path: str, holder: Optional[Dict] = None):
+        """Remember which lock was busy and who holds it."""
         super().__init__(f"'{path}' is locked")
         self.path = path
         self.holder = holder
@@ -108,6 +109,7 @@ class Lock:
     """
 
     def __init__(self, path: str, token: str, recovered: Optional[int] = None):
+        """`token` is what this owner wrote into the lock file at `path`."""
         self.path = path
         self.token = token
         self.recovered = recovered
@@ -136,9 +138,11 @@ class Lock:
         # Still stuck: a leftover is recovered as stale once this process exits.
 
     def __enter__(self) -> "Lock":
+        """Context-manager entry: the lock is already held."""
         return self
 
     def __exit__(self, *_exc) -> None:
+        """Context-manager exit: release, whether or not the block raised."""
         self.release()
 
 

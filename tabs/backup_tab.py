@@ -161,9 +161,10 @@ class BackupJobDialog(QtWidgets.QDialog):
                               "Off - do not re-read the copy"])
         self.verify.setCurrentIndex(backup_utils.VERIFY_MODES.index(
             backup_utils.job_verify_mode(job or {})))
-        # One short line on purpose: the dialog must still fit a 1366x768
-        # laptop at 125% scaling (~614 px tall), and the item texts already
-        # say what each mode does.
+        # One short line on purpose: the form already needs 636 px, which is
+        # more than a 1366x768 laptop at 125% scaling can show (614 px, less
+        # the taskbar), so there the fields are still squeezed. The item
+        # texts already say what each mode does.
         field = add_field(advanced, "Verification", self.verify, hint=(
             "Quick and Off finish sooner but check less. Off versions are "
             "marked not verified."))
@@ -196,6 +197,23 @@ class BackupJobDialog(QtWidgets.QDialog):
         shadow.setOffset(0, 2)
         shadow.setColor(QtGui.QColor(24, 24, 27, 28))
         card.setGraphicsEffect(shadow)
+        self._fit_to_screen()
+
+    def _fit_to_screen(self) -> None:
+        """Open at the form's full height instead of Qt's default.
+
+        Qt sizes a new top-level to its size hint but never taller than 2/3
+        of the screen. On any screen under ~950 px high (1366x768, or 1080p
+        at 125% scaling) that is less than this form needs, so every field
+        was squeezed until its text clipped. Ask for the full height, capped
+        at what the screen can show (less a title bar's worth).
+        """
+        width = self.minimumWidth()
+        needed = self.layout().totalHeightForWidth(width)
+        screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
+        if screen is not None:
+            needed = min(needed, screen.availableGeometry().height() - 48)
+        self.resize(width, max(needed, self.minimumSizeHint().height()))
 
     def _label(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
