@@ -31,6 +31,7 @@ there reports the real error rather than claiming success, which is the most
 that can honestly be promised until someone runs it.
 """
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -104,10 +105,79 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 class BackupAborted(Exception):
     """Raised inside the copy to stop it when the user quits mid-run.
 
-    Not an OSError on purpose: `shutil.copytree` swallows OSError per entry
-    and carries on, which is exactly the behaviour wanted for a locked file
-    and exactly wrong for a cancellation.
+    Not an OSError on purpose: `copy_tree` swallows OSError per entry and
+    carries on, which is exactly the behaviour wanted for a locked file and
+    exactly wrong for a cancellation.
     """
+
+
+# Plain-language reasons for a failure to write the drive being copied TO,
+# keyed by the machine-readable `cause` a failed result carries. `{drive}` is
+# "backup drive" for a backup and "destination drive" for a restore.
+TARGET_CAUSES = {
+    "no_space": "The {drive} is full",
+    "path_too_long": "A file path is too long for the {drive}",
+    "file_too_large": "A file is too large for this drive (FAT32 limits files to 4 GB)",
+    "target_unavailable": "The {drive} was disconnected or became unavailable",
+    "no_permission": "No permission to write to the {drive}",
+}
+_WINERROR_CAUSES = {112: "no_space", 39: "no_space", 206: "path_too_long",
+                    223: "file_too_large", 21: "target_unavailable",
+                    3: "target_unavailable", 53: "target_unavailable",
+                    64: "target_unavailable", 67: "target_unavailable",
+                    5: "no_permission"}
+_ERRNO_CAUSES = {errno.ENOSPC: "no_space", errno.ENAMETOOLONG: "path_too_long",
+                 errno.EFBIG: "file_too_large", errno.ENOENT: "target_unavailable",
+                 getattr(errno, "ESTALE", -1): "target_unavailable",
+                 errno.EACCES: "no_permission", errno.EPERM: "no_permission"}
+
+
+class TargetWriteFailed(Exception):
+    """Writing the destination of a copy failed: a full drive, a path too long
+    for it, a file too large for FAT32, a drive that went away.
+
+    Not an OSError on purpose, like BackupAborted: `copy_tree` counts a
+    per-file OSError as one skipped SOURCE file and carries on, and a run
+    that carried on past a full drive went on to verify, promote and PRUNE a
+    copy holding a fraction of the files -- deleting the last complete
+    backup. Only a failure to open or read the source may be a skip.
+
+    `cause` is a `TARGET_CAUSES` key, or "target_write_failed" when the error
+    is not one of those; `path` is the destination that failed.
+    """
+
+    def __init__(self, path: str, error: OSError):
+        self.path, self.error = path, error
+        cause = (_WINERROR_CAUSES.get(getattr(error, "winerror", None))
+                 or _ERRNO_CAUSES.get(error.errno) or "target_write_failed")
+        # ponytail: Windows' C runtime reports a path over MAX_PATH as a plain
+        # ENOENT, so length decides. Mislabels a vanished drive at a >=260
+        # path when long paths are enabled; the run still fails either way.
+        if cause == "target_unavailable" and os.name == "nt" and len(path) >= 260:
+            cause = "path_too_long"
+        self.cause = cause
+        super().__init__(self.reason("backup drive"))
+
+    def reason(self, drive: str) -> str:
+        """The plain-language cause, naming the file, e.g. "The backup drive
+        is full (failed on report.docx)"."""
+        text = TARGET_CAUSES.get(self.cause)
+        text = (text.format(drive=drive) if text else
+                f"Could not write to the {drive}: {self.error.strerror or self.error}")
+        return f"{text} (failed on {os.path.basename(self.path)})"
+
+
+@contextlib.contextmanager
+def _writing(path: str) -> Iterator[None]:
+    """Re-raise any OSError inside the block as TargetWriteFailed for `path`.
+
+    Wraps exactly the calls that touch the destination, so where an error is
+    classified is where it happened, never guessed later from its text.
+    """
+    try:
+        yield
+    except OSError as exc:
+        raise TargetWriteFailed(path, exc) from exc
 
 
 class JobsFileCorrupt(Exception):
@@ -528,22 +598,6 @@ def prune_versions(job: Dict) -> List[str]:
 # Walking and copying
 # ---------------------------------------------------------------------------
 
-def _ignore_links(directory: str, names) -> set:
-    """`shutil.copytree`'s ignore hook, dropping symlinks and junctions.
-
-    Reuses `fs_utils._is_link_like` rather than a second link predicate:
-    `is_symlink()` is False for a Windows junction, and the reparse-point
-    attribute alone wrongly catches cloud-sync roots, so the name-surrogate
-    test lives in exactly one place. Copying a junction that points at an
-    ancestor of the source would otherwise recurse until the disk fills.
-    """
-    try:
-        with os.scandir(directory) as entries:
-            return {entry.name for entry in entries if _is_link_like(entry)}
-    except OSError:
-        return set()
-
-
 def _iter_tree(root: str) -> Iterator[Optional[Tuple[str, int, float]]]:
     """Yield `(relative path, size, mtime)` per file, or None per unreadable
     entry. Relative paths use forward slashes and keep their case.
@@ -659,21 +713,39 @@ def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
     comparison relies on is preserved. If anything fails once `dst` exists,
     the half-written file is deleted before the error propagates, so it can
     never sit in a version looking like a real copy.
+
+    Errors are classified where they happen: failing to open or read `src`
+    raises the OSError (the caller skips that file); failing to create,
+    write, close or stamp `dst` raises TargetWriteFailed (the caller fails
+    the whole copy).
     """
     digest = hashlib.sha256()
     size = 0
+    read_error = None
     with open(src, "rb") as fsrc:
         mtime = os.fstat(fsrc.fileno()).st_mtime
         try:
-            with open(dst, "wb") as fdst:
-                while True:
-                    chunk = fsrc.read(CHUNK)
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    fdst.write(chunk)
-                    size += len(chunk)
-            shutil.copystat(src, dst)
+            with _writing(dst):
+                with open(dst, "wb") as fdst:
+                    while True:
+                        try:
+                            chunk = fsrc.read(CHUNK)
+                        except OSError as exc:
+                            read_error = exc  # the source's, re-raised below as a skip
+                            break
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        fdst.write(chunk)
+                        size += len(chunk)
+            if read_error is not None:
+                raise read_error
+            try:
+                shutil.copystat(src, dst)
+            except OSError as exc:
+                if exc.filename == src:
+                    raise  # stat of the source failed: a skip, not the target's
+                raise TargetWriteFailed(dst, exc) from exc
             _copy_windows_attributes(src, dst)
         except BaseException:
             try:
@@ -691,35 +763,39 @@ def copy_tree(source: str, destination: str,
               ) -> Tuple[int, int, List[str]]:
     """Copy `source` into `destination`, reporting `(done, total)` per file.
 
-    Returns `(files_copied, bytes_copied, errors)`. Built on
-    `shutil.copytree` with a counting `copy_function` rather than a
-    hand-rolled walk: copytree already collects per-file failures and carries
-    on, which is exactly the "a permission error must not abandon the batch"
-    behaviour the rest of this app has, and it already handles directory
-    creation and metadata.
+    Returns `(files_copied, bytes_copied, errors)`, where `errors` names the
+    SOURCE files and folders that could not be opened or read. A locked file
+    is normal (a running app holds it open), so it is skipped and reported
+    and the copy carries on. A failure to write the DESTINATION -- creating
+    a folder, writing or closing a file -- is never a skip: it raises
+    TargetWriteFailed and the copy stops, because carrying on past a full or
+    vanished drive only produces a copy missing everything after that point.
+    An unreadable `source` itself raises OSError.
 
-    With `on_copied`, each file is copied by `_hash_copy` and
+    A hand-rolled walk, not `shutil.copytree`: copytree catches every
+    per-entry OSError, including its own folder creation on the destination,
+    into one list, so a target failure could not be told from a skip.
+    Symlinks and junctions are skipped (`_is_link_like`, the one link
+    predicate: copying a junction that points at an ancestor of the source
+    would recurse until the disk fills). Existing destination folders are
+    reused, as copytree's `dirs_exist_ok=True` did.
+
+    Every file is copied by `_hash_copy`. With `on_copied`,
     `on_copied(relative path, size, mtime, sha256)` is called once it has
-    landed -- `run_job` streams that into the version's manifest. Without it
-    (restore), files are copied with plain `copy2`. If `on_copied` fails the
-    file just copied is deleted, so the tree never holds a file its manifest
-    does not list.
+    landed -- `run_job` streams that into the version's manifest. If
+    `on_copied` fails the file just copied is deleted, so the tree never holds
+    a file its manifest does not list.
     """
     total = tree_totals(source)[0]
     state = {"done": 0, "bytes": 0}
+    errors: List[str] = []
 
-    def copy_one(src: str, dst: str) -> str:
-        """copytree's per-file hook: abort check, copy, count, report."""
+    def copy_one(src: str, dst: str) -> None:
+        """Abort check, copy, count, report one file."""
         if should_abort is not None and should_abort():
             raise BackupAborted()
-        if on_copied is None:
-            shutil.copy2(src, dst)
-            try:
-                state["bytes"] += os.path.getsize(dst)
-            except OSError:
-                pass
-        else:
-            size, mtime, sha = _hash_copy(src, dst)
+        size, mtime, sha = _hash_copy(src, dst)
+        if on_copied is not None:
             try:
                 on_copied(os.path.relpath(src, source).replace("\\", "/"),
                           size, mtime, sha)
@@ -729,24 +805,41 @@ def copy_tree(source: str, destination: str,
                 except OSError:
                     pass
                 raise
-            state["bytes"] += size
+        state["bytes"] += size
         state["done"] += 1
         if on_progress is not None:
             on_progress(state["done"], total)
-        return dst
 
-    errors: List[str] = []
-    try:
-        shutil.copytree(source, destination, copy_function=copy_one,
-                        ignore=_ignore_links, ignore_dangling_symlinks=True,
-                        dirs_exist_ok=True)
-    except shutil.Error as exc:
-        # copytree raises this once, at the end, carrying every entry it could
-        # not copy. A locked file is normal (a running app holds it open), so
-        # it is reported alongside a successful backup, never as a failure of
-        # the whole run.
-        for entry in exc.args[0]:
-            errors.append(f"{os.path.basename(str(entry[0]))}: {entry[2]}")
+    def copy_dir(src_dir: str, dst_dir: str) -> None:
+        """Copy one folder, depth first. OSError if `src_dir` is unreadable."""
+        with os.scandir(src_dir) as listing:
+            entries = list(listing)
+        with _writing(dst_dir):
+            os.makedirs(dst_dir, exist_ok=True)
+        for entry in entries:
+            dst = os.path.join(dst_dir, entry.name)
+            try:
+                if _is_link_like(entry):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    copy_dir(entry.path, dst)
+                else:
+                    copy_one(entry.path, dst)
+            except OSError as exc:
+                # Source-side failures land here; the destination's are
+                # TargetWriteFailed and pass straight up. A full drive or an
+                # over-size file can only come from a write, so one arriving
+                # unclassified is still the target's (belt and braces).
+                failed = TargetWriteFailed(dst, exc)
+                if failed.cause in ("no_space", "file_too_large"):
+                    raise failed from exc
+                errors.append(f"{entry.name}: {exc}")
+        try:
+            shutil.copystat(src_dir, dst_dir)
+        except OSError:
+            pass  # folder times are cosmetic: changes-since compares files only
+
+    copy_dir(source, destination)
     return state["done"], state["bytes"], errors
 
 
@@ -906,7 +999,7 @@ def preflight(job: Dict,
 
 class _ManifestWriteFailed(Exception):
     """A manifest line could not be written. Not an OSError on purpose, for
-    the same reason as BackupAborted: copytree would swallow an OSError as one
+    the same reason as BackupAborted: copy_tree would swallow an OSError as one
     skipped file and carry on, leaving a copied file the manifest omits."""
 
 
@@ -1264,7 +1357,11 @@ def run_job(job: Dict,
     Source files that could not be read are reported in `errors` and left
     out of the manifest; the run is still ok. "Verified" means every file
     that was copied matches, not that every source file was copied -- the
-    message says how many were skipped.
+    message says how many were skipped. A failure to WRITE the target (full
+    drive, path too long, file too large, drive gone) is never a skip: the
+    run fails with a `cause` (a `TARGET_CAUSES` key or
+    "target_write_failed"), nothing is promoted or pruned, and the `.partial`
+    folder and `.tmp` manifest are removed.
 
     `on_phase` is called with "copying" and then, unless the mode is "off",
     "verifying"; `on_progress` restarts from 0 for the verify pass (over the
@@ -1429,6 +1526,17 @@ def _backup(job: Dict,
     except BackupAborted:
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": "Backup cancelled"}
+    except TargetWriteFailed as exc:
+        # Unlike a failed verification, nothing is kept for inspection: the
+        # copy is incomplete by definition, and on a full drive it is the
+        # very thing using up the space.
+        _discard(partial, manifest_tmp)
+        leftover = [p for p in (partial, manifest_tmp) if os.path.exists(p)]
+        cleanup = ("the incomplete copy was removed" if not leftover else
+                   "the incomplete copy could not be removed: " + ", ".join(leftover))
+        return {"ok": False, "cause": exc.cause,
+                "message": (f"Backup failed: {exc}. Nothing was saved or pruned "
+                            f"and earlier backups are untouched; {cleanup}.")}
     except (OSError, _ManifestWriteFailed) as exc:
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": f"Backup failed: {exc}"}
@@ -1619,6 +1727,14 @@ def restore_version(job: Dict, version: str, destination: str,
     `<destination>/<job name>-restored-<version>/`, which is unambiguous about
     what it is and can be moved over the source by hand once the user has
     looked at it.
+
+    If the destination cannot be written (full, too-long path, unplugged) the
+    result is `ok=False` with a `cause`, and a restore folder this call
+    created is removed so a partial restore is never mistaken for a whole
+    one. A folder that already existed (an earlier restore of the same
+    version) is left alone, since it may hold the user's own changes, and
+    the message says it may be incomplete. Files in the version that cannot
+    be read are skipped and reported in `errors`, as before.
     """
     source = version_path(job, version)
     if not os.path.isdir(source):
@@ -1626,17 +1742,32 @@ def restore_version(job: Dict, version: str, destination: str,
 
     safe_name = re.sub(r"[^\w.-]+", "_", job.get("name") or job["id"]).strip("_") or job["id"]
     folder = os.path.join(destination, f"{safe_name}-restored-{version}")
+    existed = os.path.exists(folder)
     try:
         files, restored_bytes, errors = copy_tree(
             source, folder, on_progress=on_progress, should_abort=should_abort)
     except BackupAborted:
         return {"ok": False, "message": "Restore cancelled"}
+    except TargetWriteFailed as exc:
+        if existed:
+            after = f"{folder} already existed and may now be incomplete."
+        else:
+            try:
+                _rmtree(folder)
+                after = "The incomplete restore folder was removed."
+            except FileNotFoundError:
+                after = "Nothing was restored."
+            except OSError:
+                after = f"The incomplete restore folder could not be removed: {folder}"
+        return {"ok": False, "cause": exc.cause,
+                "message": f"Restore failed: {exc.reason('destination drive')}. {after}"}
     except OSError as exc:
         return {"ok": False, "message": f"Restore failed: {exc}"}
 
     message = f"Restored {files} file(s) to {folder}"
     if errors:
-        message += f". {len(errors)} file(s) could not be written"
+        message += (f". {len(errors)} file(s) could not be read from the backup "
+                    "and were skipped")
     return {"ok": True, "message": message, "path": folder, "files": files,
             "bytes": restored_bytes, "errors": errors}
 
