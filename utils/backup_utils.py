@@ -180,6 +180,55 @@ def _writing(path: str) -> Iterator[None]:
         raise TargetWriteFailed(path, exc) from exc
 
 
+# A copy that ends with fewer files than the source held when it started is
+# only a failure past BOTH of these: a locked file or two is normal and is
+# reported as a skip, but a run that copied a fraction of the tree (a folder
+# went away, a drive dropped mid-run) must not become the newest verified
+# backup and prune a complete one. The floor stops one locked file in a tiny
+# tree from being "more than 30%". A vanished source ROOT always fails,
+# whatever the counts.
+SHORTFALL_TOLERANCE = 0.30
+SHORTFALL_MIN_FILES = 3
+
+
+class SourceUnavailable(Exception):
+    """The folder being copied FROM went away or is far from complete.
+
+    Not an OSError on purpose, like TargetWriteFailed: `copy_tree` counts a
+    per-file OSError as one skipped file and carries on, and a run that
+    carried on past a source that had vanished verified, promoted and PRUNED
+    a copy holding one file. `cause` is "source_unavailable" (the root is
+    gone or unreadable) or "source_incomplete" (the root is there but the
+    shortfall passed `SHORTFALL_TOLERANCE`); `expected` is how many files
+    the source held when the copy started and `copied` how many landed.
+    """
+
+    def __init__(self, source: str, copied: int, expected: int, cause: str):
+        self.source, self.copied, self.expected, self.cause = (
+            source, copied, expected, cause)
+        super().__init__(self.reason("source folder", "backup"))
+
+    def reason(self, what: str, during: str) -> str:
+        """The plain-language cause for `what` ("source folder" for a backup,
+        "backup version" for a restore) `during` the "backup" or "restore",
+        with how much was copied."""
+        counts = f"only {self.copied} of {self.expected} file(s) were copied"
+        if self.cause == "source_unavailable":
+            return (f"The {what} became unavailable during the {during} (it was "
+                    f"disconnected, moved or can no longer be read), so {counts}")
+        return (f"Too many files in the {what} could not be read during the "
+                f"{during}, so {counts}")
+
+
+def _source_gone(source: str) -> bool:
+    """True if `source` can no longer be listed (gone, moved, unplugged)."""
+    try:
+        with os.scandir(source):
+            return False
+    except OSError:
+        return True
+
+
 class JobsFileCorrupt(Exception):
     """The jobs file exists but cannot be trusted as a list of jobs.
 
@@ -759,7 +808,8 @@ def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
 def copy_tree(source: str, destination: str,
               on_progress: Optional[Callable[[int, int], None]] = None,
               should_abort: Optional[Callable[[], bool]] = None,
-              on_copied: Optional[Callable[[str, int, float, str], None]] = None
+              on_copied: Optional[Callable[[str, int, float, str], None]] = None,
+              stats: Optional[Dict[str, int]] = None
               ) -> Tuple[int, int, List[str]]:
     """Copy `source` into `destination`, reporting `(done, total)` per file.
 
@@ -785,10 +835,27 @@ def copy_tree(source: str, destination: str,
     landed -- `run_job` streams that into the version's manifest. If
     `on_copied` fails the file just copied is deleted, so the tree never holds
     a file its manifest does not list.
+
+    Completeness: the file count taken when the copy starts is what the copy
+    must be measured against. If `source` can no longer be listed -- checked
+    as soon as a source error shows up, so a vanished drive stops the copy
+    instead of grinding through one error per remaining file, and again when
+    the walk ends -- or if the files copied fall short of that count by
+    `SHORTFALL_MIN_FILES` or more AND more than `SHORTFALL_TOLERANCE`, it
+    raises SourceUnavailable. A smaller shortfall is just the locked files
+    in `errors`. `stats`, if given, gets "expected" (that starting count) and
+    "not_copied" (how many of them did not land): `errors` has one entry for
+    a whole unreadable folder, so its length under-reports the files missed.
     """
     total = tree_totals(source)[0]
     state = {"done": 0, "bytes": 0}
     errors: List[str] = []
+
+    def check_source_alive() -> None:
+        """Stop the copy if the source root has gone away."""
+        if _source_gone(source):
+            raise SourceUnavailable(source, state["done"], total,
+                                    "source_unavailable")
 
     def copy_one(src: str, dst: str) -> None:
         """Abort check, copy, count, report one file."""
@@ -833,6 +900,7 @@ def copy_tree(source: str, destination: str,
                 failed = TargetWriteFailed(dst, exc)
                 if failed.cause in ("no_space", "file_too_large"):
                     raise failed from exc
+                check_source_alive()  # a vanished root is not one more skip
                 errors.append(f"{entry.name}: {exc}")
         try:
             shutil.copystat(src_dir, dst_dir)
@@ -840,6 +908,12 @@ def copy_tree(source: str, destination: str,
             pass  # folder times are cosmetic: changes-since compares files only
 
     copy_dir(source, destination)
+    check_source_alive()  # gone by the end: whatever copied is not the whole
+    missing = max(0, total - state["done"])
+    if stats is not None:
+        stats["expected"], stats["not_copied"] = total, missing
+    if missing >= SHORTFALL_MIN_FILES and missing > SHORTFALL_TOLERANCE * total:
+        raise SourceUnavailable(source, state["done"], total, "source_incomplete")
     return state["done"], state["bytes"], errors
 
 
@@ -1355,13 +1429,24 @@ def run_job(job: Dict,
     4. Prune, which never removes the newest verified version.
 
     Source files that could not be read are reported in `errors` and left
-    out of the manifest; the run is still ok. "Verified" means every file
-    that was copied matches, not that every source file was copied -- the
-    message says how many were skipped. A failure to WRITE the target (full
-    drive, path too long, file too large, drive gone) is never a skip: the
-    run fails with a `cause` (a `TARGET_CAUSES` key or
-    "target_write_failed"), nothing is promoted or pruned, and the `.partial`
-    folder and `.tmp` manifest are removed.
+    out of the manifest; the run is still ok (`not_copied` counts the files
+    that never landed, which can exceed `len(errors)` when a whole folder was
+    unreadable). "Verified" means every file that was copied matches, not
+    that every source file was copied -- the message says how many were
+    skipped. A failure to WRITE the target (full drive, path too long, file
+    too large, drive gone) is never a skip: the run fails with a `cause` (a
+    `TARGET_CAUSES` key or "target_write_failed"), nothing is promoted or
+    pruned, and the `.partial` folder and `.tmp` manifest are removed.
+
+    A SOURCE that goes away mid-run fails the same way, with cause
+    "source_unavailable" (the source folder can no longer be listed, noticed
+    at the first source error or at the end of the copy) or
+    "source_incomplete" (the folder is there but at least
+    `SHORTFALL_MIN_FILES` files and more than `SHORTFALL_TOLERANCE` of the
+    count taken before the copy did not land). The check is made when the
+    COPY ends: a source that disappears afterwards, during verification,
+    changes nothing -- verification reads the copy, and every file was
+    already copied.
 
     `on_phase` is called with "copying" and then, unless the mode is "off",
     "verifying"; `on_progress` restarts from 0 for the verify pass (over the
@@ -1506,6 +1591,7 @@ def _backup(job: Dict,
 
     if on_phase is not None:
         on_phase("copying")
+    stats: Dict[str, int] = {}
     try:
         with open(manifest_tmp, "w", encoding="utf-8", newline="\n") as out:
             out.write(json.dumps({"type": "header", "version": MANIFEST_VERSION,
@@ -1522,14 +1608,16 @@ def _backup(job: Dict,
 
             files, copied_bytes, errors = copy_tree(
                 source, partial, on_progress=on_progress,
-                should_abort=should_abort, on_copied=record)
+                should_abort=should_abort, on_copied=record, stats=stats)
     except BackupAborted:
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": "Backup cancelled"}
-    except TargetWriteFailed as exc:
+    except (TargetWriteFailed, SourceUnavailable) as exc:
         # Unlike a failed verification, nothing is kept for inspection: the
         # copy is incomplete by definition, and on a full drive it is the
-        # very thing using up the space.
+        # very thing using up the space. A source that vanished mid-run is
+        # the same: what was copied is a fraction of the tree and must never
+        # be promoted, or it would prune the last complete backup.
         _discard(partial, manifest_tmp)
         leftover = [p for p in (partial, manifest_tmp) if os.path.exists(p)]
         cleanup = ("the incomplete copy was removed" if not leftover else
@@ -1601,13 +1689,17 @@ def _backup(job: Dict,
                    "verification is turned off for this job")
     else:
         message = f"Backed up {files} file(s) to {final} and verified every copied file"
+    # `errors` has one entry per unreadable FOLDER, so count the files that
+    # never landed against the count taken before the copy instead.
+    not_copied = max(len(errors), stats.get("not_copied", 0))
     if errors:
-        message += (f". {len(errors)} file(s) could not be read and were "
+        message += (f". {not_copied} file(s) could not be read and were "
                     "skipped, so they are not in this backup")
     if pruned:
         message += f". Removed {len(pruned)} old version(s)"
     return {"ok": True, "message": message, "version": stamp, "files": files,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
+            "not_copied": not_copied,
             "verified": mode != "off", "verify_mode": mode, "manifest": manifest,
             "target_volume": target_volume(target)}
 
@@ -1734,7 +1826,10 @@ def restore_version(job: Dict, version: str, destination: str,
     one. A folder that already existed (an earlier restore of the same
     version) is left alone, since it may hold the user's own changes, and
     the message says it may be incomplete. Files in the version that cannot
-    be read are skipped and reported in `errors`, as before.
+    be read are skipped and reported in `errors`, as before -- unless the
+    stored version itself vanishes mid-restore or most of it cannot be read
+    (`copy_tree`'s completeness rule): that fails with cause
+    "source_unavailable" / "source_incomplete" and the same folder handling.
     """
     source = version_path(job, version)
     if not os.path.isdir(source):
@@ -1743,12 +1838,14 @@ def restore_version(job: Dict, version: str, destination: str,
     safe_name = re.sub(r"[^\w.-]+", "_", job.get("name") or job["id"]).strip("_") or job["id"]
     folder = os.path.join(destination, f"{safe_name}-restored-{version}")
     existed = os.path.exists(folder)
+    stats: Dict[str, int] = {}
     try:
         files, restored_bytes, errors = copy_tree(
-            source, folder, on_progress=on_progress, should_abort=should_abort)
+            source, folder, on_progress=on_progress, should_abort=should_abort,
+            stats=stats)
     except BackupAborted:
         return {"ok": False, "message": "Restore cancelled"}
-    except TargetWriteFailed as exc:
+    except (TargetWriteFailed, SourceUnavailable) as exc:
         if existed:
             after = f"{folder} already existed and may now be incomplete."
         else:
@@ -1759,15 +1856,17 @@ def restore_version(job: Dict, version: str, destination: str,
                 after = "Nothing was restored."
             except OSError:
                 after = f"The incomplete restore folder could not be removed: {folder}"
+        reason = (exc.reason("backup version", "restore") if isinstance(exc, SourceUnavailable)
+                  else exc.reason("destination drive"))
         return {"ok": False, "cause": exc.cause,
-                "message": f"Restore failed: {exc.reason('destination drive')}. {after}"}
+                "message": f"Restore failed: {reason}. {after}"}
     except OSError as exc:
         return {"ok": False, "message": f"Restore failed: {exc}"}
 
     message = f"Restored {files} file(s) to {folder}"
     if errors:
-        message += (f". {len(errors)} file(s) could not be read from the backup "
-                    "and were skipped")
+        message += (f". {max(len(errors), stats.get('not_copied', 0))} file(s) "
+                    "could not be read from the backup and were skipped")
     return {"ok": True, "message": message, "path": folder, "files": files,
             "bytes": restored_bytes, "errors": errors}
 
