@@ -23,8 +23,9 @@ from utils.preflight import _preflight_and_sweep, target_volume
 from utils.verify import _quick_verify
 from utils.versions import (MANIFEST_VERSION, VERSION_FORMAT, _discard, is_verified,
                             job_root, latest_version, manifest_path, prune_versions,
-                            pruning_held_sentence, sanity_drop_baseline,
-                            version_datetime, version_path)
+                            pruning_held_sentence, restore_candidates,
+                            sanity_drop_baseline, version_path,
+                            version_when)
 
 
 # The copy preserves mtime (copystat, as copy2 does), so an untouched file compares equal to the nanosecond
@@ -480,16 +481,21 @@ def changes_since(job: Dict,
     removed = sum(1 for rel in backed_up if rel not in current)
 
     changed = added + modified + removed
-    when = version_datetime(version)
+    candidates = restore_candidates(job)
     return {
         "ok": True,
         "version": version,
-        "when": when.strftime("%Y-%m-%d %H:%M") if when else version,
+        "when": version_when(version),
         "added": added, "modified": modified, "removed": removed,
         "changed": changed, "bytes": changed_bytes,
-        # The version a Restore would use; False for an "off" or legacy one,
-        # so the Restore table never makes it look checked.
+        # Whether the LATEST version (the one compared above) was verified;
+        # False for an "off" or legacy one.
         "verified": is_verified(job, version),
+        # What Restore will actually use (card 45). Measured here, in the
+        # worker, so the row never reads manifests on the UI thread. Drift
+        # above is still against the LATEST version, not this one.
+        "restore": candidates,
+        "preferred_when": version_when(candidates["preferred"]),
         "message": ("No changes since the last backup" if changed == 0 else
                     f"{changed} file(s) changed since the last backup"),
     }

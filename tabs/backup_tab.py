@@ -539,10 +539,27 @@ class RestoreRow(QtWidgets.QWidget):
         when = changes.get("when") if changes.get("ok") else None
         last = QtWidgets.QLabel(when or "Never backed up")
         last.setObjectName("Hint")
-        if when and changes.get("verified") is False:
-            # The version Restore would use was never checked after copying
-            # (verification off, or made before checking existed). Say so
-            # rather than let it pass for a verified one.
+        plan = changes.get("restore") or {}
+        if when and plan.get("newer_unverified") and changes.get("preferred_when"):
+            # Restore defaults to the newest VERIFIED backup (card 45), so
+            # that is the date shown, and the newer unverified one is named
+            # as the thing being passed over.
+            tip = (f"Restore will use the newest verified backup "
+                   f"({changes['preferred_when']}). The newest backup "
+                   f"({when}) was not verified; you can still choose it "
+                   "when you press Restore.")
+            last.setText(f"{changes['preferred_when']}\nnewer backup not verified")
+            last.setObjectName("StatusWarn")
+            # The column's minimum width (RESTORE_COLUMNS) is narrower than
+            # this note; wrap it rather than clip it at the 940px window.
+            last.setWordWrap(True)
+            last.setToolTip(tip)
+            last.setAccessibleDescription(tip)
+        elif when and changes.get("verified") is False:
+            # No version is verified, so Restore uses the newest, which was
+            # never checked after copying (verification off, or made before
+            # checking existed). Say so rather than let it pass for a
+            # verified one.
             last.setText(f"{when}\nnot verified")
             last.setObjectName("StatusWarn")
             last.setToolTip("This backup was not read back and checked after "
@@ -1075,8 +1092,39 @@ class BackupTab(QtWidgets.QWidget):
             phases={"verifying": f"Verifying backup \"{job.get('name')}\"..."},
         )
 
+    def _choose_restore_version(self, job: dict):
+        """Which version to restore, asking only when the answer is not clear.
+
+        Defaults to the newest VERIFIED version. If a newer one exists that
+        was never verified, or none is verified at all, the user is told in
+        one plain dialog and picks; otherwise there is no extra step. Returns
+        a version stamp, or None for "cancelled / nothing to restore".
+        """
+        plan = backup_utils.restore_candidates(job)
+        preferred, latest = plan["preferred"], plan["latest"]
+        if plan["fallback"]:
+            choice = ConfirmDialog.choose(
+                self, "Restore an unverified backup?",
+                "None of this backup's versions has been verified; restoring "
+                "the newest one.",
+                confirm_text="Restore anyway")
+            return latest if choice == "confirm" else None
+        if preferred == latest:
+            return preferred
+        choice = ConfirmDialog.choose(
+            self, "The newest backup has not been verified",
+            f"The newest backup ({backup_utils.version_when(latest)}) has not "
+            "been verified. The newest verified backup is from "
+            f"{backup_utils.version_when(preferred)}.",
+            confirm_text="Restore the verified backup",
+            alternate_text="Restore the newest anyway")
+        return {"confirm": preferred, "alternate": latest}.get(choice)
+
     def restore_backup_job(self, job: dict):
-        """Copy the job's latest version into a folder the user picks.
+        """Copy the job's preferred version into a folder the user picks.
+
+        The preferred version is the newest verified one (card 45); see
+        `_choose_restore_version` for when the user is asked.
 
         Restoring to a new location rather than over the live source: an
         overwrite would silently replace every edit made since the backup and
@@ -1086,10 +1134,12 @@ class BackupTab(QtWidgets.QWidget):
         """
         if self.backup_thread is not None:
             return
-        version = backup_utils.latest_version(job)
-        if version is None:
+        if backup_utils.latest_version(job) is None:
             self._say(f"\"{job.get('name')}\" has no backup to restore yet.",
                       ok=False)
+            return
+        version = self._choose_restore_version(job)
+        if version is None:
             return
         destination = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Restore into which folder?", self.home)

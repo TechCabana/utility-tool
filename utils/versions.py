@@ -168,6 +168,44 @@ def verified_versions(job: Dict) -> List[str]:
     return [name for name in version_names(job) if is_verified(job, name)]
 
 
+def version_when(stamp: Optional[str]) -> Optional[str]:
+    """A version stamp as the "2026-11-06 14:30" text the Restore row shows
+    (the raw stamp if it does not parse), or None for no stamp."""
+    if stamp is None:
+        return None
+    moment = version_datetime(stamp)
+    return moment.strftime("%Y-%m-%d %H:%M") if moment else stamp
+
+
+def restore_candidates(job: Dict) -> Dict:
+    """Which version a restore should use, and what it would be passing over.
+
+    A tool that promises "a backup that says OK is restorable" should not
+    restore an unchecked copy while a checked one exists, so:
+
+    * `preferred` -- the newest VERIFIED version ("full" or "quick"; "off",
+      legacy and damaged-manifest versions are not), else the newest of any
+      kind when none is verified.
+    * `latest` -- the newest version of any kind.
+    * `fallback` -- True only when NO version is verified, so `preferred` is
+      unverified data and the user must be told so.
+    * `newer_unverified` -- versions newer than `preferred`, all unverified
+      by construction; what the user is passing over, and may still choose.
+
+    No versions: preferred and latest are None. Reads each manifest's tail
+    only, so it is cheap enough to call when a button is pressed.
+    """
+    names = version_names(job)
+    if not names:
+        return {"preferred": None, "latest": None, "fallback": False,
+                "newer_unverified": []}
+    verified = [name for name in names if is_verified(job, name)]
+    preferred = verified[-1] if verified else names[-1]
+    return {"preferred": preferred, "latest": names[-1],
+            "fallback": not verified,
+            "newer_unverified": [name for name in names if name > preferred]}
+
+
 # ---------------------------------------------------------------------------
 # Source sanity guard (card 51)
 # ---------------------------------------------------------------------------
@@ -391,10 +429,14 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
 # Restore
 # ---------------------------------------------------------------------------
 
-def restore_version(job: Dict, version: str, destination: str,
+def restore_version(job: Dict, version: Optional[str], destination: str,
                     on_progress: Optional[Callable[[int, int], None]] = None,
                     should_abort: Optional[Callable[[], bool]] = None) -> Dict:
     """Copy one stored version into a NEW folder under `destination`.
+
+    `version=None` means the default: `restore_candidates(job)["preferred"]`,
+    the newest verified version. A caller that wants a different one (the
+    newest unverified, say) names its stamp.
 
     Deliberately not an overwrite of the live source. Restoring on top of the
     working folder is a destructive merge -- it would delete nothing but would
@@ -415,6 +457,10 @@ def restore_version(job: Dict, version: str, destination: str,
     (`copy_tree`'s completeness rule): that fails with cause
     "source_unavailable" / "source_incomplete" and the same folder handling.
     """
+    if version is None:
+        version = restore_candidates(job)["preferred"]
+        if version is None:
+            return {"ok": False, "message": "There is no backup to restore yet"}
     source = version_path(job, version)
     if not os.path.isdir(source):
         return {"ok": False, "message": f"Backup version {version} not found"}
