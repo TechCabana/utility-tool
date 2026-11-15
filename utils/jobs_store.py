@@ -357,9 +357,12 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
         skipped = (max(len(errors), result.get("not_copied", 0))
                    if result.get("ok") else 0)
         job["last_skipped"] = skipped
-        # Names only, never the OS error text (it can carry a full path).
+        # File names only: not the OS error text (it can carry a full path) and
+        # not the folder path the run log keeps (`copy_tree` errors read
+        # "<path from the source root>: <error>").
         job["last_skipped_sample"] = [
-            str(error).split(": ", 1)[0] for error in errors[:SKIPPED_SAMPLE_MAX]
+            str(error).split(": ", 1)[0].rsplit("/", 1)[-1]
+            for error in errors[:SKIPPED_SAMPLE_MAX]
         ] if skipped else []
         # Card 51: a run that held pruning says so on the job. The flag is
         # recomputed per run, so a normal run (or a failed one) clears it.

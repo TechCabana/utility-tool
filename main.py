@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from PySide6 import QtWidgets, QtCore, QtGui
@@ -315,7 +316,14 @@ def run_backup_job_cli(job_id):
     result could not be written back (the jobs-file lock timed out), the exit
     code is still the run's own, 0 or 1, and the message says so.
     """
-    from utils import backup_utils
+    from utils import backup_utils, runlog
+
+    def log_failure(cause, message, job=None):
+        """Leave a line in the app-level run log for a headless failure; the
+        log can never change the exit code (it swallows its own errors)."""
+        now = datetime.now()
+        runlog.append_run(job, {"ok": False, "cause": cause, "message": message},
+                          "scheduled", now, now, app_level=True)
 
     # A task registered before the rename can fire before the renamed app has
     # ever been opened, so the jobs file it needs may still be in the old
@@ -328,11 +336,13 @@ def run_backup_job_cli(job_id):
     except backup_utils.JobsFileCorrupt as exc:
         hint = f" Open {APP_NAME} to restore it." if exc.has_backup else ""
         print(f"[ERROR] {exc}{hint}", file=sys.stderr)
+        log_failure("jobs_file_damaged", f"{exc}{hint}")
         return 3
     if job is None:
         print(f"[ERROR] No backup job with id '{job_id}'")
+        log_failure("unknown_job", f"No backup job with id '{job_id}'")
         return 2
-    result = backup_utils.run_job(job)
+    result = backup_utils.run_job(job, trigger="scheduled")
     if result.get("busy"):
         # Not a result of this job: recording it would overwrite the real last
         # run's outcome with "failed: already running".
@@ -343,6 +353,7 @@ def run_backup_job_cli(job_id):
     except backup_utils.JobsFileCorrupt as exc:
         print(f"[ERROR] The backup ran ({result.get('message', '')}) but its "
               f"result could not be recorded: {exc}", file=sys.stderr)
+        log_failure("jobs_file_damaged", f"Result could not be recorded: {exc}", job)
         return 3
     except OSError as exc:
         # The jobs-file lock timed out or the file could not be written. The
@@ -350,6 +361,7 @@ def run_backup_job_cli(job_id):
         # job's stored last result is stale.
         print(("[OK] " if result.get("ok") else "[ERROR] ") + result.get("message", "")
               + f" This result could not be recorded: {exc}", file=sys.stderr)
+        log_failure("jobs_file_unavailable", f"Result could not be recorded: {exc}", job)
         return 0 if result.get("ok") else 1
     print(("[OK] " if result.get("ok") else "[ERROR] ") + result.get("message", ""))
     if result.get("ok") and result.get("not_copied"):

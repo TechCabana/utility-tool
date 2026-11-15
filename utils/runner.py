@@ -9,15 +9,13 @@ Two calls go through another module's attribute rather than an imported
 name, so a test that patches that module's attribute reaches this code too:
 `jobs_store._locks_dir()` and `verify._verify_copy(...)`.
 """
-import hashlib
 import json
 import os
-import re
 import time
 from datetime import datetime
 from typing import Callable, Dict, Optional
 
-from utils import jobs_store, locks, verify
+from utils import jobs_store, locks, runlog, verify
 from utils.copying import (BackupAborted, SourceUnavailable, TargetWriteFailed,
                            _writing, copy_tree, walk_tree)
 from utils.jobs_store import job_verify_mode
@@ -80,7 +78,8 @@ def _claim_stamp(root: str, job: Dict) -> Optional[str]:
 def run_job(job: Dict,
             on_progress: Optional[Callable[[int, int], None]] = None,
             should_abort: Optional[Callable[[], bool]] = None,
-            on_phase: Optional[Callable[[str], None]] = None) -> Dict:
+            on_phase: Optional[Callable[[str], None]] = None,
+            trigger: str = "manual") -> Dict:
     """Take one versioned, checked copy of `job`'s source; prune old versions.
 
     Returns a plain result dict: `ok`, `message`, and on success `version`,
@@ -152,7 +151,30 @@ def run_job(job: Dict,
     result message says so.
 
     `preflight()` runs after the lock and nothing is created until it passes.
+
+    **Run log (card 52).** Every call appends exactly one line to the job's log
+    (`utils/runlog.py`) once the lock is released -- success, failure, cancelled,
+    busy and pre-flight refusals alike, and a run that raises is logged as
+    "failed" before the exception propagates unchanged. `trigger` says how it
+    started: "manual" (the GUI's Run button) or "scheduled" (the headless
+    `--run-backup-job` path). A log failure never changes the result.
     """
+    start = datetime.now()
+    try:
+        result = _locked_run(job, on_progress, should_abort, on_phase)
+    except BaseException as exc:
+        runlog.append_run(job, {"ok": False, "message": f"{type(exc).__name__}: {exc}"},
+                          trigger, start)
+        raise
+    runlog.append_run(job, result, trigger, start)
+    return result
+
+
+def _locked_run(job: Dict,
+                on_progress: Optional[Callable[[int, int], None]],
+                should_abort: Optional[Callable[[], bool]],
+                on_phase: Optional[Callable[[str], None]]) -> Dict:
+    """`run_job` without the log: take the per-job lock, run, release it."""
     lock_path = _job_lock_path(job)
     if lock_path is None:
         return {"ok": False, "message": "This backup job has no usable id, so "
@@ -188,9 +210,7 @@ def _job_lock_path(job: Dict) -> Optional[str]:
     job_id = job.get("id")
     if not isinstance(job_id, str) or not job_id:
         return None
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id):
-        job_id = "id-" + hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:16]
-    return os.path.join(jobs_store._locks_dir(), job_id + ".lock")
+    return os.path.join(jobs_store._locks_dir(), runlog.safe_id(job_id) + ".lock")
 
 
 def _busy_message(holder: Optional[Dict]) -> str:

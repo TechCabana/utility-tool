@@ -407,7 +407,11 @@ def copy_tree(source: str, destination: str,
                 if failed.cause in ("no_space", "file_too_large"):
                     raise failed from exc
                 check_source_alive()  # a vanished root is not one more skip
-                errors.append(f"{entry.name}: {exc}")
+                # Path from the source root (forward slashes, as in the
+                # manifest) so the run log says WHICH file; the "<path>: <error>"
+                # shape is relied on by record_run and runlog.
+                rel = os.path.relpath(entry.path, source).replace("\\", "/")
+                errors.append(f"{rel}: {exc}")
         try:
             shutil.copystat(src_dir, dst_dir)
         except OSError:
