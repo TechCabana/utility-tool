@@ -352,6 +352,9 @@ def run_backup_job_cli(job_id):
               + f" This result could not be recorded: {exc}", file=sys.stderr)
         return 0 if result.get("ok") else 1
     print(("[OK] " if result.get("ok") else "[ERROR] ") + result.get("message", ""))
+    if result.get("ok") and result.get("not_copied"):
+        # Silence is never success, but the exit code stays the run's own.
+        print(f"[WARN] {result['not_copied']} file(s) were not copied", file=sys.stderr)
     return 0 if result.get("ok") else 1
 
 

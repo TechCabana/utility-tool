@@ -368,6 +368,13 @@ class JobRow(QtWidgets.QWidget):
                 widget.setObjectName(style_name)
             widget.setMinimumWidth(minimum)
             h.addWidget(widget, stretch)
+            if widget.objectName() == "StatusWarn":
+                # An OK that left files behind: say how many and which, on
+                # the widget itself, for the pointer and for a screen reader.
+                detail = self._skipped_detail(job)
+                widget.setToolTip(detail)
+                widget.setAccessibleName(f"{job.get('name', 'Job')}: {status}")
+                widget.setAccessibleDescription(detail)
 
         # Icon buttons, so three per-row actions cost 108px instead of 240 --
         # each keeps a tooltip and an accessible name, which is what a text
@@ -447,8 +454,26 @@ class JobRow(QtWidgets.QWidget):
         if not job.get("last_run"):
             return "Never run", "Hint"
         if result.startswith("ok"):
+            # Silence is never success: a run that left files behind is not
+            # plain OK, however green that would look.
+            skipped = backup_utils.job_skipped(job)
+            if skipped:
+                return f"OK, {skipped} skipped", "StatusWarn"
             return "OK", "StatusOk"
         return "Failed", "StatusError"
+
+    @staticmethod
+    def _skipped_detail(job: dict) -> str:
+        """The count and up to five names behind an "OK, N skipped" status."""
+        skipped = backup_utils.job_skipped(job)
+        names = backup_utils.job_skipped_sample(job)
+        text = (f"The last backup finished, but {skipped} file(s) could not "
+                "be read and are not in it.")
+        if names:
+            text += "\n" + "\n".join(names)
+            if skipped > len(names):
+                text += f"\nand {skipped - len(names)} more"
+        return text
 
     def _last_run(self, job: dict) -> str:
         """When this job last ran, short enough to fit its column.
@@ -610,6 +635,7 @@ class BackupTab(QtWidgets.QWidget):
         # Carries a run's result line across the remeasure that follows it,
         # so the remeasure's own outcome does not erase what just happened.
         self._backup_notice = ""
+        self._backup_notice_warn = False  # ...and whether that line is a warning
 
         v = QtWidgets.QVBoxLayout(self)
         # Margins leave room for the card drop shadows to render un-clipped
@@ -923,8 +949,9 @@ class BackupTab(QtWidgets.QWidget):
             for button in host.findChildren(QtWidgets.QPushButton):
                 button.setEnabled(False)
 
-    def _say(self, message: str, ok: bool = True):
-        self.backup_status.setObjectName("Hint" if ok else "StatusError")
+    def _say(self, message: str, ok: bool = True, warn: bool = False):
+        self.backup_status.setObjectName(
+            "StatusError" if not ok else "StatusWarn" if warn else "Hint")
         # An objectName change after the sheet was applied needs the style
         # re-polished, or the widget keeps the rules it was first matched by.
         self.backup_status.style().unpolish(self.backup_status)
@@ -1164,15 +1191,20 @@ class BackupTab(QtWidgets.QWidget):
             self._say(f"{message} The result could not be recorded: {exc}",
                       ok=False)
             return
-        self._say(message, ok=result.get("ok", False))
+        # A run that left files behind reads as a warning, not as plain news.
+        warn = bool(result.get("ok") and (result.get("errors")
+                                          or result.get("not_copied")))
+        self._say(message, ok=result.get("ok", False), warn=warn)
         if result.get("ok"):
             self._backup_notice = message
+            self._backup_notice_warn = warn
             self._remeasure = True
 
     def _finish_changes(self, result: dict):
         self._changes.update(result.get("changes", {}))
         notice, self._backup_notice = self._backup_notice, ""
+        warn, self._backup_notice_warn = self._backup_notice_warn, False
         if notice:
-            self._say(notice)
+            self._say(notice, warn=warn)
         else:
             self.backup_status.setVisible(False)

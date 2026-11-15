@@ -85,7 +85,28 @@ def new_job(name: str, source: str, target: str, schedule: str = "daily",
         "verify": verify if verify in VERIFY_MODES else DEFAULT_VERIFY,
         "last_run": "",
         "last_result": "",
+        "last_skipped": 0,
+        "last_skipped_sample": [],
     }
+
+
+# How many unreadable-file names a job keeps from its last run (card 50).
+SKIPPED_SAMPLE_MAX = 5
+
+
+def job_skipped(job: Dict) -> int:
+    """How many files `job`'s last run did not copy; 0 when the field is
+    missing (an older jobs file) or is not a positive whole number."""
+    value = job.get("last_skipped")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def job_skipped_sample(job: Dict) -> List[str]:
+    """The (at most `SKIPPED_SAMPLE_MAX`) names stored with `last_skipped`."""
+    sample = job.get("last_skipped_sample")
+    if not isinstance(sample, list):
+        return []
+    return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
 
 
 def _backup_path() -> str:
@@ -298,5 +319,17 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
             job["target_volume"] = result["target_volume"]
         job["last_run"] = datetime.now().isoformat(timespec="seconds")
         job["last_result"] = ("ok" if result.get("ok") else "failed") +             (f": {result.get('message', '')}" if not result.get("ok") else "")
+        # A run that finished but left files behind is still "ok" (readers of
+        # last_result keep working); the count and a few names ride beside it
+        # so the screen can say so. The count is the one the run's own message
+        # uses, so the screen and the message agree.
+        errors = result.get("errors") or []
+        skipped = (max(len(errors), result.get("not_copied", 0))
+                   if result.get("ok") else 0)
+        job["last_skipped"] = skipped
+        # Names only, never the OS error text (it can carry a full path).
+        job["last_skipped_sample"] = [
+            str(error).split(": ", 1)[0] for error in errors[:SKIPPED_SAMPLE_MAX]
+        ] if skipped else []
         _save_job(job)
     return job
