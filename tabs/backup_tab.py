@@ -369,9 +369,9 @@ class JobRow(QtWidgets.QWidget):
             widget.setMinimumWidth(minimum)
             h.addWidget(widget, stretch)
             if widget.objectName() == "StatusWarn":
-                # An OK that left files behind: say how many and which, on
-                # the widget itself, for the pointer and for a screen reader.
-                detail = self._skipped_detail(job)
+                # An OK with a caveat (files left behind, pruning held): say
+                # what, on the widget itself, for the pointer and a screen reader.
+                detail = self._warning_detail(job)
                 widget.setToolTip(detail)
                 widget.setAccessibleName(f"{job.get('name', 'Job')}: {status}")
                 widget.setAccessibleDescription(detail)
@@ -457,10 +457,25 @@ class JobRow(QtWidgets.QWidget):
             # Silence is never success: a run that left files behind is not
             # plain OK, however green that would look.
             skipped = backup_utils.job_skipped(job)
-            if skipped:
-                return f"OK, {skipped} skipped", "StatusWarn"
+            held = backup_utils.job_pruning_held(job)
+            if skipped or held:
+                parts = (([f"{skipped} skipped"] if skipped else [])
+                         + (["pruning held"] if held else []))
+                return "OK, " + ", ".join(parts), "StatusWarn"
             return "OK", "StatusOk"
         return "Failed", "StatusError"
+
+    @staticmethod
+    def _warning_detail(job: dict) -> str:
+        """Everything behind an "OK, ..." warning: the skipped files and/or
+        the held-pruning sentence with its two counts."""
+        parts = []
+        if backup_utils.job_skipped(job):
+            parts.append(JobRow._skipped_detail(job))
+        if backup_utils.job_pruning_held(job):
+            parts.append(backup_utils.pruning_held_sentence(
+                backup_utils.job_last_files(job), backup_utils.job_baseline_files(job)))
+        return "\n\n".join(parts)
 
     @staticmethod
     def _skipped_detail(job: dict) -> str:
@@ -1193,7 +1208,8 @@ class BackupTab(QtWidgets.QWidget):
             return
         # A run that left files behind reads as a warning, not as plain news.
         warn = bool(result.get("ok") and (result.get("errors")
-                                          or result.get("not_copied")))
+                                          or result.get("not_copied")
+                                          or result.get("pruning_held")))
         self._say(message, ok=result.get("ok", False), warn=warn)
         if result.get("ok"):
             self._backup_notice = message

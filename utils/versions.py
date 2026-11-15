@@ -168,6 +168,65 @@ def verified_versions(job: Dict) -> List[str]:
     return [name for name in version_names(job) if is_verified(job, name)]
 
 
+# ---------------------------------------------------------------------------
+# Source sanity guard (card 51)
+# ---------------------------------------------------------------------------
+# A run is compared with the versions already kept. If it has lost more than
+# this share of the files the best of them had, the source was probably
+# emptied by mistake, by ransomware or by a half-finished move, and pruning
+# is held for the run so the complete copies are not rolled out of retention
+# one run at a time. There is deliberately no minimum file count: a tiny
+# source going from 2 files to 1 is a 50% drop and holds like any other.
+SANITY_DROP_FRACTION = 0.30
+
+
+def baseline_files(job: Dict, exclude: Optional[str] = None) -> int:
+    """The most files any retained VERIFIED version of `job` holds; 0 if none.
+
+    The count is the manifest trailer's `files`. A version with no readable
+    verified manifest (legacy, "off", damaged) does not count: it was never
+    shown to be a complete copy, so it cannot say what "complete" looks like.
+    `exclude` is the version stamp of the run being judged.
+    """
+    best = 0
+    for name in verified_versions(job):
+        if name == exclude:
+            continue
+        files = (read_manifest_summary(job, name) or {}).get("files")
+        if isinstance(files, int) and not isinstance(files, bool) and files > best:
+            best = files
+    return best
+
+
+def sanity_drop_baseline(job: Dict, files: int, exclude: Optional[str] = None) -> int:
+    """The baseline file count if `files` is more than `SANITY_DROP_FRACTION`
+    below it (pruning must be held), else 0 (also 0 with no baseline, e.g. a
+    first run).
+
+    The baseline is the MAX over retained versions, not the previous one, so
+    the guard keeps holding on every later run while the source stays low.
+    The hold has no automatic release: pruning is what would roll the large
+    versions out, and it is held, so only the count coming back within the
+    threshold lets it through. A later card adds an explicit "this is fine"
+    action; until then, growth of the target is the accepted cost.
+    """
+    baseline = baseline_files(job, exclude)
+    if baseline and (baseline - files) / baseline > SANITY_DROP_FRACTION:
+        return baseline
+    return 0
+
+
+def pruning_held_sentence(files: int, baseline: int) -> str:
+    """The plain-English warning for a run whose pruning was held."""
+    fewer = round(100 * (baseline - files) / baseline)
+    def count(n: int) -> str:
+        return f"{n} file" if n == 1 else f"{n} files"
+    return (f"Pruning was held because this backup has {count(files)} and an "
+            f"earlier backup has {count(baseline)} ({fewer}% fewer). If that is "
+            "not expected, check your files before the next run; older backups "
+            "were kept.")
+
+
 def prune_versions(job: Dict) -> List[str]:
     """Delete the oldest versions beyond the job's retention count.
 

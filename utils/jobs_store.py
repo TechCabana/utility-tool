@@ -87,6 +87,9 @@ def new_job(name: str, source: str, target: str, schedule: str = "daily",
         "last_result": "",
         "last_skipped": 0,
         "last_skipped_sample": [],
+        "last_pruning_held": False,
+        "last_baseline_files": 0,
+        "last_files": 0,
     }
 
 
@@ -107,6 +110,33 @@ def job_skipped_sample(job: Dict) -> List[str]:
     if not isinstance(sample, list):
         return []
     return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
+
+
+def _count(value) -> int:
+    """`value` if it is a positive whole number (not a bool), else 0."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def job_pruning_held(job: Dict) -> bool:
+    """True when `job`'s last run held pruning (the source sanity guard, card 51).
+
+    False for a job from an older jobs file (no fields) and for any junk: the
+    flag must be exactly True and both counts the warning quotes must be
+    positive whole numbers.
+    """
+    return (job.get("last_pruning_held") is True
+            and _count(job.get("last_baseline_files")) > 0
+            and _count(job.get("last_files")) > 0)
+
+
+def job_baseline_files(job: Dict) -> int:
+    """The file count the held run was compared with; 0 when not held."""
+    return _count(job.get("last_baseline_files")) if job_pruning_held(job) else 0
+
+
+def job_last_files(job: Dict) -> int:
+    """How many files the last successful run copied; 0 if unknown."""
+    return _count(job.get("last_files"))
 
 
 def _backup_path() -> str:
@@ -331,5 +361,12 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
         job["last_skipped_sample"] = [
             str(error).split(": ", 1)[0] for error in errors[:SKIPPED_SAMPLE_MAX]
         ] if skipped else []
+        # Card 51: a run that held pruning says so on the job. The flag is
+        # recomputed per run, so a normal run (or a failed one) clears it.
+        held = bool(result.get("ok") and result.get("pruning_held") is True
+                    and _count(result.get("baseline_files")) > 0)
+        job["last_pruning_held"] = held
+        job["last_baseline_files"] = _count(result.get("baseline_files")) if held else 0
+        job["last_files"] = _count(result.get("files")) if result.get("ok") else 0
         _save_job(job)
     return job
