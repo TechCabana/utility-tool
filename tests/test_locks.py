@@ -18,14 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from utils import backup_utils, locks
+from utils import backup_utils, jobs_store, locks, preflight
 
 REPO = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
 def isolated_jobs_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
 
 
 @pytest.fixture
@@ -261,7 +261,7 @@ def test_lock_is_released_when_run_job_raises(tree, monkeypatch):
     def boom(_job):
         raise RuntimeError("unexpected")
 
-    monkeypatch.setattr(backup_utils, "preflight", boom)
+    monkeypatch.setattr(preflight, "preflight", boom)
     with pytest.raises(RuntimeError):
         backup_utils.run_job(job)
     assert not os.path.exists(job_lock(job))
@@ -311,7 +311,7 @@ def _hammer_jobs_file(monkeypatch, count=12):
         time.sleep(0.005)
         real_save_jobs(items)
 
-    monkeypatch.setattr(backup_utils, "save_jobs", slow_save_jobs)
+    monkeypatch.setattr(jobs_store, "save_jobs", slow_save_jobs)
     added = [backup_utils.new_job(f"new{i}", "s", "t", schedule="manual") for i in range(count)]
     errors = []
     barrier = threading.Barrier(count * 2)
@@ -336,7 +336,7 @@ def _hammer_jobs_file(monkeypatch, count=12):
         thread.start()
     for thread in threads:
         thread.join()
-    monkeypatch.setattr(backup_utils, "save_jobs", real_save_jobs)
+    monkeypatch.setattr(jobs_store, "save_jobs", real_save_jobs)
     return jobs, added, errors
 
 
@@ -352,7 +352,7 @@ def test_concurrent_record_run_and_save_job_lose_no_update(monkeypatch):
 
 def test_the_same_harness_loses_updates_without_the_lock(monkeypatch):
     """Positive control: with the lock stubbed out the harness must see losses."""
-    monkeypatch.setattr(backup_utils, "_jobs_file_lock", contextlib.nullcontext)
+    monkeypatch.setattr(jobs_store, "_jobs_file_lock", contextlib.nullcontext)
     jobs, added, errors = _hammer_jobs_file(monkeypatch)
     stored = {j["id"]: j for j in backup_utils.load_jobs()}
     intact = (len(stored) == len(jobs) + len(added)
@@ -366,7 +366,7 @@ def test_remove_job_and_save_job_do_not_resurrect_each_other(monkeypatch):
     backup_utils.save_job(keep)
     backup_utils.save_job(drop)
     real = backup_utils.save_jobs
-    monkeypatch.setattr(backup_utils, "save_jobs", lambda items: (time.sleep(0.05), real(items)))
+    monkeypatch.setattr(jobs_store, "save_jobs", lambda items: (time.sleep(0.05), real(items)))
     extra = backup_utils.new_job("extra", "s", "t", schedule="manual")
     threads = [threading.Thread(target=backup_utils.remove_job, args=(drop["id"],)),
                threading.Thread(target=backup_utils.save_job, args=(extra,))]
@@ -382,7 +382,7 @@ def test_jobs_file_lock_is_released_even_when_the_save_fails(monkeypatch, isolat
     def boom(_items):
         raise OSError("disk full")
 
-    monkeypatch.setattr(backup_utils, "save_jobs", boom)
+    monkeypatch.setattr(jobs_store, "save_jobs", boom)
     with pytest.raises(OSError):
         backup_utils.save_job(backup_utils.new_job("a", "s", "t", schedule="manual"))
     assert not (isolated_locks_dir / "jobs-file.lock").exists()

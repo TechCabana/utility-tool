@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from utils import backup_utils
+from utils import backup_utils, jobs_store
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -20,7 +20,7 @@ REPO = Path(__file__).resolve().parent.parent
 @pytest.fixture(autouse=True)
 def jobs_file(tmp_path, monkeypatch):
     path = tmp_path / "backup_jobs.json"
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(path))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(path))
     return path
 
 

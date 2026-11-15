@@ -15,7 +15,7 @@ import os
 
 import pytest
 
-from utils import backup_utils
+from utils import backup_utils, copying, jobs_store
 
 TOP, SUB = 24, 16          # 40 files; `sub` is 40% of them
 FILES = TOP + SUB
@@ -23,7 +23,7 @@ FILES = TOP + SUB
 
 @pytest.fixture(autouse=True)
 def isolated_jobs_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
     yield
 
 
@@ -101,7 +101,7 @@ def counting_hash_copy(monkeypatch):
         calls["n"] += 1
         return real(src, dst)
 
-    monkeypatch.setattr(backup_utils, "_hash_copy", wrapper)
+    monkeypatch.setattr(copying, "_hash_copy", wrapper)
     return calls
 
 
@@ -187,7 +187,7 @@ def lock_files(monkeypatch, names):
             raise PermissionError(errno.EACCES, "Permission denied", str(path))
         return real_open(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(backup_utils, "open", fake_open, raising=False)
+    monkeypatch.setattr(copying, "open", fake_open, raising=False)
 
 
 def test_two_locked_files_of_forty_stay_a_skip_and_prune_still_runs(job, monkeypatch):
@@ -295,7 +295,7 @@ def test_a_source_that_blips_away_for_one_file_is_just_a_skip(job, tmp_path, mon
         finally:
             move(tmp_path / "away", job["source"])
 
-    monkeypatch.setattr(backup_utils, "_hash_copy", wrapper)
+    monkeypatch.setattr(copying, "_hash_copy", wrapper)
 
     result = backup_utils.run_job(job)
 

@@ -333,7 +333,14 @@ utility-tool/
 │   ├── icons.py            SVG -> QIcon, recoloured per theme
 │   └── motion.py           the one fade, reduced-motion aware
 ├── utils/                 pure logic, no Qt imports
-│   ├── backup_utils.py     jobs storage, versioned copy, restore, changes-since, Task Scheduler
+│   ├── backup_utils.py     facade: re-exports the backup modules below under one import
+│   ├── jobs_store.py       jobs file, its .bak and lock, job CRUD, record_run
+│   ├── versions.py         version names, manifests, prune, sweep of leftovers, restore
+│   ├── copying.py          tree walk, hashing copy, copy_tree and its failure types
+│   ├── verify.py           full and quick checks of a finished copy
+│   ├── preflight.py        pre-run checks (source, target, same drive, space)
+│   ├── runner.py           run_job and changes-since
+│   ├── scheduler.py        Windows Task Scheduler and macOS launchd registration
 │   ├── activity.py         short log of recent runs shown on Home
 │   ├── fs_utils.py         app-data path, symlink/junction test, byte formatting
 │   ├── locks.py            cross-process lock files: one run per job, one writer of the jobs file

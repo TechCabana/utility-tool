@@ -15,12 +15,12 @@ import time
 
 import pytest
 
-from utils import backup_utils
+from utils import backup_utils, jobs_store, scheduler
 
 
 @pytest.fixture(autouse=True)
 def isolated_jobs_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
     yield
 
 
@@ -75,7 +75,7 @@ def test_get_and_remove_job():
 def test_load_jobs_reports_a_corrupt_file_instead_of_no_jobs():
     # The old behaviour (return []) let the next save wipe every job; the full
     # corruption suite lives in tests/test_jobs_file.py.
-    with open(backup_utils.JOBS_FILE, "w", encoding="utf-8") as handle:
+    with open(jobs_store.JOBS_FILE, "w", encoding="utf-8") as handle:
         handle.write("{not a list")
     with pytest.raises(backup_utils.JobsFileCorrupt):
         backup_utils.load_jobs()
@@ -345,7 +345,7 @@ def test_task_name_is_prefixed_and_keyed_on_the_job_id():
 def test_unregister_and_exists_target_the_legacy_task_only_when_asked(monkeypatch):
     calls = []
     monkeypatch.setattr(backup_utils.sys, "platform", "win32")
-    monkeypatch.setattr(backup_utils, "_run", lambda args: calls.append(args) or (True, ""))
+    monkeypatch.setattr(scheduler, "_run", lambda args: calls.append(args) or (True, ""))
     backup_utils.unregister_task("abc", legacy=True)
     backup_utils.task_exists("abc", legacy=True)
     backup_utils.unregister_task("abc")
@@ -383,7 +383,7 @@ def test_schtasks_args_is_none_for_a_manual_job():
 
 def test_register_task_removes_any_task_for_a_job_switched_to_manual(monkeypatch):
     removed = []
-    monkeypatch.setattr(backup_utils, "unregister_task",
+    monkeypatch.setattr(scheduler, "unregister_task",
                         lambda job_id: removed.append(job_id) or (True, ""))
     job = backup_utils.new_job("n", "s", "t", schedule="manual")
     ok, message = backup_utils.register_task(job)
@@ -449,7 +449,7 @@ def test_launchd_plist_escapes_xml_in_a_path(monkeypatch):
     # A path containing & or < would otherwise produce a plist macOS refuses
     # to parse, and the failure would arrive as "job not scheduled" with no
     # explanation.
-    monkeypatch.setattr(backup_utils, "job_argv",
+    monkeypatch.setattr(scheduler, "job_argv",
                         lambda job_id: ["/Apps/Tom & Jerry/python", "--run-backup-job", job_id])
     plist = backup_utils.launchd_plist({"id": "abc", "schedule": "daily"})
     assert "Tom &amp; Jerry" in plist
@@ -469,7 +469,7 @@ def test_launchd_legacy_unregister_boots_out_and_removes_the_old_label(tmp_path,
     monkeypatch.setattr(backup_utils.sys, "platform", "darwin")
     monkeypatch.setattr(backup_utils.os.path, "expanduser", lambda p: str(tmp_path))
     calls = []
-    monkeypatch.setattr(backup_utils, "_launchctl", lambda args: calls.append(args) or (True, ""))
+    monkeypatch.setattr(scheduler, "_launchctl", lambda args: calls.append(args) or (True, ""))
     old_plist = tmp_path / "Library" / "LaunchAgents" / "com.techcabana.utilitytool.backup.abc.plist"
     old_plist.parent.mkdir(parents=True)
     old_plist.write_text("<plist/>", encoding="utf-8")
