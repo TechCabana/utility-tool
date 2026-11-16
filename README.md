@@ -246,13 +246,20 @@ flowchart LR
    hashes of a sample of at most 500 files) or no check at all; a version made with the check
    off is kept but marked "not verified" and never counts as the last known-good copy.
    Versions beyond the number kept are then pruned, but the newest verified version is never
-   deleted. A restore copies the latest version into a new folder the user picks; it never
-   writes over the live source.
+   deleted. A restore copies the newest verified version into a new folder the user picks,
+   and asks first when a newer version was never verified or when none is; it never writes
+   over the live source.
 5. A run that cannot finish honestly fails instead of saving a partial copy: if the backup
    drive fills up, disappears or refuses a write, or the source folder disappears or most of
    its files cannot be read, nothing is promoted or pruned and earlier versions are left as
    they were. Files that are merely locked by another program are skipped and counted in the
-   result. Only one run of a job happens at a time (a lock file in the app-data folder); a
+   result, and the job then reads "OK, N skipped" rather than plain OK. A run that copied more
+   than 30% fewer files than the largest verified version still kept succeeds but prunes
+   nothing ("pruning held"), so an emptied source cannot roll the complete copies out of
+   retention; it stays held on later runs until the count recovers or the larger versions
+   are deleted by hand, and a job with verification off has no verified version to compare
+   with, so it is not covered. Every run appends one line to `logs/<job id>.jsonl` in the
+   app-data folder (the newest 200 are kept). Only one run of a job happens at a time (a lock file in the app-data folder); a
    second one, such as the scheduled task firing during a manual run, is refused and the
    headless path exits 4. Abandoned leftovers of failed runs older than 7 days are removed at
    the start of the next run, except the most recent one, which is kept for inspection.
@@ -288,7 +295,12 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
     "target_volume": "1754806083",
     "verify": "full",
     "last_run": "2026-11-02T20:00:04",
-    "last_result": "ok"
+    "last_result": "ok",
+    "last_skipped": 0,
+    "last_skipped_sample": [],
+    "last_pruning_held": false,
+    "last_baseline_files": 0,
+    "last_files": 1204
   }
 ]
 ```
@@ -301,11 +313,15 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `retention` | int | Versions to keep; older ones are deleted after a run |
 | `target_volume` | string | The target drive's volume id, recorded on save or first run; a run onto a different drive is refused |
 | `verify` | string | `full` (default: re-read every copied file), `quick` (all sizes, a sample of hashes) or `off`; a missing or unknown value runs as `full` |
+| `last_result` | string | `ok`, or `failed: <message>` |
+| `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
+| `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last run held pruning, the file count it was compared with, and how many files it copied |
 
 The file is replaced atomically on every save, and the previous good copy is kept as
 `backup_jobs.json.bak`. A damaged file is reported as damaged, never read as "no jobs"; the
 Backup screen offers to restore the `.bak`, and the headless `--run-backup-job` path exits 3.
-| `last_result` | string | `ok`, or `failed: <message>` |
+A jobs file written by an older version (without the last five fields) reads as "nothing
+skipped, nothing held".
 
 </details>
 
@@ -340,13 +356,14 @@ utility-tool/
 │   ├── verify.py           full and quick checks of a finished copy
 │   ├── preflight.py        pre-run checks (source, target, same drive, space)
 │   ├── runner.py           run_job and changes-since
+│   ├── runlog.py           per-job run log, one JSON line per run, newest 200 kept
 │   ├── scheduler.py        Windows Task Scheduler and macOS launchd registration
 │   ├── activity.py         short log of recent runs shown on Home
 │   ├── fs_utils.py         app-data path, symlink/junction test, byte formatting
 │   ├── locks.py            cross-process lock files: one run per job, one writer of the jobs file
 │   └── migrate.py          one-time copy of data, tasks and settings from the UtilityTool name
 └── tests/                 pytest suite over utils/ and styles/ (Qt-free layer only, see Testing)
-    ├── conftest.py         keeps every test's lock files out of the real app-data folder
+    ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder
     ├── test_backup_utils.py
     ├── test_activity.py
     ├── test_fs_utils.py
@@ -354,7 +371,11 @@ utility-tool/
     ├── test_locks.py
     ├── test_migrate.py
     ├── test_preflight.py
+    ├── test_restore_candidates.py
     ├── test_review_gate_batch2.py
+    ├── test_runlog.py
+    ├── test_sanity_guard.py
+    ├── test_skipped_status.py
     ├── test_source_vanishes.py
     ├── test_sweep.py
     ├── test_target_failures.py
@@ -382,9 +403,9 @@ utility-tool/
 pytest tests/
 ```
 
-Covers the Qt-free layer only (`utils/backup_utils.py`, `utils/locks.py`, `utils/activity.py`,
+Covers the Qt-free layer only (`utils/backup_utils.py` and the modules it re-exports, `utils/runlog.py`, `utils/locks.py`, `utils/activity.py`,
 `utils/fs_utils.py`, `utils/migrate.py` and the design tokens in `styles/tokens.py`), using real `tmp_path` files;
-the scheduler, free space and volume identity are injected rather than touched. 290 tests,
+the scheduler, free space and volume identity are injected rather than touched. 395 tests,
 all passing; the run takes over a minute, since several tests wait a second for a distinct version stamp. The Qt-driven `tabs/` layer (including the Backup screen's
 worker thread and UI) has no automated coverage and stays manually
 verified, per the [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps

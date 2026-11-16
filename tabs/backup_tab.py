@@ -598,6 +598,11 @@ class RestoreRow(QtWidgets.QWidget):
         # reader which one this is, as fix_btn's name does above.
         self.restore_btn.setAccessibleName(
             f"Restore {job.get('name', 'this job')} from its last backup")
+        # The "not verified" note beside the date is a label, which the
+        # keyboard and a screen reader's tab order never reach; repeat it on
+        # the button, which they do (empty when there is no note).
+        self.restore_btn.setToolTip(last.toolTip())
+        self.restore_btn.setAccessibleDescription(last.toolTip())
         # Nothing to restore from until a version exists on disk.
         self.restore_btn.setEnabled(bool(changes.get("ok")))
         self.restore_btn.clicked.connect(lambda: self.restore_requested.emit(self.job))

@@ -311,6 +311,56 @@ def test_a_corrupt_line_does_not_stop_appending_or_trimming(make_job):
     assert lines[0]["message"] == "1"
 
 
+def test_a_name_utf8_cannot_encode_is_still_logged_as_one_valid_line(make_job):
+    """Review gate: a Windows file name can hold an unpaired surrogate. UTF-8
+    refuses to encode it, so the append raised, was swallowed, and the run left
+    no line at all."""
+    job, _ = make_job()
+    now = real_datetime.now()
+    skipped = {"ok": True, "message": "m", "files": 2,
+               "errors": ["dir/\udc80odd.txt: [WinError 32] in use"]}
+    failed = {"ok": False, "message": "Backup failed (failed on bad\ud800name.txt)"}
+
+    assert runlog.append_run(job, skipped, "manual", now) is True
+    assert runlog.append_run(job, failed, "scheduled", now) is True
+
+    with open(runlog.log_path(job["id"]), "rb") as handle:
+        raw = handle.read()
+    raw.decode("utf-8")                                  # strict: the file is valid UTF-8
+    first, second = [json.loads(line) for line in raw.splitlines()]
+    assert first["skipped_paths"] == ["dir/\udc80odd.txt"]      # round-trips exactly
+    assert second["message"] == failed["message"]
+    assert [run["outcome"] for run in runlog.read_runs(job["id"])] == ["failed", "ok_skipped"]
+
+
+def test_an_append_after_a_torn_line_starts_a_fresh_line(make_job):
+    """Review gate: a crash or a full disk mid-append leaves a fragment with no
+    newline; the next run's line was glued onto it and lost as well."""
+    job, _ = make_job()
+    path = runlog.log_path(job["id"])
+    now = real_datetime.now()
+    assert runlog.append_run(job, {"ok": True, "message": "before"}, "manual", now)
+    with open(path, "ab") as handle:
+        handle.write(b'{"v": 1, "start": "2026-01-01T00:00:00", "mess')   # torn, no newline
+
+    assert runlog.append_run(job, {"ok": True, "message": "after"}, "manual", now)
+
+    assert [run["message"] for run in runlog.read_runs(job["id"])] == ["after", "before"]
+    lines = raw_lines(job["id"])
+    assert len(lines) == 3 and lines[1].endswith('"mess')    # the fragment stays alone
+    # ...and a healthy log gets no blank lines.
+    assert runlog.append_run(job, {"ok": True, "message": "third"}, "manual", now)
+    assert "" not in raw_lines(job["id"]) and len(raw_lines(job["id"])) == 4
+
+
+def test_a_huge_message_is_capped(make_job):
+    job, _ = make_job()
+    assert runlog.append_run(job, {"ok": False, "message": "x" * 1_000_000},
+                             "manual", real_datetime.now())
+    assert len(only_line(job["id"])["message"]) == runlog.MESSAGE_MAX == 2000
+    assert os.path.getsize(runlog.log_path(job["id"])) < 4096
+
+
 def test_an_unwritable_log_folder_does_not_change_the_run(make_job, tmp_path, monkeypatch):
     job, _ = make_job()
     blocker = tmp_path / "not_a_folder"
@@ -346,6 +396,18 @@ def test_the_log_lock_is_released_and_the_logs_folder_holds_only_logs(make_job, 
     assert [p.name for p in logs.iterdir()] == [job["id"] + ".jsonl"]
     leftovers = [p.name for p in Path(jobs_store._locks_dir()).iterdir()]
     assert leftovers == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="app_dir() follows %APPDATA% on Windows only")
+def test_the_unpatched_app_data_folder_is_not_the_real_one():
+    """Review gate: tests/conftest.py points %APPDATA% at a throwaway folder for
+    the whole session, so a test that forgets a redirect cannot write the real
+    jobs file, locks or logs. `app_dir()` is what all three are built from
+    (`app_dir_for` is the same path without creating it)."""
+    from utils import fs_utils
+    real_roaming = os.path.normcase(os.path.expanduser("~\\AppData\\Roaming"))
+    here = os.path.normcase(fs_utils.app_dir_for(fs_utils.APP_NAME))
+    assert not here.startswith(real_roaming), here
 
 
 def test_a_job_id_cannot_point_the_log_outside_its_folder():

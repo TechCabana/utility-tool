@@ -43,6 +43,9 @@ RUNLOG_VERSION = 1
 # ~400 B plus at most 50 paths, so 200 lines stay well under a megabyte.
 RUNLOG_MAX_RUNS = 200
 SKIPPED_PATHS_MAX = 50
+# A real message is a few hundred characters. The cap is what keeps "200 lines
+# stay well under a megabyte" true whatever an exception's text turns out to be.
+MESSAGE_MAX = 2000
 APP_LOG_NAME = "app"
 OUTCOMES = ("ok", "ok_skipped", "ok_pruning_held", "failed", "cancelled", "busy")
 LINE_KEYS = ("v", "start", "end", "trigger", "job", "name", "outcome", "files",
@@ -130,7 +133,7 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
         "version": _text(result.get("version")),
         "verify_mode": mode,
         "cause": _text(result.get("cause")),
-        "message": str(result.get("message", "")),
+        "message": str(result.get("message", ""))[:MESSAGE_MAX],
         "pruning_held": result.get("pruning_held") is True,
     }
 
@@ -169,6 +172,30 @@ def _trim(path: str) -> None:
         raise
 
 
+def _append_line(path: str, line: str) -> None:
+    """Append `line` to `path` as exactly one line; the caller holds the lock.
+
+    Two things a plain text-mode append got wrong:
+
+    * A file name can hold an unpaired surrogate (Windows names are UTF-16 and
+      need not be well formed) and so can a message quoting it. UTF-8 refuses
+      to encode one, so the whole line -- the run -- went unlogged.
+      `backslashreplace` writes it as the `\\udXXX` escape, which is valid JSON
+      and reads back as the same character.
+    * A crash or a full disk mid-append leaves a fragment with no newline. The
+      next line used to be glued onto it, so one torn line cost two runs. Start
+      on a fresh line whenever the file does not end with one.
+    """
+    data = line.encode("utf-8", "backslashreplace") + b"\n"
+    with open(path, "ab+") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell():
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                data = b"\n" + data
+        handle.write(data)  # append mode: always lands at the end
+
+
 def append_run(job: Optional[Dict], result: Dict, trigger: str,
                start: datetime, end: Optional[datetime] = None,
                app_level: bool = False) -> bool:
@@ -189,8 +216,7 @@ def append_run(job: Optional[Dict], result: Dict, trigger: str,
         lock = locks.acquire_wait(os.path.join(jobs_store._locks_dir(), lock_name),
                                   "run log update", timeout=LOCK_TIMEOUT)
         try:
-            with open(path, "a", encoding="utf-8", newline="\n") as handle:
-                handle.write(line + "\n")
+            _append_line(path, line)
             _trim(path)
         finally:
             lock.release()
