@@ -190,15 +190,15 @@ def test_launchd_variant_uses_the_same_order_via_backup_utils(dirs, monkeypatch)
     """The default callables route through backup_utils, which branches to
     launchd on macOS. Unverified on a real Mac -- this only pins the order and
     the old/new labels, with launchctl and the plist writes faked out."""
-    from utils import backup_utils
+    from utils import backup_utils, scheduler
     old, new = dirs
     monkeypatch.setattr(backup_utils.sys, "platform", "darwin")
     calls = []
-    monkeypatch.setattr(backup_utils, "_launchd_register",
+    monkeypatch.setattr(scheduler, "_launchd_register",
                         lambda job: calls.append(("register", backup_utils.launchd_label(job["id"])))
                         or (True, ""))
-    monkeypatch.setattr(backup_utils, "_launchd_exists", lambda job_id, legacy=False: legacy)
-    monkeypatch.setattr(backup_utils, "_launchd_unregister",
+    monkeypatch.setattr(scheduler, "_launchd_exists", lambda job_id, legacy=False: legacy)
+    monkeypatch.setattr(scheduler, "_launchd_unregister",
                         lambda job_id, legacy=False: calls.append(
                             ("remove", backup_utils.launchd_label(job_id, legacy))) or (True, ""))
     results = migrate.migrate_tasks([DAILY], str(old), str(new))
@@ -255,11 +255,11 @@ def test_settings_never_replace_a_value_already_chosen_in_the_new_app():
 
 
 def test_migrate_tasks_reports_a_corrupt_jobs_file_instead_of_no_jobs(dirs, tmp_path, monkeypatch):
-    from utils import backup_utils
+    from utils import jobs_store
     old, new = dirs
     bad = tmp_path / "bad.json"
     bad.write_text("{broken", encoding="utf-8")
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(bad))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(bad))
     results = migrate.migrate_tasks(old_dir=str(old), new_dir=str(new),
                                     register=lambda job: pytest.fail("must not register"))
     assert len(results) == 1 and results[0]["ok"] is False

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from utils import backup_utils
+from utils import backup_utils, jobs_store
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -20,7 +20,7 @@ REPO = Path(__file__).resolve().parent.parent
 @pytest.fixture(autouse=True)
 def jobs_file(tmp_path, monkeypatch):
     path = tmp_path / "backup_jobs.json"
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(path))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(path))
     return path
 
 
@@ -200,7 +200,12 @@ def test_cli_exits_3_with_an_error_on_a_corrupt_jobs_file(tmp_path):
     assert proc.returncode == 3, proc.stderr
     assert "[ERROR]" in proc.stderr and "damaged" in proc.stderr
     assert jobs.read_bytes() == before
-    assert sorted(p.name for p in jobs.parent.iterdir()) == ["backup_jobs.json"]
+    # Card 52: nothing was run or changed, but the failure is logged. The jobs
+    # file is untouched and no .bak / .corrupt copy appeared; the only additions
+    # are the run log and the (empty again) folder its short lock used.
+    assert sorted(p.name for p in jobs.parent.iterdir()) == ["backup_jobs.json", "locks", "logs"]
+    assert list((jobs.parent / "locks").iterdir()) == []
+    assert [p.name for p in (jobs.parent / "logs").iterdir()] == ["app.jsonl"]
 
 
 def test_cli_unknown_job_still_exits_2(tmp_path):

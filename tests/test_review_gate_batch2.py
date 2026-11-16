@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from utils import backup_utils, locks
+from utils import backup_utils, copying, jobs_store, locks, preflight, runner
 
 REPO = Path(__file__).resolve().parent.parent
 FILES = 30
@@ -36,7 +36,7 @@ OLD1, OLD2 = "20200101-000000", "20200102-000000"
 @pytest.fixture(autouse=True)
 def isolated_jobs_file(tmp_path, monkeypatch):
     """Keep every test off the real jobs file."""
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
     yield
 
 
@@ -162,7 +162,7 @@ def test_a_full_drive_hitting_the_manifest_fails_with_the_same_cause(
             return FullManifest(real_open(path, mode, *args, **kwargs))
         return real_open(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(backup_utils, "open", fake_open, raising=False)
+    monkeypatch.setattr(runner, "open", fake_open, raising=False)
     time.sleep(1.1)  # a distinct version stamp
     result = backup_utils.run_job(job)
 
@@ -242,7 +242,7 @@ def test_a_run_that_copies_nothing_never_becomes_the_newest_backup(tmp_path, mon
             raise PermissionError(errno.EACCES, "Permission denied", str(path))
         return real_open(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(backup_utils, "open", locked, raising=False)
+    monkeypatch.setattr(copying, "open", locked, raising=False)
     time.sleep(1.1)  # a distinct version stamp
     result = backup_utils.run_job(job)
 
@@ -272,8 +272,8 @@ def test_a_full_wrong_drive_is_reported_as_the_wrong_drive_and_not_swept(
         (root / f"{stamp}.partial").mkdir(parents=True)
         (root / f"{stamp}.partial" / "data.bin").write_text("x", encoding="utf-8")
     job["target_volume"] = "some-other-drive"
-    monkeypatch.setattr(backup_utils, "volume_id", lambda p: "this-drive")
-    monkeypatch.setattr(backup_utils, "_free_bytes", lambda p: 0)
+    monkeypatch.setattr(preflight, "volume_id", lambda p: "this-drive")
+    monkeypatch.setattr(preflight, "_free_bytes", lambda p: 0)
 
     # Positive control: on the RIGHT drive this very state is swept.
     control = dict(job, target_volume="this-drive")

@@ -316,6 +316,10 @@ RESTORE_COLUMNS = (
 )
 RESTORE_ACTION_WIDTH = 110
 
+# The Status tooltip of a FAILED job whose last successful run kept an older,
+# larger backup aside (card 51): a failure never clears that hold.
+HELD_AFTER_FAILURE = "Older backups are being kept because the source shrank."
+
 
 def _tail(path: str, segments: int = 2) -> str:
     """The last few segments of a path, for a narrow table column.
@@ -368,6 +372,15 @@ class JobRow(QtWidgets.QWidget):
                 widget.setObjectName(style_name)
             widget.setMinimumWidth(minimum)
             h.addWidget(widget, stretch)
+            detail = (self._warning_detail(job)
+                      if widget.objectName() in ("StatusWarn", "StatusError") else "")
+            if detail:
+                # An OK with a caveat (files left behind, pruning held), or a
+                # failure while older backups are kept aside: say what, on the
+                # widget itself, for the pointer and a screen reader.
+                widget.setToolTip(detail)
+                widget.setAccessibleName(f"{job.get('name', 'Job')}: {status}")
+                widget.setAccessibleDescription(detail)
 
         # Icon buttons, so three per-row actions cost 108px instead of 240 --
         # each keeps a tooltip and an accessible name, which is what a text
@@ -447,8 +460,45 @@ class JobRow(QtWidgets.QWidget):
         if not job.get("last_run"):
             return "Never run", "Hint"
         if result.startswith("ok"):
+            # Silence is never success: a run that left files behind is not
+            # plain OK, however green that would look.
+            skipped = backup_utils.job_skipped(job)
+            held = backup_utils.job_pruning_held(job)
+            if skipped or held:
+                parts = (([f"{skipped} skipped"] if skipped else [])
+                         + (["pruning held"] if held else []))
+                return "OK, " + ", ".join(parts), "StatusWarn"
             return "OK", "StatusOk"
         return "Failed", "StatusError"
+
+    @staticmethod
+    def _warning_detail(job: dict) -> str:
+        """Everything behind an "OK, ..." warning: the skipped files and/or
+        the held-pruning sentence with its two counts. For a failed run, only
+        the line saying older backups are still kept aside ("" if not)."""
+        if not job.get("last_result", "").startswith("ok"):
+            # Failure stays the status; a hold an earlier run set survives it.
+            return HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else ""
+        parts = []
+        if backup_utils.job_skipped(job):
+            parts.append(JobRow._skipped_detail(job))
+        if backup_utils.job_pruning_held(job):
+            parts.append(backup_utils.pruning_held_sentence(
+                backup_utils.job_last_files(job), backup_utils.job_baseline_files(job)))
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _skipped_detail(job: dict) -> str:
+        """The count and up to five names behind an "OK, N skipped" status."""
+        skipped = backup_utils.job_skipped(job)
+        names = backup_utils.job_skipped_sample(job)
+        text = (f"The last backup finished, but {skipped} file(s) could not "
+                "be read and are not in it.")
+        if names:
+            text += "\n" + "\n".join(names)
+            if skipped > len(names):
+                text += f"\nand {skipped - len(names)} more"
+        return text
 
     def _last_run(self, job: dict) -> str:
         """When this job last ran, short enough to fit its column.
@@ -499,10 +549,27 @@ class RestoreRow(QtWidgets.QWidget):
         when = changes.get("when") if changes.get("ok") else None
         last = QtWidgets.QLabel(when or "Never backed up")
         last.setObjectName("Hint")
-        if when and changes.get("verified") is False:
-            # The version Restore would use was never checked after copying
-            # (verification off, or made before checking existed). Say so
-            # rather than let it pass for a verified one.
+        plan = changes.get("restore") or {}
+        if when and plan.get("newer_unverified") and changes.get("preferred_when"):
+            # Restore defaults to the newest VERIFIED backup (card 45), so
+            # that is the date shown, and the newer unverified one is named
+            # as the thing being passed over.
+            tip = (f"Restore will use the newest verified backup "
+                   f"({changes['preferred_when']}). The newest backup "
+                   f"({when}) was not verified; you can still choose it "
+                   "when you press Restore.")
+            last.setText(f"{changes['preferred_when']}\nnewer backup not verified")
+            last.setObjectName("StatusWarn")
+            # The column's minimum width (RESTORE_COLUMNS) is narrower than
+            # this note; wrap it rather than clip it at the 940px window.
+            last.setWordWrap(True)
+            last.setToolTip(tip)
+            last.setAccessibleDescription(tip)
+        elif when and changes.get("verified") is False:
+            # No version is verified, so Restore uses the newest, which was
+            # never checked after copying (verification off, or made before
+            # checking existed). Say so rather than let it pass for a
+            # verified one.
             last.setText(f"{when}\nnot verified")
             last.setObjectName("StatusWarn")
             last.setToolTip("This backup was not read back and checked after "
@@ -541,6 +608,11 @@ class RestoreRow(QtWidgets.QWidget):
         # reader which one this is, as fix_btn's name does above.
         self.restore_btn.setAccessibleName(
             f"Restore {job.get('name', 'this job')} from its last backup")
+        # The "not verified" note beside the date is a label, which the
+        # keyboard and a screen reader's tab order never reach; repeat it on
+        # the button, which they do (empty when there is no note).
+        self.restore_btn.setToolTip(last.toolTip())
+        self.restore_btn.setAccessibleDescription(last.toolTip())
         # Nothing to restore from until a version exists on disk.
         self.restore_btn.setEnabled(bool(changes.get("ok")))
         self.restore_btn.clicked.connect(lambda: self.restore_requested.emit(self.job))
@@ -610,6 +682,7 @@ class BackupTab(QtWidgets.QWidget):
         # Carries a run's result line across the remeasure that follows it,
         # so the remeasure's own outcome does not erase what just happened.
         self._backup_notice = ""
+        self._backup_notice_warn = False  # ...and whether that line is a warning
 
         v = QtWidgets.QVBoxLayout(self)
         # Margins leave room for the card drop shadows to render un-clipped
@@ -923,8 +996,9 @@ class BackupTab(QtWidgets.QWidget):
             for button in host.findChildren(QtWidgets.QPushButton):
                 button.setEnabled(False)
 
-    def _say(self, message: str, ok: bool = True):
-        self.backup_status.setObjectName("Hint" if ok else "StatusError")
+    def _say(self, message: str, ok: bool = True, warn: bool = False):
+        self.backup_status.setObjectName(
+            "StatusError" if not ok else "StatusWarn" if warn else "Hint")
         # An objectName change after the sheet was applied needs the style
         # re-polished, or the widget keeps the rules it was first matched by.
         self.backup_status.style().unpolish(self.backup_status)
@@ -1033,8 +1107,39 @@ class BackupTab(QtWidgets.QWidget):
             phases={"verifying": f"Verifying backup \"{job.get('name')}\"..."},
         )
 
+    def _choose_restore_version(self, job: dict):
+        """Which version to restore, asking only when the answer is not clear.
+
+        Defaults to the newest VERIFIED version. If a newer one exists that
+        was never verified, or none is verified at all, the user is told in
+        one plain dialog and picks; otherwise there is no extra step. Returns
+        a version stamp, or None for "cancelled / nothing to restore".
+        """
+        plan = backup_utils.restore_candidates(job)
+        preferred, latest = plan["preferred"], plan["latest"]
+        if plan["fallback"]:
+            choice = ConfirmDialog.choose(
+                self, "Restore an unverified backup?",
+                "None of this backup's versions has been verified; restoring "
+                "the newest one.",
+                confirm_text="Restore anyway")
+            return latest if choice == "confirm" else None
+        if preferred == latest:
+            return preferred
+        choice = ConfirmDialog.choose(
+            self, "The newest backup has not been verified",
+            f"The newest backup ({backup_utils.version_when(latest)}) has not "
+            "been verified. The newest verified backup is from "
+            f"{backup_utils.version_when(preferred)}.",
+            confirm_text="Restore the verified backup",
+            alternate_text="Restore the newest anyway")
+        return {"confirm": preferred, "alternate": latest}.get(choice)
+
     def restore_backup_job(self, job: dict):
-        """Copy the job's latest version into a folder the user picks.
+        """Copy the job's preferred version into a folder the user picks.
+
+        The preferred version is the newest verified one (card 45); see
+        `_choose_restore_version` for when the user is asked.
 
         Restoring to a new location rather than over the live source: an
         overwrite would silently replace every edit made since the backup and
@@ -1044,10 +1149,12 @@ class BackupTab(QtWidgets.QWidget):
         """
         if self.backup_thread is not None:
             return
-        version = backup_utils.latest_version(job)
-        if version is None:
+        if backup_utils.latest_version(job) is None:
             self._say(f"\"{job.get('name')}\" has no backup to restore yet.",
                       ok=False)
+            return
+        version = self._choose_restore_version(job)
+        if version is None:
             return
         destination = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Restore into which folder?", self.home)
@@ -1164,15 +1271,21 @@ class BackupTab(QtWidgets.QWidget):
             self._say(f"{message} The result could not be recorded: {exc}",
                       ok=False)
             return
-        self._say(message, ok=result.get("ok", False))
+        # A run that left files behind reads as a warning, not as plain news.
+        warn = bool(result.get("ok") and (result.get("errors")
+                                          or result.get("not_copied")
+                                          or result.get("pruning_held")))
+        self._say(message, ok=result.get("ok", False), warn=warn)
         if result.get("ok"):
             self._backup_notice = message
+            self._backup_notice_warn = warn
             self._remeasure = True
 
     def _finish_changes(self, result: dict):
         self._changes.update(result.get("changes", {}))
         notice, self._backup_notice = self._backup_notice, ""
+        warn, self._backup_notice_warn = self._backup_notice_warn, False
         if notice:
-            self._say(notice)
+            self._say(notice, warn=warn)
         else:
             self.backup_status.setVisible(False)

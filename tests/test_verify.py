@@ -14,12 +14,12 @@ import time
 
 import pytest
 
-from utils import backup_utils
+from utils import backup_utils, copying, jobs_store, runner, versions
 
 
 @pytest.fixture(autouse=True)
 def isolated_jobs_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
     yield
 
 
@@ -238,7 +238,7 @@ def test_a_fault_on_the_write_path_during_the_copy_fails_the_run(tree, monkeypat
             return FlippingWriter(handle)
         return handle
 
-    monkeypatch.setattr(backup_utils, "open", fake_open, raising=False)
+    monkeypatch.setattr(copying, "open", fake_open, raising=False)
     result = backup_utils.run_job(job)
     assert result["ok"] is False
     assert "Nested/B.bin" in result["message"]
@@ -324,7 +324,7 @@ def test_an_unreadable_source_file_is_skipped_reported_and_left_out(tree, monkey
             return FailingRead(handle)
         return handle
 
-    monkeypatch.setattr(backup_utils, "open", fake_open, raising=False)
+    monkeypatch.setattr(copying, "open", fake_open, raising=False)
     result = backup_utils.run_job(job)
 
     assert result["ok"], result["message"]
@@ -425,7 +425,9 @@ class _FrozenClock(backup_utils.datetime):
 def test_a_second_run_in_the_same_second_never_demotes_the_first(tree, monkeypatch):
     job, _, _ = tree
     job["retention"] = 5
-    monkeypatch.setattr(backup_utils, "datetime", _FrozenClock)
+    monkeypatch.setattr(jobs_store, "datetime", _FrozenClock)
+    monkeypatch.setattr(versions, "datetime", _FrozenClock)
+    monkeypatch.setattr(runner, "datetime", _FrozenClock)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
     first = backup_utils.run_job(job)
     assert first["ok"], first["message"]

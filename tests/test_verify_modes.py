@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from utils import backup_utils
+from utils import backup_utils, jobs_store, verify
 
 FILES = 60          # 5% of 60 -> a sample of 3
 LARGEST = "big/largest.bin"
@@ -26,7 +26,7 @@ SMALL = "small/f_10.txt"   # neither largest nor newest
 
 @pytest.fixture(autouse=True)
 def isolated_jobs_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
 
 
 @pytest.fixture
@@ -39,7 +39,7 @@ def rehashed(monkeypatch):
         seen.append(os.path.relpath(path, partial_root(path)).replace("\\", "/"))
         return real(path)
 
-    monkeypatch.setattr(backup_utils, "_rehash", counting)
+    monkeypatch.setattr(verify, "_rehash", counting)
     return seen
 
 
@@ -214,7 +214,7 @@ def test_quick_catches_a_corrupted_sampled_file(tmp_path):
 def test_quick_catches_a_missing_or_resized_unsampled_file(tmp_path, monkeypatch,
                                                           rehashed, damage):
     # Sample shrunk to exactly {largest, newest}, so SMALL is certainly unsampled.
-    monkeypatch.setattr(backup_utils, "QUICK_SAMPLE_FRACTION", 0.0001)
+    monkeypatch.setattr(verify, "QUICK_SAMPLE_FRACTION", 0.0001)
     job, _ = make_job(tmp_path, "quick")
 
     def action(partial):
@@ -234,7 +234,7 @@ def test_quick_does_not_catch_a_same_size_corruption_outside_the_sample(
         tmp_path, monkeypatch, rehashed):
     # The honest limit of quick mode, pinned so nobody mistakes it for full:
     # a byte flipped (size unchanged) in a file the sample skipped passes.
-    monkeypatch.setattr(backup_utils, "QUICK_SAMPLE_FRACTION", 0.0001)
+    monkeypatch.setattr(verify, "QUICK_SAMPLE_FRACTION", 0.0001)
     job, source = make_job(tmp_path, "quick")
     result = backup_utils.run_job(job, on_phase=on_verify(job, flip_first_byte(SMALL)))
     assert result["ok"], result["message"]
