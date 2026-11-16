@@ -18,7 +18,8 @@ from PySide6.QtCore import Qt
 from utils import backup_utils
 from utils.fs_utils import human_size
 from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
-                            divider, icon_button, section, table_header)
+                            add_field, divider, icon_button, section,
+                            section_header, table_header)
 
 
 class BackupWorker(QtCore.QObject):
@@ -147,6 +148,31 @@ class BackupJobDialog(QtWidgets.QDialog):
         hint.setWordWrap(True)
         v.addWidget(hint)
 
+        # Advanced: settings most people never change. A plain labelled
+        # section until the Simple/Advanced switch (batch 4) can hide it.
+        v.addWidget(section_header("Advanced"))
+        advanced = QtWidgets.QFormLayout()
+        advanced.setSpacing(8)
+        advanced.setLabelAlignment(Qt.AlignLeft)
+        self.verify = QtWidgets.QComboBox()
+        # Same order as backup_utils.VERIFY_MODES; the index is the mode.
+        self.verify.addItems(["Full - re-read every file (slowest, safest)",
+                              "Quick - check sizes and a sample of files",
+                              "Off - do not re-read the copy"])
+        self.verify.setCurrentIndex(backup_utils.VERIFY_MODES.index(
+            backup_utils.job_verify_mode(job or {})))
+        # One short line on purpose: the form already needs 636 px, which is
+        # more than a 1366x768 laptop at 125% scaling can show (614 px, less
+        # the taskbar), so there the fields are still squeezed. The item
+        # texts already say what each mode does.
+        field = add_field(advanced, "Verification", self.verify, hint=(
+            "Quick and Off finish sooner but check less. Off versions are "
+            "marked not verified."))
+        # Line the field up with the form above (its widest label).
+        advanced.labelForField(field).setMinimumWidth(
+            form.labelForField(self.retention).sizeHint().width())
+        v.addLayout(advanced)
+
         self.error = QtWidgets.QLabel()
         self.error.setObjectName("StatusError")
         self.error.setWordWrap(True)
@@ -171,6 +197,23 @@ class BackupJobDialog(QtWidgets.QDialog):
         shadow.setOffset(0, 2)
         shadow.setColor(QtGui.QColor(24, 24, 27, 28))
         card.setGraphicsEffect(shadow)
+        self._fit_to_screen()
+
+    def _fit_to_screen(self) -> None:
+        """Open at the form's full height instead of Qt's default.
+
+        Qt sizes a new top-level to its size hint but never taller than 2/3
+        of the screen. On any screen under ~950 px high (1366x768, or 1080p
+        at 125% scaling) that is less than this form needs, so every field
+        was squeezed until its text clipped. Ask for the full height, capped
+        at what the screen can show (less a title bar's worth).
+        """
+        width = self.minimumWidth()
+        needed = self.layout().totalHeightForWidth(width)
+        screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
+        if screen is not None:
+            needed = min(needed, screen.availableGeometry().height() - 48)
+        self.resize(width, max(needed, self.minimumSizeHint().height()))
 
     def _label(self, text: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(text)
@@ -229,14 +272,15 @@ class BackupJobDialog(QtWidgets.QDialog):
             volume = self.job["target_volume"]
 
         schedule = ("manual", "daily", "weekly")[self.schedule.currentIndex()]
+        verify = backup_utils.VERIFY_MODES[self.verify.currentIndex()]
         if self.job is None:
             self.job = backup_utils.new_job(name, source, target, schedule, at,
-                                            self.retention.value(), volume)
+                                            self.retention.value(), volume, verify)
         else:
             self.job.update({"name": name, "source": source, "target": target,
                              "schedule": schedule, "at": at,
                              "retention": self.retention.value(),
-                             "target_volume": volume})
+                             "target_volume": volume, "verify": verify})
         self.accept()
 
 
@@ -455,6 +499,14 @@ class RestoreRow(QtWidgets.QWidget):
         when = changes.get("when") if changes.get("ok") else None
         last = QtWidgets.QLabel(when or "Never backed up")
         last.setObjectName("Hint")
+        if when and changes.get("verified") is False:
+            # The version Restore would use was never checked after copying
+            # (verification off, or made before checking existed). Say so
+            # rather than let it pass for a verified one.
+            last.setText(f"{when}\nnot verified")
+            last.setObjectName("StatusWarn")
+            last.setToolTip("This backup was not read back and checked after "
+                            "it was copied.")
 
         text, style = self._changes(changes)
         changed = QtWidgets.QLabel(text)
@@ -1101,6 +1153,11 @@ class BackupTab(QtWidgets.QWidget):
         result line the user is reading.
         """
         message = result.get("message", "")
+        if result.get("busy"):
+            # Another run of this job holds its lock (e.g. the scheduled task
+            # fired). Show why, and leave the job's real last_result alone.
+            self._say(message, ok=False)
+            return
         try:
             backup_utils.record_run(job["id"], result)
         except (backup_utils.JobsFileCorrupt, OSError) as exc:

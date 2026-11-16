@@ -309,7 +309,11 @@ def run_backup_job_cli(job_id):
     Qt-free by design, so nothing here touches the widget layer.
 
     Exit codes: 0 backed up, 1 the backup failed, 2 no such job, 3 the jobs
-    file is damaged (nothing was run or written).
+    file is damaged (nothing was run or written), 4 skipped because another
+    run of the same job is already in progress (nothing was run or written,
+    and the job's last result is left as it was). If the run finished but its
+    result could not be written back (the jobs-file lock timed out), the exit
+    code is still the run's own, 0 or 1, and the message says so.
     """
     from utils import backup_utils
 
@@ -329,12 +333,24 @@ def run_backup_job_cli(job_id):
         print(f"[ERROR] No backup job with id '{job_id}'")
         return 2
     result = backup_utils.run_job(job)
+    if result.get("busy"):
+        # Not a result of this job: recording it would overwrite the real last
+        # run's outcome with "failed: already running".
+        print(f"[SKIPPED] {result.get('message', '')}", file=sys.stderr)
+        return 4
     try:
         backup_utils.record_run(job_id, result)
     except backup_utils.JobsFileCorrupt as exc:
         print(f"[ERROR] The backup ran ({result.get('message', '')}) but its "
               f"result could not be recorded: {exc}", file=sys.stderr)
         return 3
+    except OSError as exc:
+        # The jobs-file lock timed out or the file could not be written. The
+        # run itself happened, so say how it went and exit on that; only the
+        # job's stored last result is stale.
+        print(("[OK] " if result.get("ok") else "[ERROR] ") + result.get("message", "")
+              + f" This result could not be recorded: {exc}", file=sys.stderr)
+        return 0 if result.get("ok") else 1
     print(("[OK] " if result.get("ok") else "[ERROR] ") + result.get("message", ""))
     return 0 if result.get("ok") else 1
 

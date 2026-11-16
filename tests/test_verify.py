@@ -119,7 +119,7 @@ def test_a_run_writes_a_sibling_manifest_matching_independent_hashes(tree):
     assert lines[0]["type"] == "header" and lines[0]["version"] == 1
     assert lines[0]["stamp"] == result["version"]
     assert lines[-1] == {"type": "end", "files": 4, "bytes": result["bytes"],
-                         "verified": True}
+                         "verify": "full", "verified": True}
     entries = {e["path"]: e for e in lines[1:-1]}
     assert all(e["type"] == "file" for e in entries.values())
 
@@ -269,7 +269,8 @@ def test_abort_during_copy_removes_partial_and_temp_manifest(tree):
         return calls["n"] > 1
 
     result = backup_utils.run_job(job, should_abort=abort_after_first_file)
-    assert result == {"ok": False, "message": "Backup cancelled"}
+    # `swept` (the sweep's removals; empty here) is part of every result the sweep ran for
+    assert result == {"ok": False, "message": "Backup cancelled", "swept": []}
     assert os.listdir(backup_utils.job_root(job)) == []
 
 
