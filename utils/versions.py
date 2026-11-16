@@ -12,7 +12,7 @@ import shutil
 import stat
 import sys
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from utils.copying import BackupAborted, SourceUnavailable, TargetWriteFailed, copy_tree
 from utils.fs_utils import _is_link_like
@@ -211,61 +211,73 @@ def restore_candidates(job: Dict) -> Dict:
 # ---------------------------------------------------------------------------
 # A run is compared with the versions already kept. If it has lost more than
 # this share of the files the best of them had, the source was probably
-# emptied by mistake, by ransomware or by a half-finished move, and pruning
-# is held for the run so the complete copies are not rolled out of retention
-# one run at a time. There is deliberately no minimum file count: a tiny
-# source going from 2 files to 1 is a 50% drop and holds like any other.
+# emptied by mistake, by ransomware or by a half-finished move, so that best
+# version -- the "baseline" -- is kept aside while the others prune as usual,
+# and a complete copy cannot be rolled out of retention one run at a time.
+# There is deliberately no minimum file count: a tiny source going from 2
+# files to 1 is a 50% drop and holds like any other.
 SANITY_DROP_FRACTION = 0.30
 
 
-def baseline_files(job: Dict, exclude: Optional[str] = None) -> int:
-    """The most files any retained VERIFIED version of `job` holds; 0 if none.
+def sanity_baseline(job: Dict, exclude: Optional[str] = None) -> Tuple[int, Optional[str]]:
+    """`(files, stamp)` of the retained version of `job` holding the most
+    files (ties: the newest of them); `(0, None)` if there is none.
 
-    The count is the manifest trailer's `files`. A version with no readable
-    verified manifest (legacy, "off", damaged) does not count: it was never
-    shown to be a complete copy, so it cannot say what "complete" looks like.
-    `exclude` is the version stamp of the run being judged.
+    Any version with a readable, complete manifest trailer counts, verified
+    or not: the file count is a property of the source, not of how carefully
+    the copy was checked, so a job with verification "off" is guarded too.
+    Legacy versions (no manifest), damaged or truncated trailers and a junk
+    `files` value do not count. `exclude` is the stamp of the run being judged.
     """
-    best = 0
-    for name in verified_versions(job):
+    best, stamp = 0, None
+    for name in version_names(job):             # oldest first, so >= keeps the newest tie
         if name == exclude:
             continue
         files = (read_manifest_summary(job, name) or {}).get("files")
-        if isinstance(files, int) and not isinstance(files, bool) and files > best:
-            best = files
-    return best
+        if isinstance(files, int) and not isinstance(files, bool) and files > 0 and files >= best:
+            best, stamp = files, name
+    return best, stamp
+
+
+def baseline_files(job: Dict, exclude: Optional[str] = None) -> int:
+    """The file count of `sanity_baseline`; 0 if there is no baseline."""
+    return sanity_baseline(job, exclude)[0]
+
+
+def is_sanity_drop(baseline: int, files: int) -> bool:
+    """True if `files` is more than `SANITY_DROP_FRACTION` below `baseline`
+    (never with no baseline, e.g. a first run)."""
+    return bool(baseline) and (baseline - files) / baseline > SANITY_DROP_FRACTION
 
 
 def sanity_drop_baseline(job: Dict, files: int, exclude: Optional[str] = None) -> int:
-    """The baseline file count if `files` is more than `SANITY_DROP_FRACTION`
-    below it (pruning must be held), else 0 (also 0 with no baseline, e.g. a
-    first run).
+    """The baseline file count if `files` is a sanity drop against it (the
+    baseline must be kept aside), else 0.
 
     The baseline is the MAX over retained versions, not the previous one, so
     the guard keeps holding on every later run while the source stays low.
-    The hold has no automatic release: pruning is what would roll the large
-    versions out, and it is held, so only the count coming back within the
-    threshold lets it through. A later card adds an explicit "this is fine"
-    action; until then, growth of the target is the accepted cost.
+    Holding protects only that one version (`prune_versions(protect=...)`),
+    so a source that stays low costs one extra complete version, never
+    unbounded growth. It ends when the count comes back within the
+    threshold; a later card adds an explicit "this is fine" action.
     """
     baseline = baseline_files(job, exclude)
-    if baseline and (baseline - files) / baseline > SANITY_DROP_FRACTION:
-        return baseline
-    return 0
+    return baseline if is_sanity_drop(baseline, files) else 0
 
 
 def pruning_held_sentence(files: int, baseline: int) -> str:
-    """The plain-English warning for a run whose pruning was held."""
+    """The plain-English warning for a run that kept its baseline aside."""
     fewer = round(100 * (baseline - files) / baseline)
     def count(n: int) -> str:
         return f"{n} file" if n == 1 else f"{n} files"
     return (f"Pruning was held because this backup has {count(files)} and an "
-            f"earlier backup has {count(baseline)} ({fewer}% fewer). If that is "
-            "not expected, check your files before the next run; older backups "
-            "were kept.")
+            f"earlier backup has {count(baseline)} ({fewer}% fewer). That "
+            "earlier, larger backup is being kept; other old backups are pruned "
+            "as usual. If that is not expected, check your files before the "
+            "next run.")
 
 
-def prune_versions(job: Dict) -> List[str]:
+def prune_versions(job: Dict, protect: Iterable[str] = ()) -> List[str]:
     """Delete the oldest versions beyond the job's retention count.
 
     Returns the names actually removed. A version that cannot be deleted (a
@@ -278,13 +290,20 @@ def prune_versions(job: Dict) -> List[str]:
     one made with verification "off", it is still the last one known to match
     what was copied. Legacy and "off" versions otherwise prune by retention
     like any other. A pruned version's manifest goes with it.
+
+    Versions named in `protect` (the sanity guard's baseline) are never
+    deleted and do not count toward retention, so a held job keeps at most
+    `retention` ordinary versions plus the protected ones. An empty `protect`
+    is the plain retention prune.
     """
     keep = max(1, int(job.get("retention", DEFAULT_RETENTION)))
     names = version_names(job)
     protected = next((name for name in reversed(names)
                       if is_verified(job, name)), None)
+    protect = set(protect)
+    candidates = [name for name in names if name not in protect]
     removed = []
-    for name in names[:max(0, len(names) - keep)]:
+    for name in candidates[:max(0, len(candidates) - keep)]:
         if name == protected:
             continue
         # Manifest first: a version whose folder deletion fails halfway must

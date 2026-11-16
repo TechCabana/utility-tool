@@ -316,6 +316,10 @@ RESTORE_COLUMNS = (
 )
 RESTORE_ACTION_WIDTH = 110
 
+# The Status tooltip of a FAILED job whose last successful run kept an older,
+# larger backup aside (card 51): a failure never clears that hold.
+HELD_AFTER_FAILURE = "Older backups are being kept because the source shrank."
+
 
 def _tail(path: str, segments: int = 2) -> str:
     """The last few segments of a path, for a narrow table column.
@@ -368,10 +372,12 @@ class JobRow(QtWidgets.QWidget):
                 widget.setObjectName(style_name)
             widget.setMinimumWidth(minimum)
             h.addWidget(widget, stretch)
-            if widget.objectName() == "StatusWarn":
-                # An OK with a caveat (files left behind, pruning held): say
-                # what, on the widget itself, for the pointer and a screen reader.
-                detail = self._warning_detail(job)
+            detail = (self._warning_detail(job)
+                      if widget.objectName() in ("StatusWarn", "StatusError") else "")
+            if detail:
+                # An OK with a caveat (files left behind, pruning held), or a
+                # failure while older backups are kept aside: say what, on the
+                # widget itself, for the pointer and a screen reader.
                 widget.setToolTip(detail)
                 widget.setAccessibleName(f"{job.get('name', 'Job')}: {status}")
                 widget.setAccessibleDescription(detail)
@@ -468,7 +474,11 @@ class JobRow(QtWidgets.QWidget):
     @staticmethod
     def _warning_detail(job: dict) -> str:
         """Everything behind an "OK, ..." warning: the skipped files and/or
-        the held-pruning sentence with its two counts."""
+        the held-pruning sentence with its two counts. For a failed run, only
+        the line saying older backups are still kept aside ("" if not)."""
+        if not job.get("last_result", "").startswith("ok"):
+            # Failure stays the status; a hold an earlier run set survives it.
+            return HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else ""
         parts = []
         if backup_utils.job_skipped(job):
             parts.append(JobRow._skipped_detail(job))

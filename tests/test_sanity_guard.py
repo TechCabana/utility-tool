@@ -1,7 +1,8 @@
 # tests/test_sanity_guard.py
 # Card 51: the source sanity guard. A run that copied more than 30% fewer files
-# than the largest retained VERIFIED version holds still succeeds and keeps its
-# version, but pruning is held for it. Real trees under tmp_path; the one fake
+# than the largest retained version with a complete manifest (verified or not)
+# still succeeds and keeps its version, and that largest version is kept aside
+# while the others prune as usual (the bounded hold). Real trees under tmp_path; the one fake
 # is a clock that moves one second per run so every run gets its own stamp
 # without sleeping. Faults are patched on the module that owns them
 # (`utils.runner`, `utils.versions`, `utils.copying`), never on the facade.
@@ -73,11 +74,13 @@ def run(job):
 
 @pytest.fixture
 def prune_calls(monkeypatch):
-    """Record every call `run_job` makes to prune, then do the real prune."""
+    """Record every call `run_job` makes to prune (job id, protected set),
+    then do the real prune."""
     calls = []
     real = runner.prune_versions
     monkeypatch.setattr(runner, "prune_versions",
-                        lambda job: calls.append(job["id"]) or real(job))
+                        lambda job, protect=(): calls.append((job["id"], set(protect)))
+                        or real(job, protect))
     return calls
 
 
@@ -101,7 +104,9 @@ def test_done_when_ten_files_to_six_holds_pruning_then_nine_prunes_normally(make
     assert held["baseline_files"] == 10 and held["files"] == 6
     assert held["pruned"] == []
     assert "Pruning was held because this backup has 6 files and an earlier backup has 10 files (40% fewer)" in held["message"]
-    assert "older backups were kept" in held["message"]
+    # Bounded hold: the sentence now says what is kept and that the rest prune.
+    assert ("That earlier, larger backup is being kept; other old backups are "
+            "pruned as usual") in held["message"]
     assert "Removed" not in held["message"]
     # Retention is 2 and 3 versions exist: the guard is the only reason.
     assert backup_utils.version_names(job) == kept + [held["version"]]
@@ -128,15 +133,19 @@ def test_the_new_version_is_still_promoted_and_verified_on_a_held_run(make_job):
     assert trailer["files"] == 5 and trailer["verified"] is True
 
 
-def test_prune_is_not_even_attempted_on_a_held_run(make_job, prune_calls):
+def test_a_held_run_still_prunes_but_protects_the_baseline(make_job, prune_calls):
+    # Replaces "prune is not even attempted on a held run": skipping the prune
+    # outright let a permanently smaller source grow the target until every
+    # run failed for space (bounded-hold redesign). Now the prune runs and
+    # only the baseline is protected.
     job, source = make_job()
-    run(job)
-    assert prune_calls == [job["id"]]                      # a normal run does call it
+    first, _ = run(job)
+    assert prune_calls == [(job["id"], set())]             # a normal run protects nothing
 
     set_files(source, 4)
     held, _ = run(job)
     assert held["pruning_held"]
-    assert prune_calls == [job["id"]]                      # ...and the held one did not
+    assert prune_calls[1] == (job["id"], {first["version"]})
 
 
 # --- the threshold ---------------------------------------------------------------
@@ -200,15 +209,18 @@ def test_the_baseline_is_the_largest_retained_version_not_the_previous_one(make_
     assert second_low["pruned"] == []
 
 
-def test_an_unverified_earlier_version_is_not_a_baseline(make_job):
+def test_an_unverified_earlier_version_is_a_baseline(make_job):
+    # Was "...is NOT a baseline". A file count is a property of the source,
+    # not of how the copy was checked, and excluding "off" versions left every
+    # verification-off job unguarded (10 -> 1 files never held).
     job, source = make_job()
     off, _ = run(dict(job, verify="off"))
     assert off["verified"] is False
     set_files(source, 5)
     result, _ = run(job)
 
-    assert result["ok"] and result["pruning_held"] is False
-    assert result["baseline_files"] == 0
+    assert result["ok"] and result["pruning_held"] is True
+    assert result["baseline_files"] == 10
 
 
 def test_an_unverified_new_version_is_still_judged_against_a_verified_baseline(make_job):
@@ -279,15 +291,19 @@ def test_a_held_run_stores_the_fields_and_a_normal_run_clears_them(make_job):
     assert backup_utils.job_pruning_held(stored) is False
 
 
-def test_a_failed_run_does_not_set_the_hold_fields(make_job):
+def test_a_failed_run_neither_sets_nor_clears_the_hold_fields(make_job):
+    # Was "a failed run does not set the hold fields" and asserted a failure
+    # CLEARED them. That hid the cause of the low-space failures a hold leads
+    # to, so a failure now leaves all three exactly as the last success set them.
     job, source = make_job()
     run(job)
     stored = backup_utils.record_run(job["id"], {
         "ok": False, "message": "drive gone", "pruning_held": True,
         "baseline_files": 10, "files": 6})
     assert stored["last_pruning_held"] is False and stored["last_baseline_files"] == 0
+    assert stored["last_files"] == 10
 
-    # ...and a real failure (the source is gone) after a held run clears it.
+    # ...and a real failure (the source is gone) after a held run keeps it.
     set_files(source, 5)
     _, held = run(job)
     assert held["last_pruning_held"] is True
@@ -296,7 +312,8 @@ def test_a_failed_run_does_not_set_the_hold_fields(make_job):
     source.rmdir()
     failed, stored = run(job)
     assert failed["ok"] is False
-    assert stored["last_pruning_held"] is False and stored["last_baseline_files"] == 0
+    assert stored["last_pruning_held"] is True and stored["last_baseline_files"] == 10
+    assert stored["last_files"] == 5 and stored["last_skipped"] == 0
 
 
 def test_a_new_job_starts_not_held():
@@ -403,3 +420,230 @@ def test_the_headless_run_warns_on_stderr_and_still_exits_zero(tmp_path, make_jo
     assert "[OK] " in second.stdout
     assert ("[WARN] Pruning was held because this backup has 5 files and an earlier "
             "backup has 10 files (50% fewer)") in second.stderr
+
+
+# --- the bounded hold (review-gate redesign) ---------------------------------------
+# Skipping the prune outright let a source that stayed small grow the target
+# without bound until every run failed pre-flight for space. Now the hold
+# protects one version, the baseline, and everything else prunes by retention.
+
+FILE_BYTES = 10_000
+
+
+def set_sized_files(source, count):
+    """Like `set_files`, but every file is exactly `FILE_BYTES` long, so the
+    space a version takes on the target is known."""
+    source.mkdir(parents=True, exist_ok=True)
+    for old in source.iterdir():
+        old.unlink()
+    for i in range(count):
+        (source / f"file{i}.bin").write_bytes(bytes([i % 251]) * FILE_BYTES)
+
+
+def tree_bytes(path):
+    """Bytes of every file under `path` (versions, manifests, leftovers)."""
+    return sum(os.path.getsize(os.path.join(d, f))
+               for d, _, names in os.walk(path) for f in names)
+
+
+def stamps_with_files(job):
+    """{stamp: files} from each retained version's trailer."""
+    return {name: (backup_utils.read_manifest_summary(job, name) or {}).get("files")
+            for name in backup_utils.version_names(job)}
+
+
+def test_reviewer_scenario_a_permanently_smaller_source_never_fills_a_finite_disk(
+        make_job, monkeypatch):
+    from utils import preflight
+    job, source = make_job(retention=2)
+    set_sized_files(source, 10)
+    target = job["target"]
+    # A finite drive: free = capacity - what the target holds. Room for the
+    # baseline, two 6-file versions and the next run's 1.1x margin, but not
+    # for an unbounded pile of 6-file versions.
+    capacity = 350_000
+    asked = []
+
+    def free(path):
+        asked.append(path)
+        return capacity - tree_bytes(target)
+
+    monkeypatch.setattr(preflight, "_free_bytes", free)
+    assert 2 * 10 * FILE_BYTES + 10 * 6 * FILE_BYTES > capacity   # unbounded would not fit
+
+    results = []
+    for n in range(12):
+        if n == 2:
+            set_sized_files(source, 6)
+        result, stored = run(backup_utils.get_job(job["id"]))
+        results.append(result)
+        assert result["ok"], (n + 1, result["message"])
+        assert len(backup_utils.version_names(job)) <= 2 + 1, n + 1
+    assert asked                                            # the finite drive was consulted
+
+    baseline = results[1]["version"]                        # ties -> the newest 10-file one
+    assert stamps_with_files(job)[baseline] == 10
+    assert all(r["pruning_held"] for r in results[2:])
+    assert all(r["baseline_files"] == 10 for r in results[2:])
+    assert results[0]["version"] not in backup_utils.version_names(job)
+    assert stored["last_pruning_held"] is True
+
+
+def test_the_baseline_survives_a_fully_rolled_retention_window(make_job):
+    job, source = make_job(retention=1)
+    first, _ = run(job)
+    set_files(source, 6)
+    held = [run(job)[0] for _ in range(4)]
+
+    assert all(r["pruning_held"] for r in held)
+    # Retention 1: only the newest ordinary version, plus the protected baseline.
+    assert backup_utils.version_names(job) == [first["version"], held[-1]["version"]]
+    assert held[-1]["pruned"] == [held[-2]["version"]]
+    assert held[-1]["message"].endswith("before the next run. Removed 1 old version(s)")
+
+
+def test_protect_and_the_newest_verified_rule_both_hold(make_job):
+    job, source = make_job(retention=1)
+    off_big, _ = run(dict(job, verify="off"))               # the baseline: 10 files, unverified
+    set_files(source, 6)
+    verified_small, _ = run(job)                            # full verify, 6 files
+    off_small, _ = run(dict(job, verify="off"))             # newest, unverified
+
+    assert off_small["pruning_held"] and off_small["baseline_files"] == 10
+    # Retention 1 would prune `verified_small`, but it is the newest verified
+    # version; `off_big` is protected as the baseline. Nothing goes.
+    assert off_small["pruned"] == []
+    assert backup_utils.version_names(job) == [
+        off_big["version"], verified_small["version"], off_small["version"]]
+
+
+def test_prune_versions_protect_does_not_count_toward_retention(make_job):
+    job, _ = make_job(retention=2)
+    stamps = [run(job)[0]["version"] for _ in range(2)]
+    root = backup_utils.job_root(job)
+    for name in ("20200101-000000", "20200102-000000"):     # two old legacy versions
+        os.makedirs(os.path.join(root, name))
+
+    # Protect the OLDER real version: if it counted toward retention, the two
+    # newest names would be "kept" by it and both legacy versions would go.
+    removed = backup_utils.prune_versions(job, protect={stamps[0]})
+    assert removed == ["20200101-000000"]
+    assert backup_utils.version_names(job) == ["20200102-000000"] + stamps
+
+
+def test_when_the_count_recovers_the_hold_ends_and_the_baseline_prunes(make_job):
+    job, source = make_job(retention=2)
+    big = [run(job)[0] for _ in range(2)]
+    set_files(source, 6)
+    small = [run(job)[0] for _ in range(3)]
+    assert big[1]["version"] in backup_utils.version_names(job)
+
+    set_files(source, 9)
+    recovered, stored = run(job)
+    assert recovered["pruning_held"] is False and recovered["baseline_files"] == 0
+    assert big[1]["version"] in recovered["pruned"]
+    assert backup_utils.version_names(job) == [small[-1]["version"], recovered["version"]]
+    assert stored["last_pruning_held"] is False and stored["last_baseline_files"] == 0
+
+
+def test_an_all_off_job_going_from_ten_files_to_one_holds(make_job):
+    job, source = make_job(verify="off")
+    first, _ = run(job)
+    set_files(source, 1)
+    result, stored = run(job)
+
+    assert result["verified"] is False
+    assert result["pruning_held"] is True and result["baseline_files"] == 10
+    assert first["version"] in backup_utils.version_names(job)
+    assert stored["last_pruning_held"] is True
+
+
+def test_an_off_version_with_a_damaged_trailer_is_not_a_baseline(make_job):
+    job, source = make_job(verify="off")
+    run(job)
+    stamp = backup_utils.version_names(job)[0]
+    path = backup_utils.manifest_path(job, stamp)
+    with open(path, "rb") as handle:
+        data = handle.read()
+    with open(path, "wb") as handle:
+        handle.write(data[:-10])                            # truncated mid-trailer
+    set_files(source, 1)
+
+    result, _ = run(job)
+    assert result["ok"] and result["pruning_held"] is False
+
+
+def test_a_failed_space_preflight_keeps_the_hold_and_a_success_recomputes_it(
+        make_job, monkeypatch):
+    from utils import preflight
+    job, source = make_job()
+    run(job)
+    set_files(source, 6)
+    _, stored = run(job)
+    assert stored["last_pruning_held"] is True and stored["last_files"] == 6
+
+    monkeypatch.setattr(preflight, "_free_bytes", lambda path: 0)
+    failed, stored = run(backup_utils.get_job(job["id"]))
+    assert failed["ok"] is False
+    assert failed["message"].startswith(preflight.LOW_SPACE_PREFIX)
+    assert preflight.HELD_LOW_SPACE_SENTENCE in failed["message"]
+    assert stored["last_result"].startswith("failed")
+    assert stored["last_pruning_held"] is True
+    assert stored["last_baseline_files"] == 10 and stored["last_files"] == 6
+    assert stored["last_skipped"] == 0
+
+    monkeypatch.setattr(preflight, "_free_bytes", lambda path: 10 ** 12)
+    set_files(source, 10)
+    ok, stored = run(backup_utils.get_job(job["id"]))
+    assert ok["ok"] and ok["pruning_held"] is False
+    assert stored["last_pruning_held"] is False and stored["last_files"] == 10
+
+
+def test_a_failed_run_after_skips_still_stores_zero_skipped(make_job):
+    job, _ = make_job()
+    run(job)
+    stored = backup_utils.record_run(job["id"], {
+        "ok": True, "message": "m", "files": 9, "errors": ["a.txt: denied"],
+        "not_copied": 1, "pruning_held": False, "baseline_files": 0})
+    assert stored["last_skipped"] == 1
+    stored = backup_utils.record_run(job["id"], {"ok": False, "message": "gone"})
+    assert stored["last_skipped"] == 0 and stored["last_files"] == 9
+
+
+def test_the_low_space_message_names_the_kept_backups_only_when_held(tmp_path):
+    from utils import preflight
+    source = tmp_path / "s"
+    set_files(source, 3)
+    (tmp_path / "t").mkdir()
+    plain = {"source": str(source), "target": str(tmp_path / "t")}
+    held = dict(plain, last_pruning_held=True, last_baseline_files=10, last_files=3)
+
+    for job, expect in ((plain, False), (held, True),
+                        (dict(held, last_pruning_held="yes"), False)):
+        message = preflight.preflight(job, free_space=lambda path: 0)
+        assert message.startswith(preflight.LOW_SPACE_PREFIX)
+        assert (preflight.HELD_LOW_SPACE_SENTENCE in message) is expect
+    assert preflight.HELD_LOW_SPACE_SENTENCE.startswith(
+        "Older backups are being kept aside because your source folder shrank.")
+    # Other refusals never mention it.
+    assert "kept aside" not in preflight.preflight(dict(held, source=str(tmp_path / "x")))
+
+
+def test_a_failed_row_that_is_still_held_says_so_in_its_tooltip():
+    pytest.importorskip("PySide6")
+    from tabs.backup_tab import HELD_AFTER_FAILURE, JobRow
+
+    failed = {"last_run": "2026-11-15T10:00:00", "last_result": "failed: no space",
+              "last_skipped": 0, "last_pruning_held": False,
+              "last_baseline_files": 0, "last_files": 6}
+    held = dict(failed, last_pruning_held=True, last_baseline_files=10)
+    old = {"last_run": "2026-11-15T10:00:00", "last_result": "failed: x"}
+
+    assert HELD_AFTER_FAILURE == "Older backups are being kept because the source shrank."
+    assert JobRow._status(None, held) == ("Failed", "StatusError")   # failure stays primary
+    assert JobRow._warning_detail(held) == HELD_AFTER_FAILURE
+    assert JobRow._warning_detail(failed) == ""
+    assert JobRow._warning_detail(old) == ""                          # old jobs file: not held
+    # An OK row is unchanged: the full sentence, not the failure line.
+    ok = JobRow._warning_detail(dict(held, last_result="ok"))
+    assert "Pruning was held" in ok and HELD_AFTER_FAILURE not in ok

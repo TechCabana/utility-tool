@@ -41,11 +41,11 @@ from utils.jobs_store import (  # noqa: F401
     _write_atomic,
 )
 from utils.versions import (  # noqa: F401
-    baseline_files, _discard, is_verified, job_root, _last_line, latest_version,
+    baseline_files, _discard, is_sanity_drop, is_verified, job_root, _last_line, latest_version,
     _make_writable_and_retry, manifest_path, _MANIFEST_RE, MANIFEST_SUFFIX,
     _MANIFEST_TMP_RE, MANIFEST_VERSION, _PARTIAL_RE, prune_versions,
     pruning_held_sentence, read_manifest_summary, restore_candidates, restore_version, _rmtree,
-    SANITY_DROP_FRACTION, sanity_drop_baseline, _STAMP, SWEEP_MAX_AGE_DAYS, sweep_stale, verified_versions, verify_mode, version_datetime, VERSION_FORMAT,
+    SANITY_DROP_FRACTION, sanity_baseline, sanity_drop_baseline, _STAMP, SWEEP_MAX_AGE_DAYS, sweep_stale, verified_versions, verify_mode, version_datetime, VERSION_FORMAT,
     version_names, version_path, _VERSION_RE, version_when,
 )
 from utils.copying import (  # noqa: F401
@@ -61,7 +61,7 @@ from utils.verify import (  # noqa: F401
     VERIFY_NAMED,
 )
 from utils.preflight import (  # noqa: F401
-    _free_bytes, LOW_SPACE_PREFIX, nearest_existing_ancestor, preflight,
+    _free_bytes, HELD_LOW_SPACE_SENTENCE, LOW_SPACE_PREFIX, nearest_existing_ancestor, preflight,
     _preflight_and_sweep, _same_volume, SPACE_MARGIN, target_inside_source,
     target_volume, volume_id,
 )

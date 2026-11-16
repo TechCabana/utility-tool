@@ -364,12 +364,16 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
             str(error).split(": ", 1)[0].rsplit("/", 1)[-1]
             for error in errors[:SKIPPED_SAMPLE_MAX]
         ] if skipped else []
-        # Card 51: a run that held pruning says so on the job. The flag is
-        # recomputed per run, so a normal run (or a failed one) clears it.
-        held = bool(result.get("ok") and result.get("pruning_held") is True
-                    and _count(result.get("baseline_files")) > 0)
-        job["last_pruning_held"] = held
-        job["last_baseline_files"] = _count(result.get("baseline_files")) if held else 0
-        job["last_files"] = _count(result.get("files")) if result.get("ok") else 0
+        # Card 51: a run that kept its baseline aside says so on the job. Only a
+        # successful run recomputes the three fields: a failed run (often the
+        # very low-space failure a hold can lead to) says nothing about the
+        # source's file count, so it must not hide that older backups are
+        # still being kept aside.
+        if result.get("ok"):
+            held = bool(result.get("pruning_held") is True
+                        and _count(result.get("baseline_files")) > 0)
+            job["last_pruning_held"] = held
+            job["last_baseline_files"] = _count(result.get("baseline_files")) if held else 0
+            job["last_files"] = _count(result.get("files"))
         _save_job(job)
     return job

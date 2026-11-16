@@ -21,10 +21,10 @@ from utils.copying import (BackupAborted, SourceUnavailable, TargetWriteFailed,
 from utils.jobs_store import job_verify_mode
 from utils.preflight import _preflight_and_sweep, target_volume
 from utils.verify import _quick_verify
-from utils.versions import (MANIFEST_VERSION, VERSION_FORMAT, _discard, is_verified,
-                            job_root, latest_version, manifest_path, prune_versions,
-                            pruning_held_sentence, restore_candidates,
-                            sanity_drop_baseline, version_path,
+from utils.versions import (MANIFEST_VERSION, VERSION_FORMAT, _discard, is_sanity_drop,
+                            is_verified, job_root, latest_version, manifest_path,
+                            prune_versions, pruning_held_sentence, restore_candidates,
+                            sanity_baseline, version_path,
                             version_when)
 
 
@@ -105,8 +105,8 @@ def run_job(job: Dict,
        "off"), fsync, rename the manifest into place, and only then rename
        `.partial` to `<stamp>` -- so a version folder never exists without
        its finished manifest. An "off" version is promoted like any other.
-    4. Prune, which never removes the newest verified version -- unless the
-       source sanity guard holds it (see below).
+    4. Prune, which never removes the newest verified version, nor the
+       baseline the source sanity guard protects (see below).
 
     Source files that could not be read are reported in `errors` and left
     out of the manifest; the run is still ok (`not_copied` counts the files
@@ -132,11 +132,13 @@ def run_job(job: Dict,
     already copied.
 
     **Source sanity guard.** If this run copied more than
-    `SANITY_DROP_FRACTION` fewer files than the largest retained verified
-    version holds, the run still succeeds and keeps its version, but pruning
-    is skipped: `pruning_held` is True, `baseline_files` is that largest
-    count, `pruned` is empty and the message says so. No baseline (a first
-    run) never holds. See `versions.sanity_drop_baseline`.
+    `SANITY_DROP_FRACTION` fewer files than the largest retained version
+    with a complete manifest (verified or not) holds, the run still succeeds
+    and keeps its version, and that largest version is protected from
+    pruning while the others prune by retention as usual (it does not count
+    toward retention): `pruning_held` is True, `baseline_files` is its count
+    and the message says so. No baseline (a first run) never holds. See
+    `versions.sanity_baseline` and `prune_versions(protect=...)`.
 
     `on_phase` is called with "copying" and then, unless the mode is "off",
     "verifying"; `on_progress` restarts from 0 for the verify pass (over the
@@ -389,12 +391,16 @@ def _backup(job: Dict,
         return {"ok": False, "message": f"Could not finalise the backup: {exc}"}
 
     # Source sanity guard (card 51): a run that lost far more files than the
-    # best retained version had still succeeds and its version is kept, but
-    # pruning is held so a mostly-emptied source cannot roll every complete
-    # copy out of retention. The new version is excluded from the baseline.
-    baseline = sanity_drop_baseline(job, files, exclude=stamp)
-    held = baseline > 0
-    pruned = [] if held else prune_versions(job)
+    # best retained version had still succeeds and its version is kept, and
+    # that best version (the baseline) is protected from pruning while the
+    # rest prune as usual -- so a mostly-emptied source cannot roll every
+    # complete copy out of retention, and a source that stays low cannot grow
+    # the target without bound. The new version is excluded from the baseline.
+    baseline, baseline_stamp = sanity_baseline(job, exclude=stamp)
+    held = is_sanity_drop(baseline, files)
+    if not held:
+        baseline = 0
+    pruned = prune_versions(job, protect={baseline_stamp} if held else ())
     if mode == "quick":
         message = (f"Backed up {files} file(s) to {final} and quick-checked "
                    f"{sampled} of {files} file(s) (sizes of all, hashes of a sample)")
@@ -412,7 +418,8 @@ def _backup(job: Dict,
     if held:
         message += ". " + pruning_held_sentence(files, baseline)
     if pruned:
-        message += f". Removed {len(pruned)} old version(s)"
+        # A held run prunes too now, after a sentence that ends in its own ".".
+        message += ("" if message.endswith(".") else ".") + f" Removed {len(pruned)} old version(s)"
     return {"ok": True, "message": message, "version": stamp, "files": files,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
             "not_copied": not_copied,

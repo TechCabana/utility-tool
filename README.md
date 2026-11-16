@@ -254,11 +254,12 @@ flowchart LR
    its files cannot be read, nothing is promoted or pruned and earlier versions are left as
    they were. Files that are merely locked by another program are skipped and counted in the
    result, and the job then reads "OK, N skipped" rather than plain OK. A run that copied more
-   than 30% fewer files than the largest verified version still kept succeeds but prunes
-   nothing ("pruning held"), so an emptied source cannot roll the complete copies out of
-   retention; it stays held on later runs until the count recovers or the larger versions
-   are deleted by hand, and a job with verification off has no verified version to compare
-   with, so it is not covered. Every run appends one line to `logs/<job id>.jsonl` in the
+   than 30% fewer files than the largest version still kept (verified or not) succeeds and
+   keeps that larger version aside ("pruning held") while the others are pruned as usual, so
+   an emptied source cannot roll the last complete copy out of retention and a source that
+   stays smaller costs one extra version, not unbounded growth. The hold ends when the count
+   recovers; a failed run does not clear it, and a low-space failure says it is in force.
+   Every run appends one line to `logs/<job id>.jsonl` in the
    app-data folder (the newest 200 are kept). Only one run of a job happens at a time (a lock file in the app-data folder); a
    second one, such as the scheduled task firing during a manual run, is refused and the
    headless path exits 4. Abandoned leftovers of failed runs older than 7 days are removed at
@@ -315,7 +316,7 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `verify` | string | `full` (default: re-read every copied file), `quick` (all sizes, a sample of hashes) or `off`; a missing or unknown value runs as `full` |
 | `last_result` | string | `ok`, or `failed: <message>` |
 | `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
-| `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last run held pruning, the file count it was compared with, and how many files it copied |
+| `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed run leaves all three unchanged |
 
 The file is replaced atomically on every save, and the previous good copy is kept as
 `backup_jobs.json.bak`. A damaged file is reported as damaged, never read as "no jobs"; the

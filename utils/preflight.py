@@ -11,6 +11,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 from utils.copying import tree_totals
 from utils.fs_utils import human_size
+from utils.jobs_store import job_pruning_held
 from utils.versions import sweep_stale
 
 
@@ -104,6 +105,13 @@ def target_volume(target: str) -> str:
 # from every other refusal (which it cannot).
 LOW_SPACE_PREFIX = "Not enough free space on the target drive"
 
+# Appended to the low-space refusal when the job's last successful run kept
+# an older, larger backup aside (the source sanity guard, card 51).
+HELD_LOW_SPACE_SENTENCE = (
+    "Older backups are being kept aside because your source folder shrank. "
+    "Free some space on the backup drive, or delete the oldest backup folders "
+    "you no longer need.")
+
 
 def _free_bytes(path: str) -> int:
     """Free bytes on the volume holding existing `path`. Raises OSError."""
@@ -168,8 +176,13 @@ def preflight(job: Dict,
     except OSError as exc:
         return f"Could not read the free space on the target drive: {exc}"
     if free < need:
-        return (f"{LOW_SPACE_PREFIX}: the backup needs "
-                f"about {human_size(need)} but only {human_size(free)} is free.")
+        message = (f"{LOW_SPACE_PREFIX}: the backup needs "
+                   f"about {human_size(need)} but only {human_size(free)} is free.")
+        if job_pruning_held(job):
+            # Card 51: the guard's kept-aside baseline can be what fills the
+            # drive, and the user cannot see that from "Failed" alone.
+            message += " " + HELD_LOW_SPACE_SENTENCE
+        return message
     return None
 
 
