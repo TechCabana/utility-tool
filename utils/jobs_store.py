@@ -294,6 +294,85 @@ def restore_jobs_from_backup() -> int:
     return len(jobs)
 
 
+class QuarantineRefused(Exception):
+    """`quarantine_jobs_file` declined because doing it could destroy good data
+    (the jobs file or its `.bak` is usable after all) or there is nothing to
+    move. Nothing was changed."""
+
+
+def _rename_aside(path: str, stamp: str) -> str:
+    """Rename `path` to ``<path>.corrupt-<stamp>`` (``-2``, ``-3``... if that
+    name is taken) and return the new name. Never overwrites and never copies.
+
+    os.rename refuses an existing destination on Windows; the exists() check
+    covers POSIX, where it would silently replace it. ponytail: the
+    check-then-rename gap on POSIX is closed in practice by the jobs-file lock
+    (the only writer of these names); use os.link + os.unlink if that changes.
+    """
+    base = f"{path}.corrupt-{stamp}"
+    for number in range(1, 1000):
+        kept = base if number == 1 else f"{base}-{number}"
+        if os.path.lexists(kept):
+            continue
+        try:
+            os.rename(path, kept)
+        except FileExistsError:
+            continue
+        return kept
+    raise OSError(f"Could not find a free name to keep '{path}' under.")
+
+
+def quarantine_jobs_file() -> str:
+    """Move a damaged jobs file aside so the user can start with an empty list.
+
+    For the one state with no other way out: the file is damaged and there is
+    no usable `.bak`. Renames (never copies, never deletes) the file to
+    ``backup_jobs.json.corrupt-<YYYYMMDD-HHMMSS>`` and returns that path; a
+    stale, unusable `.bak` goes aside the same way. Afterwards `load_jobs()`
+    returns `[]` and `save_job` works again.
+
+    Everything is decided under the jobs-file lock from a fresh read, because
+    the screen's idea of the state may be stale: raises `QuarantineRefused`,
+    having changed nothing, if the jobs file is now valid or missing or a
+    usable `.bak` exists -- moving either would hide good data. OSError (the
+    jobs file is left where it was) if a rename fails.
+    """
+    with _jobs_file_lock():
+        try:
+            _read_valid(JOBS_FILE)
+        except FileNotFoundError:
+            raise QuarantineRefused(
+                f"There is no jobs file ('{JOBS_FILE}') to set aside.") from None
+        except ValueError:
+            pass  # damaged: the case this exists for
+        else:
+            raise QuarantineRefused(
+                "The jobs file can be read again, so it was left alone.")
+        if _has_usable_backup():
+            raise QuarantineRefused(
+                f"A usable backup copy ('{_backup_path()}') exists; restore it "
+                "instead of starting with an empty list.")
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        moved_bak = None
+        if os.path.lexists(_backup_path()):
+            # Unusable (checked above). Moved first: if it fails nothing has
+            # changed, and if the jobs file then fails this is put back.
+            try:
+                moved_bak = _rename_aside(_backup_path(), stamp)
+            except OSError as exc:
+                raise OSError(f"Could not set aside '{_backup_path()}': {exc}") from exc
+        try:
+            return _rename_aside(JOBS_FILE, stamp)
+        except OSError as exc:
+            if moved_bak:
+                try:
+                    os.rename(moved_bak, _backup_path())
+                except OSError:
+                    pass  # it was unusable anyway; it stays under its new name
+            raise OSError(f"Could not set aside '{JOBS_FILE}': {exc}") from exc
+
+
 def get_job(job_id: str) -> Optional[Dict]:
     """The stored job with this id, or None. Raises JobsFileCorrupt."""
     for job in load_jobs():

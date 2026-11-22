@@ -943,10 +943,23 @@ class BackupTab(QtWidgets.QWidget):
             hint="Your jobs could not be read, so nothing has been changed or "
                  "run. Restoring brings back the last good copy, which may "
                  "not include your most recent edit; the damaged file is "
-                 "kept beside it, not deleted.",
+                 "kept beside it, not deleted. With no backup copy, start "
+                 "with an empty list instead: the damaged file is kept aside "
+                 "under a new name.",
             cta_text="Restore from backup copy",
         )
         self.jobs_damaged.cta.clicked.connect(self.restore_jobs_file)
+        # The way out when there is no usable backup copy (card OsE7AgPP):
+        # offered only then, and behind a confirmation.
+        self.start_empty_btn = QtWidgets.QPushButton("Start with an empty list")
+        self.start_empty_btn.setObjectName("Secondary")
+        self.start_empty_btn.setVisible(False)
+        self.start_empty_btn.clicked.connect(self.start_with_empty_list)
+        empty_row = QtWidgets.QHBoxLayout()
+        empty_row.addStretch(1)
+        empty_row.addWidget(self.start_empty_btn)
+        empty_row.addStretch(1)
+        self.jobs_damaged.layout().addLayout(empty_row)
         self.jobs_damaged.setVisible(False)
         jv.addWidget(self.jobs_damaged)
 
@@ -960,6 +973,17 @@ class BackupTab(QtWidgets.QWidget):
         self.backup_status.setWordWrap(True)
         self.backup_status.setVisible(False)
         jv.addWidget(self.backup_status)
+
+        # Shown by start_with_empty_list() beside its notice, which names the
+        # folder the damaged file was kept in.
+        self.open_kept_btn = QtWidgets.QPushButton("Open folder")
+        self.open_kept_btn.setObjectName("Secondary")
+        self.open_kept_btn.setVisible(False)
+        self.open_kept_btn.clicked.connect(self._open_kept_folder)
+        kept_row = QtWidgets.QHBoxLayout()
+        kept_row.addWidget(self.open_kept_btn)
+        kept_row.addStretch(1)
+        jv.addLayout(kept_row)
 
         # --- restore ------------------------------------------------------
         # Same surface, second section. `rv` stays a separate name so the two
@@ -1062,6 +1086,7 @@ class BackupTab(QtWidgets.QWidget):
             return
         self._jobs_damaged = False
         self.jobs_damaged.setVisible(False)
+        self.start_empty_btn.setVisible(False)
         self._clear_layout(self.jobs_layout)
         self._clear_layout(self.restore_layout)
 
@@ -1102,6 +1127,7 @@ class BackupTab(QtWidgets.QWidget):
                        self.restore_empty, self.restore_header):
             widget.setVisible(False)
         self.jobs_damaged.setVisible(True)
+        self.start_empty_btn.setVisible(not exc.has_backup)
         self._set_backup_controls(enabled=self.backup_thread is None)
         self._say(str(exc), ok=False)
 
@@ -1124,6 +1150,67 @@ class BackupTab(QtWidgets.QWidget):
             self._backup_notice = ""
             self._say(message)
 
+    # How a folder is opened; tests replace it so no file manager starts.
+    open_url = staticmethod(QtGui.QDesktopServices.openUrl)
+
+    def _left_behind_text(self) -> str:
+        """The OS scheduler entries this app owns, in words (read-only).
+
+        With the jobs file unreadable the lost job ids are unknown, so this
+        lists every entry by the app's naming prefix. A failure to ask the
+        scheduler says so rather than claiming there are none.
+        """
+        names, error = backup_utils.list_scheduled_tasks()
+        where = backup_utils.scheduler_name()
+        if error:
+            return f"{error} Check {where} yourself for tasks left behind."
+        if not names:
+            return f"{where} holds no Safekeep tasks."
+        return (f"Scheduled tasks currently in {where} (they are not removed, "
+                "and no longer find their job, so they back nothing up): "
+                + ", ".join(names) + ".")
+
+    def start_with_empty_list(self):
+        """Confirm, then set the damaged jobs file aside and start empty.
+
+        Only for a damaged file with no usable backup copy. The file is
+        renamed to a `.corrupt-` name, never deleted; scheduled tasks are only
+        listed, never touched.
+        """
+        if self.backup_thread is not None or not self._jobs_damaged or self._can_restore_jobs:
+            return
+        left = self._left_behind_text()
+        choice = ConfirmDialog.choose(
+            self,
+            "Start with an empty job list?",
+            f"Your jobs could not be read and there is no backup copy. The "
+            f"damaged file is not deleted: it is renamed to "
+            f"{backup_utils.JOBS_FILENAME}.corrupt-<date and time> in the "
+            "same folder, so it can still be recovered by hand. Then you can "
+            "add jobs again. Backups already written to your target folders "
+            f"are not touched.\n\n{left}",
+            confirm_text="Start with an empty list",
+        )
+        if choice != "confirm":
+            return
+        try:
+            kept = backup_utils.quarantine_jobs_file()
+        except (backup_utils.QuarantineRefused, OSError) as exc:
+            self.refresh_backup()
+            self._say(f"{exc} Nothing was changed.", ok=False)
+            return
+        self._kept_folder = os.path.dirname(kept)
+        self.refresh_backup()   # no jobs file now: the normal empty state
+        self._say(f"Started with an empty job list. The damaged file was kept "
+                  f"as '{os.path.basename(kept)}' in {self._kept_folder}. {left}")
+        self.open_kept_btn.setVisible(True)
+
+    def _open_kept_folder(self):
+        """Open the folder holding the kept-aside damaged jobs file."""
+        folder = getattr(self, "_kept_folder", "")
+        if folder:
+            self.open_url(QtCore.QUrl.fromLocalFile(folder))
+
     def _clear_layout(self, layout: QtWidgets.QLayout):
         while layout.count():
             item = layout.takeAt(0)
@@ -1144,6 +1231,7 @@ class BackupTab(QtWidgets.QWidget):
         self.job_add_btn.setEnabled(enabled and not self._jobs_damaged)
         self.restore_refresh_btn.setEnabled(enabled)
         self.jobs_damaged.cta.setEnabled(enabled and self._can_restore_jobs)
+        self.start_empty_btn.setEnabled(enabled)
         if enabled:
             return
         for host in (self.jobs_host, self.restore_host):
@@ -1151,6 +1239,7 @@ class BackupTab(QtWidgets.QWidget):
                 button.setEnabled(False)
 
     def _say(self, message: str, ok: bool = True, warn: bool = False):
+        self.open_kept_btn.setVisible(False)   # belongs to its own notice only
         self.backup_status.setObjectName(
             "StatusError" if not ok else "StatusWarn" if warn else "Hint")
         # An objectName change after the sheet was applied needs the style
