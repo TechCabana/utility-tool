@@ -333,3 +333,55 @@ def test_a_skipped_deep_file_is_reported_by_its_plain_path(tmp_path, monkeypatch
     assert result["errors"][0].startswith("locked.txt: ")
     assert "?" not in result["errors"][0], result["errors"][0]
     assert str(source) in result["errors"][0].replace("\\\\", "\\")
+
+
+def _raw_x(path) -> str:
+    """Extended-length form WITHOUT normalisation, so a trailing dot or space survives."""
+    return "\\\\?\\" + str(path)
+
+
+@windows_only
+@pytest.mark.parametrize("given, expected", [
+    ("C:\\Data\\notes.", "\\\\?\\C:\\Data\\notes."),
+    ("C:\\Data\\notes ", "\\\\?\\C:\\Data\\notes "),
+    ("C:\\Data\\dir.\\f.txt", "\\\\?\\C:\\Data\\dir.\\f.txt"),
+    ("C:\\Data\\sub\\..\\notes.", "\\\\?\\C:\\Data\\notes."),
+])
+def test_long_path_keeps_a_trailing_dot_or_space(given, expected):
+    from utils.fs_utils import long_path
+    assert long_path(given) == expected
+
+
+@windows_only
+def test_a_file_named_with_a_trailing_dot_or_space_backs_up_and_restores(tmp_path):
+    """abspath strips trailing dots/spaces, so these names used to be opened as other names."""
+    source, target, restore_to = tmp_path / "s", tmp_path / "t", tmp_path / "r"
+    target.mkdir()
+    restore_to.mkdir()
+    names = ["notes.", "memo ", "dir.\\inside.txt", "plain.txt"]
+    payload = {name: os.urandom(2000) for name in names}
+    for name, data in payload.items():
+        full = _raw_x(source) + "\\" + name
+        os.makedirs(full.rsplit("\\", 1)[0], exist_ok=True)
+        with open(full, "wb") as handle:
+            handle.write(data)
+
+    job = backup_utils.new_job("Dots", str(source), str(target), schedule="manual", retention=3)
+    backup_utils.save_job(job)
+    result = backup_utils.run_job(job)
+    restored = backup_utils.restore_version(job, None, str(restore_to))
+
+    assert result["ok"], result["message"]
+    assert result["files"] == len(names) and result["errors"] == [] and result["not_copied"] == 0
+    assert restored["ok"] and restored["files"] == len(names) and restored["errors"] == []
+    for name, data in payload.items():
+        with open(_raw_x(restored["path"]) + "\\" + name, "rb") as handle:
+            assert handle.read() == data, name
+
+
+@windows_only
+def test_relative_to_keeps_trailing_dots_and_ignores_case():
+    from utils.fs_utils import relative_to
+    assert relative_to("C:\\Src\\dir.\\f.txt", "C:\\Src") == "dir.\\f.txt"
+    assert relative_to("c:\\src\\a\\notes.", "C:\\SRC\\") == "a\\notes."
+    assert relative_to("C:\\other\\f", "C:\\Src") == "..\\other\\f"   # not under root: relpath

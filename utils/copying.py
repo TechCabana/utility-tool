@@ -14,7 +14,7 @@ import shutil
 import stat
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from utils.fs_utils import _is_link_like, long_path, plain_error
+from utils.fs_utils import _is_link_like, long_path, plain_error, relative_to
 
 
 class BackupAborted(Exception):
@@ -175,7 +175,7 @@ def _iter_tree(root: str) -> Iterator[Optional[Tuple[str, int, float]]]:
                             stack.append(path)
                             continue
                         stat = entry.stat(follow_symlinks=False)
-                        rel = os.path.relpath(path, root).replace("\\", "/")
+                        rel = relative_to(path, root).replace("\\", "/")
                         yield rel, stat.st_size, stat.st_mtime
                     except OSError:
                         yield None
@@ -378,7 +378,7 @@ def copy_tree(source: str, destination: str,
         size, mtime, sha = _hash_copy(src, dst)
         if on_copied is not None:
             try:
-                on_copied(os.path.relpath(src, source).replace("\\", "/"),
+                on_copied(relative_to(src, source).replace("\\", "/"),
                           size, mtime, sha)
             except BaseException:
                 try:
@@ -420,7 +420,7 @@ def copy_tree(source: str, destination: str,
                 # Path from the source root (forward slashes, as in the
                 # manifest) so the run log says WHICH file; the "<path>: <error>"
                 # shape is relied on by record_run and runlog.
-                rel = os.path.relpath(src, source).replace("\\", "/")
+                rel = relative_to(src, source).replace("\\", "/")
                 errors.append(f"{rel}: {plain_error(exc)}")
         try:
             shutil.copystat(long_path(src_dir), long_path(dst_dir))

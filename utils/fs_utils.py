@@ -88,7 +88,10 @@ def long_path(path: str) -> str:
         # which this form would read as part of a name.
         extended = slashed
     else:
-        full = os.path.abspath(path)
+        # normpath(join(cwd, path)), not abspath: on Windows abspath calls
+        # GetFullPathName, which silently strips trailing dots and spaces, so
+        # a file named "notes." would be opened as "notes" and never found.
+        full = os.path.normpath(os.path.join(os.getcwd(), path))
         extended = (_EXTENDED_UNC + full[2:] if full.startswith("\\\\")
                     else _EXTENDED + full)
     if len(extended) > _MAX_EXTENDED:
@@ -96,6 +99,21 @@ def long_path(path: str) -> str:
                       f"Path is longer than Windows' limit of {_MAX_EXTENDED} characters",
                       path)
     return extended
+
+
+def relative_to(path: str, root: str) -> str:
+    """`path` relative to `root`, by string prefix, never touching the filesystem.
+
+    `os.path.relpath` calls abspath, which on Windows strips trailing dots and
+    spaces from every component, so a file named "notes." came out as "notes"
+    in the manifest and the run log. The engine builds every path it measures
+    as `os.path.join(root, ...)`, so a prefix cut is exact; a path that is not
+    under `root` falls back to `relpath`.
+    """
+    norm_path, norm_root = os.path.normpath(path), os.path.normpath(root)
+    if os.path.normcase(norm_path).startswith(os.path.normcase(norm_root) + os.sep):
+        return norm_path[len(norm_root) + 1:]
+    return os.path.relpath(path, root)
 
 
 def plain_path(path):
