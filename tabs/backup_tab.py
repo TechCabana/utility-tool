@@ -15,7 +15,7 @@ from typing import List, Optional
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
 
-from utils import backup_utils
+from utils import backup_utils, precheck
 from utils.fs_utils import human_size
 from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
                             add_field, divider, icon_button, section,
@@ -282,6 +282,160 @@ class BackupJobDialog(QtWidgets.QDialog):
                              "retention": self.retention.value(),
                              "target_volume": volume, "verify": verify})
         self.accept()
+
+
+class PrecheckDialog(QtWidgets.QDialog):
+    """The pre-check's report (card 104): one row per problem, each with what
+    is wrong, the fix, and an "Open folder" button for the folder holding it.
+
+    Two shapes. After a job is added or edited it only informs (`run_text`
+    empty: one Close button). Before Back up now it asks: "Back up anyway" and
+    Cancel, and `exec()` is Accepted only for "Back up anyway" -- a pre-check
+    never blocks a backup by itself, the run's own failure handling stays
+    authoritative. Colours come from the sheet through existing objectNames
+    only (StatusError for what would fail the run, StatusWarn for what would
+    be skipped); every control is a focusable QPushButton.
+    """
+
+    # Rows built in full; the rest are counted. Widgets per row are cheap, but
+    # a report of thousands would make the dialog slow to open.
+    ROWS_MAX = 50
+
+    # How a folder is opened; tests replace it so no file manager starts.
+    open_url = staticmethod(QtGui.QDesktopServices.openUrl)
+
+    def __init__(self, parent, job: dict, report: dict, run_text: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Pre-check")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.folder_buttons: List[QtWidgets.QPushButton] = []
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("Card")
+        outer.addWidget(panel)
+        body = QtWidgets.QVBoxLayout(panel)
+        body.setSpacing(10)
+
+        total = sum(report.get("counts", {}).values())
+        blocking = report.get("blocking", 0)
+        heading = QtWidgets.QLabel(
+            f"\"{job.get('name')}\": {total} file(s) need attention")
+        heading.setObjectName("H2")
+        heading.setWordWrap(True)
+        body.addWidget(heading)
+
+        if blocking:
+            lede = (f"{blocking} of them would make the backup fail. Fix them, "
+                    "then back up.")
+        else:
+            lede = ("None of them would make the backup fail, but they would "
+                    "not be in it.")
+        lede += (f" Checked {report.get('scanned', 0)} file(s) against the backup "
+                 f"drive ({report.get('fs', 'unknown')}); nothing was written.")
+        summary = QtWidgets.QLabel(lede)
+        summary.setObjectName("Hint")
+        summary.setWordWrap(True)
+        body.addWidget(summary)
+
+        rows = QtWidgets.QWidget()
+        rows.setObjectName("CardBody")
+        rows_layout = QtWidgets.QVBoxLayout(rows)
+        rows_layout.setContentsMargins(0, 0, 0, 0)
+        rows_layout.setSpacing(8)
+        problems = report.get("problems", [])
+        for index, problem in enumerate(problems[:self.ROWS_MAX]):
+            if index:
+                rows_layout.addWidget(divider())
+            rows_layout.addWidget(self._row(problem))
+        hidden = len(problems[self.ROWS_MAX:]) + report.get("problems_more", 0)
+        if hidden:
+            more = QtWidgets.QLabel(f"... and {hidden} more.")
+            more.setObjectName("Hint")
+            rows_layout.addWidget(more)
+        rows_layout.addStretch(1)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setAccessibleName("Pre-check problems")
+        scroll.setMinimumHeight(160)
+        scroll.setMaximumHeight(380)
+        scroll.setWidget(rows)
+        body.addWidget(scroll, 1)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch(1)
+        if run_text:
+            cancel = QtWidgets.QPushButton("Cancel")
+            cancel.setObjectName("Secondary")
+            cancel.clicked.connect(self.reject)
+            buttons.addWidget(cancel)
+            confirm = QtWidgets.QPushButton(run_text)
+            confirm.setObjectName("Primary")
+            confirm.clicked.connect(self.accept)
+            buttons.addWidget(confirm)
+            # Enter must not start a backup the user has not read about: the
+            # safe choice holds the focus, as in ConfirmDialog.
+            self.confirm_button, self.close_button = confirm, cancel
+        else:
+            close = QtWidgets.QPushButton("Close")
+            close.setObjectName("Primary")
+            close.clicked.connect(self.accept)
+            buttons.addWidget(close)
+            self.confirm_button, self.close_button = None, close
+        self.close_button.setDefault(True)
+        body.addLayout(buttons)
+        self.close_button.setFocus()
+
+    def _row(self, problem: dict) -> QtWidgets.QWidget:
+        """One problem: kind and path, what is wrong and the fix, Open folder."""
+        row = QtWidgets.QWidget()
+        row.setObjectName("CardBody")
+        grid = QtWidgets.QGridLayout(row)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+
+        label = precheck.KIND_LABELS.get(problem["kind"], problem["kind"])
+        kind = QtWidgets.QLabel(label if problem.get("blocking")
+                                else f"{label} - will be skipped")
+        kind.setObjectName("StatusError" if problem.get("blocking") else "StatusWarn")
+        grid.addWidget(kind, 0, 0)
+
+        path = ElidedLabel(problem["path"])
+        path.setObjectName("Data")
+        grid.addWidget(path, 1, 0)
+
+        text = QtWidgets.QLabel(f"{problem['detail']} {problem['suggestion']}")
+        text.setObjectName("Hint")
+        text.setWordWrap(True)
+        grid.addWidget(text, 2, 0)
+
+        folder = self._folder_of(problem)
+        button = QtWidgets.QPushButton("Open folder")
+        button.setObjectName("Secondary")
+        button.setAccessibleName(f"Open the folder holding {os.path.basename(problem['path'])}")
+        button.setToolTip(folder or "The folder is not available")
+        button.setEnabled(bool(folder))
+        button.clicked.connect(lambda _checked=False, f=folder: self.open_url(
+            QtCore.QUrl.fromLocalFile(f)))
+        grid.addWidget(button, 0, 1, 3, 1, Qt.AlignTop)
+        grid.setColumnStretch(0, 1)
+        self.folder_buttons.append(button)
+        return row
+
+    @staticmethod
+    def _folder_of(problem: dict) -> str:
+        """The folder to open for a problem: the one holding the offender (the
+        source folder itself for a missing source or target); "" if gone."""
+        path = problem["path"]
+        folder = path if problem["kind"] in ("source_unavailable",
+                                             "target_unavailable") else os.path.dirname(path)
+        return folder if folder and os.path.isdir(folder) else ""
 
 
 # The Backup tables' columns, defined once as (label, stretch, minimum width)
@@ -1045,7 +1199,12 @@ class BackupTab(QtWidgets.QWidget):
             message += f" It could not be scheduled: {detail}"
         self._say(message, ok=ok or job.get("schedule") == "manual")
         self.refresh_backup()
-        self.refresh_changes()
+        # Card 104: check the job against its drive before its first night.
+        # The save line rides across the check and the remeasure after it
+        # (`_backup_notice`); a clean tree adds no dialog.
+        self._backup_notice = message
+        self._backup_notice_warn = not (ok or job.get("schedule") == "manual")
+        self._precheck(job, lambda _report: self.refresh_changes())
 
     def remove_backup_job(self, job: dict):
         """Confirm, then drop the job and its scheduled task together.
@@ -1096,7 +1255,51 @@ class BackupTab(QtWidgets.QWidget):
             )
         self.refresh_backup()
 
+    def _precheck(self, job: dict, then, run_text: str = ""):
+        """Pre-check `job` off the UI thread, record it, then call `then(report)`.
+
+        Clean: `then` runs at once, with no dialog. Problems: the report dialog
+        opens first; with `run_text` it asks (Cancel or `run_text`) and `then`
+        runs only if the user goes ahead, without it it only informs. A check
+        that could not run at all says so and carries on: it never stands
+        between the user and a backup.
+        """
+        if self.backup_thread is not None:
+            return
+        self._start_backup(
+            f"Checking \"{job.get('name')}\" against its backup drive...",
+            # No file total exists before the walk, so the bar stays
+            # indeterminate and no per-file progress signal is sent.
+            lambda _progress, abort, _phase: precheck.precheck(job, None, abort),
+            lambda report: self._finish_precheck(job, report, then, run_text))
+
+    def _finish_precheck(self, job: dict, report: dict, then, run_text: str):
+        """Record the pre-check, show its report if it found anything, go on."""
+        if "scanned" not in report:   # the worker caught an unexpected error
+            self._say(f"The pre-check could not run: {report.get('message', '')}",
+                      warn=True)
+            then(report)
+            return
+        if report.get("aborted"):
+            return   # the app is closing
+        try:
+            backup_utils.record_precheck(job["id"], precheck.summary(report))
+        except (backup_utils.JobsFileCorrupt, OSError):
+            pass   # the report is still shown; only the stored copy is stale
+        if report["problems"]:
+            dialog = PrecheckDialog(self, job, report, run_text)
+            if dialog.exec() != QtWidgets.QDialog.Accepted and run_text:
+                self._say(f"Backup of \"{job.get('name')}\" not started.")
+                return
+        then(report)
+
     def run_backup_job(self, job: dict):
+        """Back up now: pre-check first, then the run (card 104)."""
+        self._precheck(job, lambda _report: self._start_run(job),
+                       run_text="Back up anyway")
+
+    def _start_run(self, job: dict):
+        """Take the backup itself on the worker thread."""
         if self.backup_thread is not None:
             return
         self._start_backup(

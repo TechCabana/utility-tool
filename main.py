@@ -312,7 +312,8 @@ def run_backup_job_cli(job_id):
     Exit codes: 0 backed up, 1 the backup failed, 2 no such job, 3 the jobs
     file is damaged (nothing was run or written), 4 skipped because another
     run of the same job is already in progress (nothing was run or written,
-    and the job's last result is left as it was). If the run finished but its
+    and the job's last result is left as it was); 5 is `--precheck-job`'s
+    "problems found" (see `precheck_job_cli`). If the run finished but its
     result could not be written back (the jobs-file lock timed out), the exit
     code is still the run's own, 0 or 1, and the message says so.
     """
@@ -342,12 +343,20 @@ def run_backup_job_cli(job_id):
         print(f"[ERROR] No backup job with id '{job_id}'")
         log_failure("unknown_job", f"No backup job with id '{job_id}'")
         return 2
+    # Card 104: a job that was never pre-checked (made by an older version,
+    # or scheduled before the check existed) gets one before its first
+    # unattended run. It never blocks the run -- the backup's own failure
+    # handling stays authoritative -- and it is recorded only once the run
+    # was not refused as busy, which must leave the jobs file untouched.
+    first_check = _first_run_precheck(job) if "last_precheck" not in job else None
     result = backup_utils.run_job(job, trigger="scheduled")
     if result.get("busy"):
         # Not a result of this job: recording it would overwrite the real last
         # run's outcome with "failed: already running".
         print(f"[SKIPPED] {result.get('message', '')}", file=sys.stderr)
         return 4
+    if first_check is not None:
+        _record_precheck(job_id, first_check)
     try:
         backup_utils.record_run(job_id, result)
     except backup_utils.JobsFileCorrupt as exc:
@@ -373,6 +382,111 @@ def run_backup_job_cli(job_id):
         print("[WARN] " + backup_utils.pruning_held_sentence(
             result["files"], result["baseline_files"]), file=sys.stderr)
     return 0 if result.get("ok") else 1
+
+
+def _safe_console():
+    """Let a path the console code page cannot show print as an escape
+    instead of crashing the headless run with UnicodeEncodeError."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass  # not a real text stream (a test capture): nothing to fix
+
+
+def _record_precheck(job_id, report):
+    """Store `report`'s summary as the job's `last_precheck`; a failure to
+    store it is printed and never changes an exit code. Returns True if stored."""
+    from utils import backup_utils, precheck
+    try:
+        backup_utils.record_precheck(job_id, precheck.summary(report))
+        return True
+    except (backup_utils.JobsFileCorrupt, OSError) as exc:
+        print(f"[WARN] The pre-check result could not be recorded: {exc}", file=sys.stderr)
+        return False
+
+
+def _print_precheck(report, stream):
+    """One line per problem: kind, path, what is wrong and the fix."""
+    from utils import precheck
+    for problem in report["problems"]:
+        when = "" if problem["blocking"] else " (will be skipped, not a failure)"
+        print(f"  {precheck.KIND_LABELS.get(problem['kind'], problem['kind'])}"
+              f"{when}: {problem['path']}\n    {problem['detail']} "
+              f"Fix: {problem['suggestion']}", file=stream)
+    if report["problems_more"]:
+        print(f"  ... and {report['problems_more']} more", file=stream)
+
+
+def _first_run_precheck(job):
+    """Pre-check a job before its first unattended run (card 104); return the
+    report for the caller to record, or None if the check could not run.
+
+    Prints any problems as warnings on stderr. Never raises and never stops
+    the run that follows.
+    """
+    from utils import precheck
+    _safe_console()
+    try:
+        report = precheck.precheck(job)
+    except Exception as exc:  # the backup's own handling stays authoritative
+        print(f"[WARN] The pre-check could not run: {exc}", file=sys.stderr)
+        return None
+    if report["problems"]:
+        print(f"[WARN] The pre-check found {sum(report['counts'].values())} "
+              "problem(s) this backup may run into:", file=sys.stderr)
+        _print_precheck(report, sys.stderr)
+    return report
+
+
+def precheck_job_cli(job_id):
+    """Pre-check one job with no GUI (`main.py --precheck-job <id>`), print
+    the report and return a process exit code.
+
+    Lists every file the job's target cannot hold (path too long, too large
+    for the drive's filesystem, a name it cannot store, names differing only
+    by case) and every file that will be skipped (locked or unreadable), with
+    a fix for each. Read-only: nothing is written to the source or the target;
+    the result is stored on the job as `last_precheck`.
+
+    Exit codes, shared with `--run-backup-job` (1 and 4 are run-only):
+    0 nothing to fix, 5 problems found (ANY problem, including files that
+    would only be skipped -- the report's `ok` field is the narrower "nothing
+    would fail the run"), 2 no such job, 3 the jobs file is damaged (nothing
+    was checked or written). A result that could not be recorded keeps its
+    0/5 and prints a warning.
+    """
+    from utils import backup_utils, precheck
+    _safe_console()
+    migrate.migrate_data()  # as --run-backup-job: the jobs file may be pre-rename
+    try:
+        job = backup_utils.get_job(job_id)
+    except backup_utils.JobsFileCorrupt as exc:
+        hint = f" Open {APP_NAME} to restore it." if exc.has_backup else ""
+        print(f"[ERROR] {exc}{hint}", file=sys.stderr)
+        return 3
+    if job is None:
+        print(f"[ERROR] No backup job with id '{job_id}'")
+        return 2
+    report = precheck.precheck(job)
+    _record_precheck(job_id, report)
+    total = sum(report["counts"].values())
+    if not total:
+        print(f"[OK] Checked {report['scanned']} file(s) in {report['took']:.1f} s: "
+              "the backup drive can hold all of them.")
+        return 0
+    print(f"[PROBLEMS] Checked {report['scanned']} file(s): {total} problem(s), "
+          f"{report['blocking']} of which would fail the backup.")
+    _print_precheck(report, sys.stdout)
+    return 5
+
+
+# Usage for the headless entry points, printed for a malformed command line.
+HEADLESS_USAGE = (
+    "usage: main.py --run-backup-job <job id>   (exit 0 ok, 1 failed, 2 no such job,\n"
+    "                                           3 jobs file damaged, 4 already running)\n"
+    "       main.py --precheck-job <job id>     (exit 0 nothing to fix, 5 problems found,\n"
+    "                                           2 no such job, 3 jobs file damaged)")
 
 
 def main() -> int:
@@ -426,7 +540,9 @@ if __name__ == "__main__":
     # scheduled run costs no QApplication and shows no window.
     if len(sys.argv) >= 3 and sys.argv[1] == "--run-backup-job":
         sys.exit(run_backup_job_cli(sys.argv[2]))
-    if "--run-backup-job" in sys.argv:
-        print("usage: main.py --run-backup-job <job id>")
+    if len(sys.argv) >= 3 and sys.argv[1] == "--precheck-job":
+        sys.exit(precheck_job_cli(sys.argv[2]))
+    if "--run-backup-job" in sys.argv or "--precheck-job" in sys.argv:
+        print(HEADLESS_USAGE)
         sys.exit(2)
     sys.exit(main())

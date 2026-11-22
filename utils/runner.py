@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 from typing import Callable, Dict, Optional
 
-from utils import jobs_store, locks, runlog, verify
+from utils import jobs_store, locks, precheck, runlog, verify
 from utils.copying import (BackupAborted, SourceUnavailable, TargetWriteFailed,
                            _writing, copy_tree, walk_tree)
 from utils.fs_utils import long_path, plain_error
@@ -332,9 +332,20 @@ def _backup(job: Dict,
             cleanup = "the incomplete copy could not be removed: " + ", ".join(leftover)
         else:
             cleanup = "the incomplete copy was removed"
-        return {"ok": False, "cause": exc.cause,
-                "message": (f"Backup failed: {exc}. Nothing was saved or pruned "
-                            f"and earlier backups are untouched; {cleanup}.")}
+        result = {"ok": False, "cause": exc.cause,
+                  "message": (f"Backup failed: {exc}. Nothing was saved or pruned "
+                              f"and earlier backups are untouched; {cleanup}.")}
+        if exc.cause in ("path_too_long", "file_too_large"):
+            # Card 104: name every file the drive cannot hold, not just the
+            # first one the copy tripped over, so the fix is one pass.
+            found = precheck.offenders(job, exc.cause,
+                                       getattr(exc, "path", ""), should_abort)
+            if found["paths"]:
+                more = f" and {found['more']} more" if found["more"] else ""
+                result["offenders"] = found["paths"]
+                result["message"] += (" Files the backup drive cannot hold: "
+                                      f"{', '.join(found['paths'])}{more}.")
+        return result
     except OSError as exc:
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": f"Backup failed: {plain_error(exc)}"}

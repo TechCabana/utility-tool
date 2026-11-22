@@ -36,7 +36,7 @@ from utils.jobs_store import (  # noqa: F401
     _backup_path, DEFAULT_RETENTION, DEFAULT_VERIFY, get_job, _has_usable_backup,
     job_baseline_files, job_last_files, job_pruning_held, job_skipped,
     job_skipped_sample, job_verify_mode, JOBS_FILE, _jobs_file_lock, JOBS_FILENAME, JobsFileCorrupt,
-    load_jobs, _locks_dir, new_job, _read_valid, record_run, remove_job,
+    load_jobs, _locks_dir, new_job, _read_valid, record_precheck, record_run, remove_job,
     restore_jobs_from_backup, _save_job, save_job, save_jobs, SCHEDULES, VERIFY_MODES,
     _write_atomic,
 )

@@ -329,6 +329,23 @@ def remove_job(job_id: str) -> None:
         save_jobs([job for job in load_jobs() if job.get("id") != job_id])
 
 
+def record_precheck(job_id: str, summary: Dict) -> Optional[Dict]:
+    """Store a pre-check's summary (`utils.precheck.summary`) on the job as
+    `last_precheck`, and return the job; None if there is no such job.
+
+    Same re-read-under-the-lock as `record_run`, so it cannot undo a run
+    recorded meanwhile. Every other field, known or not, is kept as it was.
+    Raises JobsFileCorrupt or OSError like `save_job`.
+    """
+    with _jobs_file_lock():
+        job = get_job(job_id)
+        if job is None:
+            return None
+        job["last_precheck"] = summary
+        _save_job(job)
+    return job
+
+
 def record_run(job_id: str, result: Dict) -> Optional[Dict]:
     """Write a run's outcome back onto the stored job, and return it.
 
