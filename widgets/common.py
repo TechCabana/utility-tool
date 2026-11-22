@@ -13,6 +13,7 @@ here beyond the drop shadow, which QSS cannot express.
 from __future__ import annotations
 
 import re
+from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -370,11 +371,19 @@ class ConfirmDialog(QtWidgets.QDialog):
     perform the action. The confirm button is the only filled-red surface in
     the app: by the time it is on screen the question has already been asked
     in words, which is what makes the colour mean something.
+
+    Two optional variants for a choice that is not destructive (card 45,
+    restoring): `destructive=False` makes the confirm button the ordinary
+    primary one, with the focus (Enter takes the safe suggested choice), and
+    `alternate_text` adds a third button between Cancel and confirm; read
+    which was pressed with `choose()`.
     """
 
     def __init__(self, parent, title: str, message: str,
-                 confirm_text: str = "Delete", cancel_text: str = "Cancel"):
+                 confirm_text: str = "Delete", cancel_text: str = "Cancel",
+                 alternate_text: str = "", destructive: bool = True):
         super().__init__(parent)
+        self.choice = None   # "confirm" / "alternate" once accepted
         self.setWindowTitle(title)
         self.setModal(True)
         self.setMinimumWidth(420)
@@ -421,23 +430,41 @@ class ConfirmDialog(QtWidgets.QDialog):
         cancel.clicked.connect(self.reject)
         buttons.addWidget(cancel)
 
-        confirm = QtWidgets.QPushButton(f"  {confirm_text}")
-        confirm.setObjectName("Danger")
-        # The commit point carries the same mark as the action that opened
-        # this dialog, so the two read as one gesture rather than two
-        # unrelated red buttons.
-        from widgets import icons as icon_set
+        if alternate_text:
+            alternate = QtWidgets.QPushButton(alternate_text)
+            alternate.setObjectName("Secondary")
+            alternate.clicked.connect(lambda: self._finish("alternate"))
+            buttons.addWidget(alternate)
 
-        icon_set.set_icon(confirm, "trash", "danger_text", 15)
+        if destructive:
+            confirm = QtWidgets.QPushButton(f"  {confirm_text}")
+            confirm.setObjectName("Danger")
+            # The commit point carries the same mark as the action that opened
+            # this dialog, so the two read as one gesture rather than two
+            # unrelated red buttons.
+            from widgets import icons as icon_set
+
+            icon_set.set_icon(confirm, "trash", "danger_text", 15)
+        else:
+            confirm = QtWidgets.QPushButton(confirm_text)
+            confirm.setObjectName("Primary")
         confirm.setDefault(True)
-        confirm.clicked.connect(self.accept)
+        confirm.clicked.connect(lambda: self._finish("confirm"))
         buttons.addWidget(confirm)
+        self.confirm_button = confirm
+        self.cancel_button = cancel
 
         body.addLayout(buttons)
 
         # Cancel holds focus, not the destructive button: Enter on an
-        # unexamined dialog should not delete anything.
-        cancel.setFocus()
+        # unexamined dialog should not delete anything. A non-destructive
+        # dialog puts the focus on its suggested choice instead.
+        (cancel if destructive else confirm).setFocus()
+
+    def _finish(self, choice: str) -> None:
+        """Record which button was pressed and close as accepted."""
+        self.choice = choice
+        self.accept()
 
     @staticmethod
     def ask(parent, title: str, message: str,
@@ -445,6 +472,17 @@ class ConfirmDialog(QtWidgets.QDialog):
         """Show the dialog modally; return True only if the user confirmed."""
         dialog = ConfirmDialog(parent, title, message, confirm_text, cancel_text)
         return dialog.exec() == QtWidgets.QDialog.Accepted
+
+    @staticmethod
+    def choose(parent, title: str, message: str, confirm_text: str,
+               alternate_text: str = "", cancel_text: str = "Cancel",
+               destructive: bool = False) -> Optional[str]:
+        """Show the dialog modally; return "confirm", "alternate" or None
+        (cancelled or closed)."""
+        dialog = ConfirmDialog(parent, title, message, confirm_text, cancel_text,
+                               alternate_text, destructive)
+        dialog.exec()
+        return dialog.choice
 
 
 class EmptyState(QtWidgets.QWidget):

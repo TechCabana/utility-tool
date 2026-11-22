@@ -10,14 +10,14 @@ import os
 
 import pytest
 
-from utils import backup_utils
+from utils import backup_utils, jobs_store, preflight
 
 GB = 1024 ** 3
 
 
 @pytest.fixture(autouse=True)
 def isolated_jobs_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
     yield
 
 
@@ -111,7 +111,7 @@ def test_sibling_whose_name_merely_starts_with_the_source_is_not_inside(tmp_path
 def test_insufficient_space_is_blocked_before_anything_is_written(tree, monkeypatch):
     job, _, target = tree
     # Source is 9 bytes; report 5 free. Both amounts must appear.
-    monkeypatch.setattr(backup_utils, "_free_bytes", lambda path: 5)
+    monkeypatch.setattr(preflight, "_free_bytes", lambda path: 5)
     result = backup_utils.run_job(job)
     assert result["ok"] is False
     assert "Not enough free space" in result["message"]
@@ -150,7 +150,7 @@ def test_unreadable_free_space_is_reported_not_raised(tree):
 def test_changed_volume_is_blocked_before_anything_is_written(tree, monkeypatch):
     job, _, target = tree
     job["target_volume"] = "111"
-    monkeypatch.setattr(backup_utils, "volume_id", lambda path: "222")
+    monkeypatch.setattr(preflight, "volume_id", lambda path: "222")
     result = backup_utils.run_job(job)
     assert result["ok"] is False
     assert "not the same drive" in result["message"]
@@ -160,14 +160,14 @@ def test_changed_volume_is_blocked_before_anything_is_written(tree, monkeypatch)
 def test_matching_recorded_volume_passes(tree, monkeypatch):
     job, _, _ = tree
     job["target_volume"] = "111"
-    monkeypatch.setattr(backup_utils, "volume_id", lambda path: "111")
+    monkeypatch.setattr(preflight, "volume_id", lambda path: "111")
     result = backup_utils.run_job(job)
     assert result["ok"], result["message"]
 
 
 def test_missing_recorded_volume_passes_and_is_recorded_on_success(tree, monkeypatch):
     job, _, _ = tree
-    monkeypatch.setattr(backup_utils, "volume_id", lambda path: "333")
+    monkeypatch.setattr(preflight, "volume_id", lambda path: "333")
     backup_utils.save_job(job)
     assert not backup_utils.get_job(job["id"]).get("target_volume")
 
@@ -179,7 +179,7 @@ def test_missing_recorded_volume_passes_and_is_recorded_on_success(tree, monkeyp
 
 def test_a_failed_run_does_not_record_a_volume(tree, monkeypatch):
     job, _, _ = tree
-    monkeypatch.setattr(backup_utils, "volume_id", lambda path: "333")
+    monkeypatch.setattr(preflight, "volume_id", lambda path: "333")
     backup_utils.save_job(job)
     backup_utils.record_run(job["id"], {"ok": False, "message": "x", "target_volume": "333"})
     assert not backup_utils.get_job(job["id"]).get("target_volume")
@@ -245,7 +245,7 @@ def test_windows_volume_id_is_the_32_bit_serial_every_python_reports(tmp_path):
 def test_a_recorded_64_bit_serial_still_matches_its_volume(tree, monkeypatch):
     job, _, _ = tree
     job["target_volume"] = str((0x8A68984A << 32) | 0x68983743)
-    monkeypatch.setattr(backup_utils, "volume_id", lambda path: str(0x68983743))
+    monkeypatch.setattr(preflight, "volume_id", lambda path: str(0x68983743))
     assert backup_utils.preflight(job) is None
-    monkeypatch.setattr(backup_utils, "volume_id", lambda path: str(0x11111111))
+    monkeypatch.setattr(preflight, "volume_id", lambda path: str(0x11111111))
     assert "not the same drive" in backup_utils.preflight(job)

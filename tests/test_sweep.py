@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from utils import backup_utils
+from utils import backup_utils, jobs_store, preflight, runner, verify, versions
 
 GB = 1024 ** 3
 NOW = datetime(2026, 11, 13, 12, 0, 0)
@@ -25,7 +25,7 @@ YOUNG = "20261112-000000"  # one day before NOW
 
 @pytest.fixture(autouse=True)
 def isolated_jobs_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
     yield
 
 
@@ -258,7 +258,7 @@ def test_an_undeletable_folder_is_reported_and_the_sweep_carries_on(tree, monkey
             raise PermissionError(13, "in use", path)
         real(path)
 
-    monkeypatch.setattr(backup_utils, "_rmtree", locked)
+    monkeypatch.setattr(versions, "_rmtree", locked)
     result = backup_utils.sweep_stale(job, now=NOW)  # must not raise
     assert result["removed"] == [f"{OLD2}.partial"]
     assert len(result["errors"]) == 1 and f"{OLD1}.partial" in result["errors"][0]
@@ -326,7 +326,7 @@ def test_a_locked_leftover_does_not_fail_the_run(tree, monkeypatch):
             raise PermissionError(13, "in use", path)
         real(path)
 
-    monkeypatch.setattr(backup_utils, "_rmtree", locked)
+    monkeypatch.setattr(versions, "_rmtree", locked)
     result = backup_utils.run_job(job)
     assert result["ok"], result["message"]
     assert result["swept"] == []
@@ -340,7 +340,7 @@ def test_the_sweep_runs_before_the_stamp_is_claimed(tree, monkeypatch):
     partial(root, OLD2)
     seen = []
     real_claim = backup_utils._claim_stamp
-    monkeypatch.setattr(backup_utils, "_claim_stamp",
+    monkeypatch.setattr(runner, "_claim_stamp",
                         lambda r, j: seen.append(names(root)) or real_claim(r, j))
     assert backup_utils.run_job(job)["ok"]
     assert seen == [[f"{OLD2}.partial"]]  # OLD1 already gone, nothing new yet
@@ -363,7 +363,7 @@ def test_a_full_target_is_cured_by_sweeping_then_the_run_succeeds(tree, monkeypa
     job, root = tree
     partial(root, OLD1)
     partial(root, OLD2)  # newest -> kept
-    monkeypatch.setattr(backup_utils, "_free_bytes",
+    monkeypatch.setattr(preflight, "_free_bytes",
                         space_unless_gone(root, f"{OLD1}.partial"))
     # without the sweep this very job fails pre-flight:
     assert backup_utils.preflight(job).startswith(backup_utils.LOW_SPACE_PREFIX)
@@ -379,7 +379,7 @@ def test_still_full_after_the_sweep_returns_the_low_space_failure(tree, monkeypa
     job, root = tree
     partial(root, OLD1)
     partial(root, OLD2)
-    monkeypatch.setattr(backup_utils, "_free_bytes", lambda p: 0)
+    monkeypatch.setattr(preflight, "_free_bytes", lambda p: 0)
     result = backup_utils.run_job(job)
     assert result["ok"] is False
     assert result["message"].startswith(backup_utils.LOW_SPACE_PREFIX)
@@ -391,7 +391,7 @@ def test_still_full_after_the_sweep_returns_the_low_space_failure(tree, monkeypa
 def test_a_full_target_with_nothing_to_sweep_fails_untouched(tree, monkeypatch):
     job, root = tree
     partial(root, YOUNG)
-    monkeypatch.setattr(backup_utils, "_free_bytes", lambda p: 0)
+    monkeypatch.setattr(preflight, "_free_bytes", lambda p: 0)
     result = backup_utils.run_job(job)
     assert result["ok"] is False
     assert result["message"].startswith(backup_utils.LOW_SPACE_PREFIX)
@@ -414,7 +414,7 @@ def test_a_wrong_drive_does_not_trigger_a_sweep(tree, monkeypatch):
     partial(root, OLD1)
     partial(root, OLD2)
     job["target_volume"] = "some-other-drive"
-    monkeypatch.setattr(backup_utils, "volume_id", lambda p: "this-drive")
+    monkeypatch.setattr(preflight, "volume_id", lambda p: "this-drive")
     result = backup_utils.run_job(job)
     assert result["ok"] is False and "not the same drive" in result["message"]
     assert "swept" not in result
@@ -424,7 +424,7 @@ def test_a_wrong_drive_does_not_trigger_a_sweep(tree, monkeypatch):
 def test_a_failed_verification_still_keeps_its_partial_for_inspection(tree, monkeypatch):
     job, root = tree
     partial(root, OLD1)
-    monkeypatch.setattr(backup_utils, "_verify_copy",
+    monkeypatch.setattr(verify, "_verify_copy",
                         lambda *a, **k: (1, 1, ["a.txt"]))
     result = backup_utils.run_job(job)
     assert result["ok"] is False and result["verified"] is False

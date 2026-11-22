@@ -15,14 +15,14 @@ import os
 
 import pytest
 
-from utils import backup_utils
+from utils import backup_utils, copying, jobs_store
 
 FILES = 30
 
 
 @pytest.fixture(autouse=True)
 def isolated_jobs_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(backup_utils, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
+    monkeypatch.setattr(jobs_store, "JOBS_FILE", str(tmp_path / "backup_jobs.json"))
     yield
 
 
@@ -98,7 +98,7 @@ def fail_destination_writes(monkeypatch, root, nth, error, at="write"):
                 return Failing(real_open(path, mode, *args, **kwargs))
         return real_open(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(backup_utils, "open", fake_open, raising=False)
+    monkeypatch.setattr(copying, "open", fake_open, raising=False)
     return state
 
 
@@ -249,7 +249,7 @@ def test_an_unclassified_full_drive_error_still_fails_the_run(tree, monkeypatch)
             raise OSError(errno.ENOSPC, "No space left on device")
         return real(src, dst)
 
-    monkeypatch.setattr(backup_utils, "_hash_copy", full_from_the_4th)
+    monkeypatch.setattr(copying, "_hash_copy", full_from_the_4th)
     result = backup_utils.run_job(job)
     assert_failed_cleanly(job, result, first, first_hashes)
     assert result["cause"] == "no_space"
@@ -270,7 +270,7 @@ def test_an_unreadable_source_file_is_still_a_skip_and_prune_still_runs(tree, mo
             raise PermissionError(errno.EACCES, "Permission denied", str(path))
         return real_open(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(backup_utils, "open", fake_open, raising=False)
+    monkeypatch.setattr(copying, "open", fake_open, raising=False)
     result = backup_utils.run_job(job)
 
     assert result["ok"], result["message"]
