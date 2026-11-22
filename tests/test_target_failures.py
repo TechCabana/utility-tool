@@ -16,6 +16,7 @@ import os
 import pytest
 
 from utils import backup_utils, copying, jobs_store
+from utils.fs_utils import plain_path
 
 FILES = 30
 
@@ -88,7 +89,7 @@ def fail_destination_writes(monkeypatch, root, nth, error, at="write"):
             return self.handle.write(data)
 
     def fake_open(path, mode="r", *args, **kwargs):
-        full = os.path.normcase(os.path.abspath(str(path)))
+        full = os.path.normcase(os.path.abspath(plain_path(str(path))))
         if mode == "wb" and full.startswith(root):
             state["n"] += 1
             if state["n"] == nth:
@@ -266,7 +267,7 @@ def test_an_unreadable_source_file_is_still_a_skip_and_prune_still_runs(tree, mo
     real_open = open
 
     def fake_open(path, mode="r", *args, **kwargs):
-        if mode == "rb" and os.path.normcase(os.path.abspath(str(path))) == bad:
+        if mode == "rb" and os.path.normcase(os.path.abspath(plain_path(str(path)))) == bad:
             raise PermissionError(errno.EACCES, "Permission denied", str(path))
         return real_open(path, mode, *args, **kwargs)
 
@@ -287,7 +288,7 @@ def test_an_unreadable_source_folder_is_still_a_skip(tree, monkeypatch):
     bad = os.path.normcase(os.path.abspath(str(source / "sub")))
 
     def fake_scandir(path="."):
-        if os.path.normcase(os.path.abspath(str(path))) == bad:
+        if os.path.normcase(os.path.abspath(plain_path(str(path)))) == bad:
             raise PermissionError(errno.EACCES, "Access is denied", str(path))
         return real_scandir(path)
 

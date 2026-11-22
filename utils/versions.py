@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from utils.copying import BackupAborted, SourceUnavailable, TargetWriteFailed, copy_tree
-from utils.fs_utils import _is_link_like
+from utils.fs_utils import _is_link_like, long_path, plain_error
 from utils.jobs_store import DEFAULT_RETENTION, VERIFY_MODES
 
 
@@ -47,7 +47,7 @@ def version_names(job: Dict) -> List[str]:
     ignored rather than offered as a restore point.
     """
     try:
-        with os.scandir(job_root(job)) as entries:
+        with os.scandir(long_path(job_root(job))) as entries:
             names = [e.name for e in entries
                      if e.is_dir(follow_symlinks=False) and _VERSION_RE.match(e.name)]
     except OSError:
@@ -109,7 +109,7 @@ def _last_line(path: str, limit: int = 4096) -> Optional[bytes]:
     (a real trailer is under 100 bytes, so that is garbage, not a trailer).
     """
     try:
-        with open(path, "rb") as handle:
+        with open(long_path(path), "rb") as handle:
             handle.seek(0, os.SEEK_END)
             end = handle.tell()
             start = max(0, end - limit)
@@ -159,7 +159,7 @@ def is_verified(job: Dict, stamp: str) -> bool:
     """True iff version `stamp` exists and its manifest ends verified -- a
     "full" or "quick" run. An "off" version is complete but never verified."""
     summary = read_manifest_summary(job, stamp)
-    return (os.path.isdir(version_path(job, stamp))
+    return (os.path.isdir(long_path(version_path(job, stamp)))
             and summary is not None and summary["verified"] is True)
 
 
@@ -309,7 +309,7 @@ def prune_versions(job: Dict, protect: Iterable[str] = ()) -> List[str]:
         # Manifest first: a version whose folder deletion fails halfway must
         # not keep claiming to be verified.
         try:
-            os.remove(manifest_path(job, name))
+            os.remove(long_path(manifest_path(job, name)))
         except FileNotFoundError:
             pass  # a legacy version has none
         except OSError:
@@ -335,7 +335,12 @@ def _make_writable_and_retry(func, path, _error) -> None:
 
 
 def _rmtree(path: str) -> None:
-    """`shutil.rmtree` that also removes read-only files. Raises OSError."""
+    """`shutil.rmtree` that also removes read-only files. Raises OSError.
+
+    Takes a plain path; the tree is walked in `long_path`'s form, so a file
+    nested past MAX_PATH is deleted too instead of failing the prune.
+    """
+    path = long_path(path)
     if sys.version_info >= (3, 12):
         shutil.rmtree(path, onexc=_make_writable_and_retry)
     else:  # onexc does not exist before 3.12; onerror is deprecated from it
@@ -349,7 +354,7 @@ def _discard(partial: str, manifest_tmp: str) -> None:
     except OSError:
         pass  # best effort: a leftover .partial is never listed as a version
     try:
-        os.remove(manifest_tmp)
+        os.remove(long_path(manifest_tmp))
     except OSError:
         pass
 
@@ -393,7 +398,7 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
     manifests: Dict[str, str] = {}
     taken = set()
     try:
-        with os.scandir(job_root(job)) as entries:
+        with os.scandir(long_path(job_root(job))) as entries:
             for entry in entries:
                 taken.add(entry.name)
                 if _is_link_like(entry):
@@ -410,7 +415,7 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
     except FileNotFoundError:
         return result  # no job root yet: nothing to sweep
     except OSError as exc:
-        result["errors"].append(f"{job_root(job)}: {exc}")
+        result["errors"].append(f"{job_root(job)}: {plain_error(exc)}")
         return result
 
     def old(stamp: str) -> bool:
@@ -433,12 +438,12 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
                 _rmtree(path)
             else:
                 try:
-                    os.unlink(path)
+                    os.unlink(long_path(path))
                 except PermissionError:  # read-only bit: clear it, retry once
-                    os.chmod(path, stat.S_IWRITE)
-                    os.unlink(path)
+                    os.chmod(long_path(path), stat.S_IWRITE)
+                    os.unlink(long_path(path))
         except OSError as exc:
-            result["errors"].append(f"{name}: {exc}")
+            result["errors"].append(f"{name}: {plain_error(exc)}")
         else:
             result["removed"].append(name)
     return result
@@ -481,12 +486,12 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
         if version is None:
             return {"ok": False, "message": "There is no backup to restore yet"}
     source = version_path(job, version)
-    if not os.path.isdir(source):
+    if not os.path.isdir(long_path(source)):
         return {"ok": False, "message": f"Backup version {version} not found"}
 
     safe_name = re.sub(r"[^\w.-]+", "_", job.get("name") or job["id"]).strip("_") or job["id"]
     folder = os.path.join(destination, f"{safe_name}-restored-{version}")
-    existed = os.path.exists(folder)
+    existed = os.path.exists(long_path(folder))
     stats: Dict[str, int] = {}
     try:
         files, restored_bytes, errors = copy_tree(
@@ -510,7 +515,7 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
         return {"ok": False, "cause": exc.cause,
                 "message": f"Restore failed: {reason}. {after}"}
     except OSError as exc:
-        return {"ok": False, "message": f"Restore failed: {exc}"}
+        return {"ok": False, "message": f"Restore failed: {plain_error(exc)}"}
 
     message = f"Restored {files} file(s) to {folder}"
     if errors:

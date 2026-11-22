@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from utils import backup_utils, copying, jobs_store, locks, runlog, runner
+from utils.fs_utils import plain_path
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -107,7 +108,7 @@ def fail_target_writes(monkeypatch, root):
     root = os.path.normcase(os.path.abspath(str(root)))
 
     def fake_open(path, mode="r", *args, **kwargs):
-        if mode == "wb" and os.path.normcase(os.path.abspath(str(path))).startswith(root):
+        if mode == "wb" and os.path.normcase(os.path.abspath(plain_path(str(path)))).startswith(root):
             raise OSError(errno.ENOSPC, "No space left on device", str(path))
         return real_open(path, mode, *args, **kwargs)
 

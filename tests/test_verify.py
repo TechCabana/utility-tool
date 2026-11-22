@@ -15,6 +15,7 @@ import time
 import pytest
 
 from utils import backup_utils, copying, jobs_store, runner, versions
+from utils.fs_utils import plain_path
 
 
 @pytest.fixture(autouse=True)
@@ -320,7 +321,7 @@ def test_an_unreadable_source_file_is_skipped_reported_and_left_out(tree, monkey
 
     def fake_open(path, mode="r", *args, **kwargs):
         handle = real_open(path, mode, *args, **kwargs)
-        if os.path.abspath(str(path)) == os.path.abspath(bad) and "r" in mode:
+        if os.path.abspath(plain_path(str(path))) == os.path.abspath(bad) and "r" in mode:
             return FailingRead(handle)
         return handle
 
