@@ -197,6 +197,8 @@ def _locked_run(job: Dict,
     if lock.recovered is not None:
         who = (f"process {lock.recovered}" if lock.recovered > 0
                else "an earlier run")
+        if lock.recovered_reused:
+            who += ", whose id has since been reused by another process"
         message = result.get("message", "")
         if not message.endswith((".", "!")):
             message += "."
