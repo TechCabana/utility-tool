@@ -1456,9 +1456,21 @@ class BackupTab(QtWidgets.QWidget):
             f"Restoring \"{job.get('name')}\" from {version}...",
             lambda progress, abort, _phase: backup_utils.restore_version(
                 job, version, destination, progress, abort),
-            lambda result: self._say(result.get("message", ""),
-                                     ok=result.get("ok", False)),
+            self._finish_restore,
         )
+
+    def _finish_restore(self, result: dict):
+        """Show how a restore went, in warning style when its check found a problem.
+
+        `ok` means the files were copied. A file that did not match the backup
+        (or was not on its checksum list, or was missing from it) is a warning
+        on a successful restore, not a failure: the copy is there and the
+        message names what to look at. "Could not be checked" is plain news.
+        """
+        problem = bool(result.get("mismatched") or result.get("not_in_manifest")
+                       or result.get("missing_from_version"))
+        self._say(result.get("message", ""), ok=result.get("ok", False),
+                  warn=bool(result.get("ok") and problem))
 
     def refresh_changes(self):
         """Measure every job's drift since its last backup, off the UI thread.

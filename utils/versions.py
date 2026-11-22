@@ -453,6 +453,96 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
 # Restore
 # ---------------------------------------------------------------------------
 
+# How many file names a restore message spells out before saying "and N more".
+RESTORE_NAMED = 5
+
+
+def _read_manifest_hashes(job: Dict, stamp: str) -> Tuple[Optional[Dict[str, bytes]], Optional[str]]:
+    """`({relative path: sha256 digest}, None)` for version `stamp`, or
+    `(None, reason)` when its manifest cannot be trusted.
+
+    The reason is "no manifest" (none on disk: made before manifests existed,
+    or deleted) or "manifest damaged". A manifest is trusted only if it ends
+    in a valid trailer (a run that died mid-write has none), every line
+    parses, every file entry has a path and a 64-hex-digit sha256, no path
+    repeats, and the entries number what the trailer says. Anything less
+    reads as damaged -- never as a pass.
+
+    Loaded into one dict, because the restore walks the folder in directory
+    order, not manifest order. Digests are kept as 32 raw bytes, not 64-char
+    hex, to keep a 100,000-file manifest to tens of megabytes. Paths are in
+    the manifest's own form (relative, forward slashes, case kept), which is
+    the form `copy_tree` reports them in.
+    """
+    path = manifest_path(job, stamp)
+    if not os.path.exists(long_path(path)):
+        return None, "no manifest"
+    summary = read_manifest_summary(job, stamp)
+    if summary is None:
+        return None, "manifest damaged"
+    hashes: Dict[str, bytes] = {}
+    try:
+        with open(long_path(path), "r", encoding="utf-8") as handle:
+            for line in handle:
+                entry = json.loads(line)
+                if not isinstance(entry, dict):
+                    return None, "manifest damaged"
+                if entry.get("type") != "file":
+                    continue
+                rel, sha = entry.get("path"), entry.get("sha256")
+                digest = bytes.fromhex(sha) if isinstance(sha, str) else b""
+                if not isinstance(rel, str) or len(digest) != 32 or rel in hashes:
+                    return None, "manifest damaged"
+                hashes[rel] = digest
+    except (OSError, ValueError):   # unreadable, bad JSON, bad UTF-8, bad hex
+        return None, "manifest damaged"
+    if len(hashes) != summary.get("files"):
+        return None, "manifest damaged"
+    return hashes, None
+
+
+def _files(count: int) -> str:
+    """"1 file" / "5 files"."""
+    return f"{count} file" if count == 1 else f"{count} files"
+
+
+def _named(paths: List[str]) -> str:
+    """The first `RESTORE_NAMED` paths (sorted), then "and N more"."""
+    shown = ", ".join(sorted(paths)[:RESTORE_NAMED])
+    rest = len(paths) - RESTORE_NAMED
+    return f"{shown} and {rest} more" if rest > 0 else shown
+
+
+def _restore_check_sentence(check: Dict) -> str:
+    """What a restore says about how far its files were checked.
+
+    Returns " and checked each against the backup" (a clause to append to
+    "Restored N files to <folder>") when every file matched, "" when nothing
+    needs saying, else one or more ". ..."-led sentences.
+    """
+    if check["unchecked_reason"] == "no manifest":
+        return (". This backup has no checksum list, so the files could not "
+                "be checked")
+    if check["unchecked_reason"] == "manifest damaged":
+        return (". This backup's checksum list is damaged, so the files "
+                "could not be checked")
+    parts = []
+    if check["mismatched"]:
+        parts.append(f"{_files(len(check['mismatched']))} did not match the "
+                     f"backup and may be damaged: {_named(check['mismatched'])}")
+    if check["not_in_manifest"]:
+        parts.append(f"{_files(len(check['not_in_manifest']))} not on the "
+                     "backup's checksum list could not be checked: "
+                     f"{_named(check['not_in_manifest'])}")
+    if check["missing_from_version"]:
+        parts.append(f"{_files(len(check['missing_from_version']))} the "
+                     "checksum list records could not be found in the backup: "
+                     f"{_named(check['missing_from_version'])}")
+    if parts:
+        return ". " + ". ".join(parts)
+    return " and checked each against the backup" if check["checked"] else ""
+
+
 def restore_version(job: Dict, version: Optional[str], destination: str,
                     on_progress: Optional[Callable[[int, int], None]] = None,
                     should_abort: Optional[Callable[[], bool]] = None) -> Dict:
@@ -480,6 +570,34 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     stored version itself vanishes mid-restore or most of it cannot be read
     (`copy_tree`'s completeness rule): that fails with cause
     "source_unavailable" / "source_incomplete" and the same folder handling.
+
+    Every file is also checked against the version's manifest (card 6ajl8vjD),
+    using the SHA-256 `_hash_copy` already computes while it copies -- no
+    second read. That hash is of the bytes READ from the backup, so a match
+    proves the stored file still has the bytes recorded when it was backed up
+    (it catches bit rot or tampering in the backup); it does NOT re-read what
+    was written to the destination, so it says nothing about the write. A
+    mismatch never stops the restore and nothing is deleted: the file is kept
+    and named in the result. The result gains:
+
+    * `checked` -- restored files whose hash matched the manifest;
+    * `mismatched` -- paths whose hash did not (a restored copy of a damaged
+      stored file);
+    * `not_in_manifest` -- restored files the manifest does not list;
+    * `missing_from_version` -- files the manifest lists that the restore did
+      not produce and no unreadable-file error accounts for;
+    * `unchecked_reason` -- None, "no manifest" or "manifest damaged" (then
+      nothing was checked: a manifest that cannot be trusted is never a pass);
+    * `verified` -- True only when the manifest was trusted and every restored
+      file matched, with none unlisted or missing. A file skipped as
+      unreadable is not restored, so it is in `errors` (as before) and not
+      counted against `verified`.
+
+    `ok` keeps its meaning (the files were copied); a mismatch is
+    `ok=True, verified=False`, so callers that only look at `ok` behave as
+    before and callers that care read `verified`. A cancelled restore
+    (`ok=False`, `cancelled=True`) reports what had been checked so far and
+    is never `verified`.
     """
     if version is None:
         version = restore_candidates(job)["preferred"]
@@ -493,12 +611,41 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     folder = os.path.join(destination, f"{safe_name}-restored-{version}")
     existed = os.path.exists(long_path(folder))
     stats: Dict[str, int] = {}
+    expected, unchecked_reason = _read_manifest_hashes(job, version)
+    check: Dict = {"checked": 0, "mismatched": [], "not_in_manifest": [],
+                   "missing_from_version": [], "unchecked_reason": unchecked_reason,
+                   "verified": False}
+
+    def compare(rel: str, _size: int, _mtime: float, sha: str) -> None:
+        """Compare one restored file's copy-time hash with its manifest entry.
+
+        Pops the entry so what is left in `expected` at the end is what the
+        restore did not produce. Never raises: `copy_tree` would delete the
+        file just copied if its callback failed.
+        """
+        want = expected.pop(rel, None)
+        if want is None:
+            check["not_in_manifest"].append(rel)
+        elif want == bytes.fromhex(sha):
+            check["checked"] += 1
+        else:
+            check["mismatched"].append(rel)
+
     try:
         files, restored_bytes, errors = copy_tree(
             source, folder, on_progress=on_progress, should_abort=should_abort,
-            stats=stats)
+            on_copied=compare if expected is not None else None, stats=stats)
     except BackupAborted:
-        return {"ok": False, "message": "Restore cancelled"}
+        # Only the files restored before the stop were compared; nothing here
+        # claims the rest were. Never `verified`.
+        message = "Restore cancelled"
+        if check["checked"] or check["mismatched"] or check["not_in_manifest"]:
+            message += (f". {_files(check['checked'])} had been copied and matched "
+                        "the backup before it stopped")
+            if check["mismatched"]:
+                message += (f"; {_files(len(check['mismatched']))} did not match: "
+                            f"{_named(check['mismatched'])}")
+        return dict(check, ok=False, message=message, cancelled=True)
     except (TargetWriteFailed, SourceUnavailable) as exc:
         if existed:
             after = f"{folder} already existed and may now be incomplete."
@@ -517,9 +664,31 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     except OSError as exc:
         return {"ok": False, "message": f"Restore failed: {plain_error(exc)}"}
 
-    message = f"Restored {files} file(s) to {folder}"
+    if expected is not None:
+        # What the manifest lists but the restore did not produce. A file that
+        # was skipped as unreadable is already reported in `errors` (as its own
+        # path, or as a folder holding it), so it is not "missing" as well.
+        failed = {err.split(": ", 1)[0] for err in errors}
+        for rel in expected:
+            parts = rel.split("/")
+            if not any("/".join(parts[:i]) in failed for i in range(1, len(parts) + 1)):
+                check["missing_from_version"].append(rel)
+        # `checked == files` also rules out any unlisted file: files restored
+        # = matched + mismatched + unlisted.
+        check["verified"] = (not check["mismatched"]
+                             and not check["missing_from_version"]
+                             and check["checked"] == files)
+
+    message = f"Restored {_files(files)} to {folder}"
+    sentence = _restore_check_sentence(check)
+    # A clean check is a clause of the first sentence; problems and "could not
+    # be checked" are sentences of their own, after the skipped-files note.
+    if sentence.startswith(" and "):
+        message += sentence
     if errors:
         message += (f". {max(len(errors), stats.get('not_copied', 0))} file(s) "
                     "could not be read from the backup and were skipped")
-    return {"ok": True, "message": message, "path": folder, "files": files,
-            "bytes": restored_bytes, "errors": errors}
+    if sentence and not sentence.startswith(" and "):
+        message += sentence
+    return dict(check, ok=True, message=message, path=folder, files=files,
+                bytes=restored_bytes, errors=errors)
