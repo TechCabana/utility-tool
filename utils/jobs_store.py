@@ -8,6 +8,7 @@ re-exports everything here. Qt-free.
 import contextlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -112,6 +113,10 @@ def job_skipped_sample(job: Dict) -> List[str]:
     return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
 
 
+# A version stamp (`versions.VERSION_FORMAT`); `[0-9]`, not `\d`: no Unicode digits.
+_STAMP_RE = re.compile(r"[0-9]{8}-[0-9]{6}")
+
+
 def _count(value) -> int:
     """`value` if it is a positive whole number (not a bool), else 0."""
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
@@ -137,6 +142,32 @@ def job_baseline_files(job: Dict) -> int:
 def job_last_files(job: Dict) -> int:
     """How many files the last successful run copied; 0 if unknown."""
     return _count(job.get("last_files"))
+
+
+def job_hold_released(job: Dict) -> Optional[Dict]:
+    """The owner's "this is expected" acknowledgement stored on `job` (card
+    QnFM2GMZ), or None when there is none or it is junk.
+
+    A valid one is `{"stamp", "files", "level", "since", "time"}`: the baseline
+    version that was let go (`stamp`, holding `files` files), the file count
+    the source had when it was released (`level`), the newest version at that
+    moment (`since`, the first version the guard compares against again) and
+    when it happened. Anything else -- a missing field, a wrong type, a stamp
+    that is not a version name -- reads as no acknowledgement, so the guard
+    falls back to guarding as before rather than trusting a hand-edited value.
+    """
+    release = job.get("hold_released")
+    if not isinstance(release, dict):
+        return None
+    stamp, since = release.get("stamp"), release.get("since")
+    # `stamp` may be "" (the baseline was gone from the disk when released);
+    # `since` is what the guard acts on, so it must be a real version name.
+    if not (isinstance(stamp, str) and (stamp == "" or _STAMP_RE.fullmatch(stamp))
+            and isinstance(since, str) and _STAMP_RE.fullmatch(since)):
+        return None
+    if not _count(release.get("files")) or not _count(release.get("level")):
+        return None
+    return release
 
 
 def _backup_path() -> str:

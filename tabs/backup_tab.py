@@ -480,6 +480,13 @@ RESTORE_ACTION_WIDTH = 110
 # larger backup aside (card 51): a failure never clears that hold.
 HELD_AFTER_FAILURE = "Older backups are being kept because the source shrank."
 
+# The button on a held job's card that says the shrink was on purpose (card
+# QnFM2GMZ), and what its confirmation adds to the two counts it names.
+RELEASE_HOLD_TEXT = "This is expected: forget the larger backup"
+RELEASE_HOLD_NOTE = ("Nothing is deleted right now. The earlier backup is removed "
+                     "later, in the normal clean-up, once it is older than the "
+                     "number of backups you keep.")
+
 
 def _tail(path: str, segments: int = 2) -> str:
     """The last few segments of a path, for a narrow table column.
@@ -503,13 +510,23 @@ class JobRow(QtWidgets.QWidget):
     run_requested = QtCore.Signal(dict)
     edit_requested = QtCore.Signal(dict)
     remove_requested = QtCore.Signal(dict)
+    release_hold_requested = QtCore.Signal(dict)
 
     def __init__(self, job: dict):
         super().__init__()
         self.setObjectName("CardBody")
         self.job = job
 
-        h = QtWidgets.QHBoxLayout(self)
+        # The columns are one line; a job whose pruning is held gets a second
+        # line under them with the way out (card QnFM2GMZ), so a row without a
+        # hold is exactly as it was.
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        columns = QtWidgets.QWidget()
+        columns.setObjectName("CardBody")
+        outer.addWidget(columns)
+        h = QtWidgets.QHBoxLayout(columns)
         h.setContentsMargins(0, 10, 0, 10)
         # 4, not the app's usual 12, for a row like this: at 940px (the
         # app's minimum) four columns plus three action buttons plus six
@@ -556,6 +573,43 @@ class JobRow(QtWidgets.QWidget):
                 button.setObjectName("GhostDanger")
             button.clicked.connect(lambda _=False, s=signal: s.emit(self.job))
             h.addWidget(button)
+
+        # Only while a hold is active: nothing to forget otherwise. Built here,
+        # not hidden, so `release_btn is None` is the absence a test can check.
+        self.release_btn = None
+        if backup_utils.job_pruning_held(job):
+            outer.addWidget(self._release_strip(job))
+
+    def _release_strip(self, job: dict) -> QtWidgets.QWidget:
+        """The second line of a held job: what is being kept, and the button
+        that says "this is expected" (it asks before it does anything)."""
+        strip = QtWidgets.QWidget()
+        strip.setObjectName("CardBody")
+        row = QtWidgets.QHBoxLayout(strip)
+        row.setContentsMargins(0, 0, 0, 10)
+        row.setSpacing(8)
+
+        self.release_btn = QtWidgets.QPushButton(RELEASE_HOLD_TEXT)
+        self.release_btn.setObjectName("Secondary")
+        self.release_btn.setToolTip(
+            "Stop keeping the earlier, larger backup aside. Nothing is deleted "
+            "now; it is removed in the normal clean-up.")
+        self.release_btn.setAccessibleName(
+            f"{RELEASE_HOLD_TEXT} for {job.get('name', 'this job')}")
+        # Reachable and operable from the keyboard: Tab focuses it, Space
+        # clicks it, and autoDefault makes Enter click it outside a dialog too.
+        self.release_btn.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.release_btn.setAutoDefault(True)
+        self.release_btn.clicked.connect(lambda: self.release_hold_requested.emit(self.job))
+        row.addWidget(self.release_btn)
+
+        note = QtWidgets.QLabel(
+            f"An earlier backup with {backup_utils.job_baseline_files(job)} files "
+            "is being kept aside.")
+        note.setObjectName("Hint")
+        note.setWordWrap(True)
+        row.addWidget(note, 1)
+        return strip
 
     def _text(self, value: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(value)
@@ -1109,6 +1163,7 @@ class BackupTab(QtWidgets.QWidget):
             row.run_requested.connect(self.run_backup_job)
             row.edit_requested.connect(self.edit_backup_job)
             row.remove_requested.connect(self.remove_backup_job)
+            row.release_hold_requested.connect(self.release_pruning_hold)
             self.jobs_layout.addWidget(row)
 
         self.restore_empty.setVisible(not self.jobs)
@@ -1158,6 +1213,43 @@ class BackupTab(QtWidgets.QWidget):
         if self.backup_thread is None:   # no worker started to show it later
             self._backup_notice = ""
             self._say(message)
+
+    def release_pruning_hold(self, job: dict):
+        """Ask, then stop keeping the earlier, larger backup aside (card QnFM2GMZ).
+
+        The counts in the question come from a fresh read of the jobs file, not
+        from the row, so it never quotes numbers a later run has changed. The
+        dialog is non-destructive wording -- nothing is deleted now, the older
+        backup goes in a later run's normal clean-up -- and Cancel is its
+        default button. Does nothing while a backup or restore is running.
+        """
+        if self.backup_thread is not None:
+            return
+        try:
+            fresh = backup_utils.get_job(job["id"])
+        except backup_utils.JobsFileCorrupt:
+            self.refresh_backup()
+            return
+        if fresh is None or not backup_utils.job_pruning_held(fresh):
+            # Gone, or a run ended the hold since the row was drawn.
+            self.refresh_backup()
+            self._say(backup_utils.RELEASE_NOTHING)
+            return
+        question = backup_utils.release_hold_question(
+            backup_utils.job_last_files(fresh), backup_utils.job_baseline_files(fresh))
+        choice = ConfirmDialog.choose(
+            self, "Stop keeping the earlier backup?", f"{question}\n\n{RELEASE_HOLD_NOTE}",
+            confirm_text="Stop keeping it", cancel_default=True)
+        if choice != "confirm":
+            return
+        try:
+            result = backup_utils.release_hold(fresh["id"])
+        except (backup_utils.JobsFileCorrupt, OSError) as exc:
+            self.refresh_backup()
+            self._say(f"The earlier backup is still being kept. {exc}", ok=False)
+            return
+        self.refresh_backup()
+        self._say(result["message"], ok=result["ok"])
 
     # How a folder is opened; tests replace it so no file manager starts.
     open_url = staticmethod(QtGui.QDesktopServices.openUrl)

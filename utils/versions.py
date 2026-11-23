@@ -16,7 +16,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from utils.copying import BackupAborted, SourceUnavailable, TargetWriteFailed, copy_tree
 from utils.fs_utils import _is_link_like, long_path, plain_error
-from utils.jobs_store import DEFAULT_RETENTION, VERIFY_MODES
+from utils.jobs_store import DEFAULT_RETENTION, VERIFY_MODES, job_hold_released
 
 
 # A version directory is named for the moment the backup started. Matched by
@@ -228,10 +228,24 @@ def sanity_baseline(job: Dict, exclude: Optional[str] = None) -> Tuple[int, Opti
     the copy was checked, so a job with verification "off" is guarded too.
     Legacy versions (no manifest), damaged or truncated trailers and a junk
     `files` value do not count. `exclude` is the stamp of the run being judged.
+
+    **The owner's release (card QnFM2GMZ).** When the job carries a valid
+    `hold_released` acknowledgement (`jobs_store.job_hold_released`), versions
+    OLDER than its `since` stamp are not considered at all: the owner said the
+    larger backups from before then are not what the source should be
+    compared with any more. `since` is the newest version at the moment of
+    release, so it is the first one compared against again -- which makes the
+    new reference the level the source was at then, and a later drop of more
+    than 30% below THAT holds again. Versions made after the release count as
+    usual, so a source that grows back and then shrinks is still guarded
+    against its new, larger self. The old big version stays on disk until
+    retention prunes it; it simply stops being the baseline.
     """
+    release = job_hold_released(job)
+    since = release["since"] if release else ""
     best, stamp = 0, None
     for name in version_names(job):             # oldest first, so >= keeps the newest tie
-        if name == exclude:
+        if name == exclude or name < since:     # stamps sort chronologically
             continue
         files = (read_manifest_summary(job, name) or {}).get("files")
         if isinstance(files, int) and not isinstance(files, bool) and files > 0 and files >= best:
@@ -259,7 +273,7 @@ def sanity_drop_baseline(job: Dict, files: int, exclude: Optional[str] = None) -
     Holding protects only that one version (`prune_versions(protect=...)`),
     so a source that stays low costs one extra complete version, never
     unbounded growth. It ends when the count comes back within the
-    threshold; a later card adds an explicit "this is fine" action.
+    threshold, or when the owner releases it (`runner.release_hold`).
     """
     baseline = baseline_files(job, exclude)
     return baseline if is_sanity_drop(baseline, files) else 0
@@ -275,6 +289,16 @@ def pruning_held_sentence(files: int, baseline: int) -> str:
             "earlier, larger backup is being kept; other old backups are pruned "
             "as usual. If that is not expected, check your files before the "
             "next run.")
+
+
+def release_hold_question(files: int, baseline: int) -> str:
+    """The question the "This is expected" confirmation asks, naming both
+    counts: "Your folder now has 6 files; an earlier backup has 10. Stop
+    keeping the earlier one?" (the second count carries no unit, as the card
+    words it, and so reads right for 1 as well)."""
+    noun = "file" if files == 1 else "files"
+    return (f"Your folder now has {files} {noun}; an earlier backup has "
+            f"{baseline}. Stop keeping the earlier one?")
 
 
 def prune_versions(job: Dict, protect: Iterable[str] = ()) -> List[str]:

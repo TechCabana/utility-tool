@@ -139,8 +139,12 @@ def run_job(job: Dict,
     and keeps its version, and that largest version is protected from
     pruning while the others prune by retention as usual (it does not count
     toward retention): `pruning_held` is True, `baseline_files` is its count
-    and the message says so. No baseline (a first run) never holds. See
-    `versions.sanity_baseline` and `prune_versions(protect=...)`.
+    and the message says so (`baseline_stamp` names it). No baseline (a first
+    run) never holds. See `versions.sanity_baseline` and
+    `prune_versions(protect=...)`. The owner can end a hold with
+    `release_hold`; the guard then ignores versions older than the release
+    (the acknowledgement is read from the jobs file, so a stale `job` dict
+    cannot undo it).
 
     `on_phase` is called with "copying" and then, unless the mode is "off",
     "verifying"; `on_progress` restarts from 0 for the verify pass (over the
@@ -239,6 +243,113 @@ def _busy_message(holder: Optional[Dict]) -> str:
             f"{holder.get('pid')}). Nothing was changed.")
 
 
+RELEASE_NOTHING = "Nothing to release: this backup is not holding any older version."
+RELEASE_BUSY = "A backup is running; try again when it finishes."
+
+
+def _released_message(baseline: int, retention) -> str:
+    """What a release tells the owner: the older backup is not kept aside any
+    more, and (honestly) it is still on disk until the normal clean-up."""
+    keep = max(1, int(retention)) if isinstance(retention, int) else jobs_store.DEFAULT_RETENTION
+    return (f"Done: the earlier backup ({baseline} files) is no longer kept "
+            "aside. Nothing was deleted now; it is removed in the normal "
+            f"clean-up once it is older than the {keep} backups you keep.")
+
+
+def _release_locked(job_id: str) -> Dict:
+    """The release itself; the caller holds the job's run lock.
+
+    Everything is decided from a fresh read under the jobs-file lock, because
+    the screen's idea of the job may be stale. Raises JobsFileCorrupt or
+    OSError (lock timeout, write failure) like `save_job`.
+    """
+    with jobs_store._jobs_file_lock():
+        job = jobs_store.get_job(job_id)
+        if job is None:
+            return {"ok": False, "released": False, "cause": "unknown_job",
+                    "message": f"There is no backup job with id '{job_id}'."}
+        baseline = jobs_store.job_baseline_files(job)
+        current = jobs_store.job_last_files(job)
+        if not jobs_store.job_pruning_held(job):
+            return {"ok": True, "released": False,
+                    "message": RELEASE_NOTHING, "baseline_files": 0,
+                    "current_files": current, "baseline_stamp": None}
+        newest = latest_version(job)
+        _, stamp = sanity_baseline(job, exclude=newest)
+        if newest is not None:
+            job["hold_released"] = {
+                "stamp": stamp or "", "files": baseline, "level": current,
+                "since": newest, "time": datetime.now().isoformat(timespec="seconds")}
+        job["last_pruning_held"] = False
+        job["last_baseline_files"] = 0
+        jobs_store._save_job(job)
+    return {"ok": True, "released": True,
+            "message": _released_message(baseline, job.get("retention")),
+            "baseline_files": baseline, "current_files": current,
+            "baseline_stamp": stamp}
+
+
+def release_hold(job_id: str, trigger: str = "manual") -> Dict:
+    """Let go of a pruning hold the owner says is expected (card QnFM2GMZ).
+
+    The source sanity guard keeps one older, larger backup (the baseline) aside
+    while the source stays more than 30% below it. A person who really did
+    delete folders on purpose has no other way to say so, so this records
+    that on the job -- `hold_released = {stamp, files, level, since, time}` --
+    and clears the hold markers so the card stops saying "pruning held".
+
+    **The rule it sets up** (applied by `versions.sanity_baseline`): versions
+    older than `since` -- the newest version at the moment of release, i.e.
+    the one holding the `level` the source was at -- are no longer compared
+    with. The next run prunes by plain retention, so the old large version
+    goes as soon as it is outside retention, and cannot re-hold in the
+    meantime just because it is still on disk. `level` becomes the reference:
+    a later run more than 30% below it holds again (protecting the then
+    largest version from `since` on), and a source that grows back is
+    guarded against its new size like any other. A second release simply
+    replaces the acknowledgement.
+
+    **It never deletes or moves anything.** Pruning happens only in a later
+    run, through `prune_versions`. With no active hold it is a no-op:
+    `ok=True, released=False` and a plain message, and nothing is written.
+
+    The job's run lock is taken first, so releasing while that job is running
+    is refused (`busy=True`, `ok=False`): the run's own `record_run` would
+    otherwise overwrite the acknowledgement. Then the jobs-file lock and a
+    fresh read, as `record_run` does.
+
+    Returns `{ok, released, message, baseline_files, current_files,
+    baseline_stamp}`; an unknown id is `ok=False, cause="unknown_job"`. Raises
+    JobsFileCorrupt for a damaged jobs file. A release is logged as one line
+    in the job's run log (`trigger` "manual" or "cli"); that never fails it.
+    """
+    start = datetime.now()
+    job = jobs_store.get_job(job_id)             # JobsFileCorrupt propagates
+    if job is None:
+        return {"ok": False, "released": False, "cause": "unknown_job",
+                "message": f"There is no backup job with id '{job_id}'."}
+    lock_path = _job_lock_path(job)
+    if lock_path is None:
+        return {"ok": False, "released": False,
+                "message": "This backup job has no usable id. Nothing was changed."}
+    try:
+        lock = locks.acquire(lock_path, f"release hold {job_id}")
+    except locks.LockBusy:
+        return {"ok": False, "released": False, "busy": True, "message": RELEASE_BUSY}
+    except OSError as exc:
+        return {"ok": False, "released": False,
+                "message": f"Could not take the backup lock: {exc}. Nothing was changed."}
+    try:
+        result = _release_locked(job_id)
+    finally:
+        lock.release()
+    if result.get("released"):
+        # After both locks are gone, as the run log requires.
+        runlog.append_run(job, dict(result, hold_released=True, files=result["current_files"]),
+                          trigger, start)
+    return result
+
+
 def _run_job(job: Dict,
              on_progress: Optional[Callable[[int, int], None]],
              should_abort: Optional[Callable[[], bool]],
@@ -269,6 +380,23 @@ def _with_sweep(result: Dict, sweep: Optional[Dict]) -> Dict:
             message += "."
         result["message"] = f"{message} {' '.join(notes)}"
     return result
+
+
+def _with_stored_release(job: Dict) -> Dict:
+    """`job`, carrying the "this is expected" acknowledgement the jobs FILE has.
+
+    A caller's job dict can be older than a release made meanwhile (the GUI
+    holds the jobs it loaded; `main.py --release-hold` writes the file), and
+    a run that judged the source with the stale dict would hold again at once.
+    So the stored acknowledgement wins over the dict's own. An unreadable jobs
+    file or a job not in it (a test's unsaved dict) leaves `job` as it was.
+    """
+    try:
+        stored = jobs_store.get_job(job.get("id"))
+    except (jobs_store.JobsFileCorrupt, OSError):
+        return job
+    release = jobs_store.job_hold_released(stored) if stored else None
+    return dict(job, hold_released=release) if release else job
 
 
 def _backup(job: Dict,
@@ -418,7 +546,7 @@ def _backup(job: Dict,
     # rest prune as usual -- so a mostly-emptied source cannot roll every
     # complete copy out of retention, and a source that stays low cannot grow
     # the target without bound. The new version is excluded from the baseline.
-    baseline, baseline_stamp = sanity_baseline(job, exclude=stamp)
+    baseline, baseline_stamp = sanity_baseline(_with_stored_release(job), exclude=stamp)
     held = is_sanity_drop(baseline, files)
     if not held:
         baseline = 0
@@ -446,6 +574,7 @@ def _backup(job: Dict,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
             "not_copied": not_copied,
             "pruning_held": held, "baseline_files": baseline,
+            "baseline_stamp": baseline_stamp if held else None,
             "verified": mode != "off", "verify_mode": mode, "manifest": manifest,
             "target_volume": target_volume(target)}
 
