@@ -16,7 +16,7 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
 
 from utils import backup_utils, precheck
-from utils.fs_utils import human_size
+from utils.fs_utils import human_size, long_path
 from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
                             add_field, divider, icon_button, section,
                             section_header, table_header)
@@ -251,7 +251,9 @@ class BackupJobDialog(QtWidgets.QDialog):
 
         if not name:
             return self._fail("Give the job a name.")
-        if not os.path.isdir(source):
+        # long_path, as the run and the pre-check use: a plain isdir drops a
+        # trailing dot, so a folder whose own name ends in one "did not exist".
+        if not source or not os.path.isdir(long_path(source)):
             return self._fail("The source folder does not exist.")
         if not target:
             return self._fail("Choose a target folder for the backups.")
@@ -288,6 +290,8 @@ class PrecheckDialog(QtWidgets.QDialog):
     """The pre-check's report (card 104): one row per problem, each with what
     is wrong, the fix, and an "Open folder" button for the folder holding it.
 
+    It opens only when something would FAIL the run (`blocking`); findings
+    that are merely skipped files show inline instead (`BackupTab._skip_note`).
     Two shapes. After a job is added or edited it only informs (`run_text`
     empty: one Close button). Before Back up now it asks: "Back up anyway" and
     Cancel, and `exec()` is Accepted only for "Back up anyway" -- a pre-check
@@ -433,9 +437,11 @@ class PrecheckDialog(QtWidgets.QDialog):
         """The folder to open for a problem: the one holding the offender (the
         source folder itself for a missing source or target); "" if gone."""
         path = problem["path"]
-        folder = path if problem["kind"] in ("source_unavailable",
+        folder = path if problem["kind"] in ("source_unavailable", "source_empty",
                                              "target_unavailable") else os.path.dirname(path)
-        return folder if folder and os.path.isdir(folder) else ""
+        # long_path: a folder whose own name ends in a dot is real but a plain
+        # isdir cannot see it.
+        return folder if folder and os.path.isdir(long_path(folder)) else ""
 
 
 # The Backup tables' columns, defined once as (label, stretch, minimum width)
@@ -837,6 +843,9 @@ class BackupTab(QtWidgets.QWidget):
         # so the remeasure's own outcome does not erase what just happened.
         self._backup_notice = ""
         self._backup_notice_warn = False  # ...and whether that line is a warning
+        # What a skip-only pre-check found, carried into the status line of the
+        # Back up now run it did not interrupt (see `_finish_precheck`).
+        self._precheck_note = ""
 
         v = QtWidgets.QVBoxLayout(self)
         # Margins leave room for the card drop shadows to render un-clipped
@@ -1344,14 +1353,20 @@ class BackupTab(QtWidgets.QWidget):
             )
         self.refresh_backup()
 
-    def _precheck(self, job: dict, then, run_text: str = ""):
+    def _precheck(self, job: dict, then, run_text: str = "", check_open: bool = True):
         """Pre-check `job` off the UI thread, record it, then call `then(report)`.
 
-        Clean: `then` runs at once, with no dialog. Problems: the report dialog
-        opens first; with `run_text` it asks (Cancel or `run_text`) and `then`
-        runs only if the user goes ahead, without it it only informs. A check
-        that could not run at all says so and carries on: it never stands
-        between the user and a backup.
+        Clean: `then` runs at once, with no dialog. Something that would fail
+        the run: the report dialog opens first; with `run_text` it asks (Cancel
+        or `run_text`) and `then` runs only if the user goes ahead, without it
+        it only informs. Only files that will be skipped: no dialog, one line in
+        the status area, and `then` runs (see `_finish_precheck`). A check that
+        could not run at all says so and carries on: it never stands between the
+        user and a backup.
+
+        `check_open=False` leaves out the per-file open (Back up now: a locked
+        file is skipped and reported by the run itself, and the open costs
+        minutes on a big tree); the Add/Edit flow keeps it.
         """
         if self.backup_thread is not None:
             return
@@ -1359,11 +1374,35 @@ class BackupTab(QtWidgets.QWidget):
             f"Checking \"{job.get('name')}\" against its backup drive...",
             # No file total exists before the walk, so the bar stays
             # indeterminate and no per-file progress signal is sent.
-            lambda _progress, abort, _phase: precheck.precheck(job, None, abort),
+            lambda _progress, abort, _phase: precheck.precheck(
+                job, None, abort, check_open=check_open),
             lambda report: self._finish_precheck(job, report, then, run_text))
 
+    @staticmethod
+    def _skip_note(report: dict) -> str:
+        """One plain sentence for a report whose problems would not fail the
+        run: how many files, the first few names, and how many more."""
+        problems = report.get("problems", [])
+        total = sum(report.get("counts", {}).values())
+        names = [p.get("rel") or p.get("path", "") for p in problems[:precheck.SAMPLE_MAX]]
+        cause = ("cannot be read right now and will be skipped"
+                 if all(p.get("kind") == "unreadable" for p in problems)
+                 else "need attention but will not stop the backup")
+        text = f"{total} file(s) {cause}: {', '.join(names)}"
+        if total > len(names):
+            text += f" and {total - len(names)} more"
+        return text + "."
+
     def _finish_precheck(self, job: dict, report: dict, then, run_text: str):
-        """Record the pre-check, show its report if it found anything, go on."""
+        """Record the pre-check, show its report if it found anything, go on.
+
+        The dialog appears only when something would FAIL the run (`blocking`).
+        Findings that are merely skipped files are not worth a question: they
+        show as one line in the status area and the backup goes ahead. After
+        Add/Edit that line rides in `_backup_notice` (so the remeasure that
+        follows does not erase it); for Back up now it is kept in
+        `_precheck_note` for the run's own status line.
+        """
         if "scanned" not in report:   # the worker caught an unexpected error
             self._say(f"The pre-check could not run: {report.get('message', '')}",
                       warn=True)
@@ -1375,24 +1414,37 @@ class BackupTab(QtWidgets.QWidget):
             backup_utils.record_precheck(job["id"], precheck.summary(report))
         except (backup_utils.JobsFileCorrupt, OSError):
             pass   # the report is still shown; only the stored copy is stale
-        if report["problems"]:
+        if report.get("blocking"):
             dialog = PrecheckDialog(self, job, report, run_text)
             if dialog.exec() != QtWidgets.QDialog.Accepted and run_text:
                 self._say(f"Backup of \"{job.get('name')}\" not started.")
                 return
+        elif report["problems"]:
+            note = self._skip_note(report)
+            self._say(note, warn=True)
+            if run_text:
+                self._precheck_note = note
+            else:
+                self._backup_notice = f"{self._backup_notice} {note}".strip()
+                self._backup_notice_warn = True
         then(report)
 
     def run_backup_job(self, job: dict):
-        """Back up now: pre-check first, then the run (card 104)."""
+        """Back up now: pre-check first, then the run (card 104).
+
+        No per-file open here (`check_open=False`): it cost 72 s on a 10,142
+        file tree, and a locked file is just skipped and reported by the run.
+        """
         self._precheck(job, lambda _report: self._start_run(job),
-                       run_text="Back up anyway")
+                       run_text="Back up anyway", check_open=False)
 
     def _start_run(self, job: dict):
         """Take the backup itself on the worker thread."""
         if self.backup_thread is not None:
             return
+        note, self._precheck_note = self._precheck_note, ""
         self._start_backup(
-            f"Backing up \"{job.get('name')}\"...",
+            f"Backing up \"{job.get('name')}\"..." + (f" {note}" if note else ""),
             lambda progress, abort, phase: backup_utils.run_job(
                 job, progress, abort, phase),
             lambda result: self._finish_run(job, result),

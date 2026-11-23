@@ -347,9 +347,19 @@ def run_backup_job_cli(job_id):
     # or scheduled before the check existed) gets one before its first
     # unattended run. It never blocks the run -- the backup's own failure
     # handling stays authoritative -- and it is recorded only once the run
-    # was not refused as busy, which must leave the jobs file untouched.
-    first_check = _first_run_precheck(job) if "last_precheck" not in job else None
-    result = backup_utils.run_job(job, trigger="scheduled")
+    # was not refused as busy, which must leave the jobs file untouched. It
+    # runs through `after_lock`, i.e. once the job's run lock is held, so a run
+    # refused as busy never walks the source first.
+    checked = {}
+
+    def check_first_run():
+        """Pre-check this job, now that the run lock is ours."""
+        checked["report"] = _first_run_precheck(job)
+
+    result = backup_utils.run_job(
+        job, trigger="scheduled",
+        after_lock=None if "last_precheck" in job else check_first_run)
+    first_check = checked.get("report")
     if result.get("busy"):
         # Not a result of this job: recording it would overwrite the real last
         # run's outcome with "failed: already running".
@@ -423,12 +433,17 @@ def _first_run_precheck(job):
     report for the caller to record, or None if the check could not run.
 
     Prints any problems as warnings on stderr. Never raises and never stops
-    the run that follows.
+    the run that follows. The per-file open is skipped (`check_open=False`):
+    this runs while the job's lock is held, so a slow walk (Defender scans
+    each open, 72 s for 10,142 files on a first pass) would hold the lock and
+    delay the first backup for no gain -- a file that cannot be opened is
+    skipped, counted and named by the run itself, and nobody is watching an
+    unattended run's warnings to act on them first. `--precheck-job` keeps it.
     """
     from utils import precheck
     _safe_console()
     try:
-        report = precheck.precheck(job)
+        report = precheck.precheck(job, check_open=False)
     except Exception as exc:  # the backup's own handling stays authoritative
         print(f"[WARN] The pre-check could not run: {exc}", file=sys.stderr)
         return None

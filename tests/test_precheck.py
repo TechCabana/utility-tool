@@ -825,3 +825,290 @@ def test_saving_a_job_prechecks_it_then_remeasures(tab, tmp_path, monkeypatch):
     assert tab._backup_notice.startswith('Added job "Pre".')   # carried across
     done(run_worker(work))
     assert remeasured == [1] and tab.recorded == [job["id"]] and tab.shown == []
+
+
+# --- card wYoRc2Nk: Back up now is fast and quiet -------------------------------------
+# Back up now skips the per-file open, asks only when something would FAIL the
+# run, and the first unattended run pre-checks only once it holds the job lock.
+# Also: an empty source is reported (the run refuses it), and a source folder
+# whose own name ends in a dot is accepted.
+
+def open_spy(monkeypatch):
+    """Replace `_can_open` with a recorder that opens nothing; returns the
+    list of paths it was asked about (the proof the open check ran or not)."""
+    asked = []
+    monkeypatch.setattr(precheck, "_can_open", lambda path: asked.append(path))
+    return asked
+
+
+def skip_only_report():
+    """A finished report whose only findings are files that will be skipped."""
+    return {"ok": True, "scanned": 7, "fs": "NTFS", "blocking": 0, "problems_more": 0,
+            "aborted": False, "counts": {"unreadable": 2},
+            "problems": [{"path": "C:/src/locked.db", "rel": "locked.db",
+                          "kind": "unreadable", "detail": "Locked.",
+                          "suggestion": precheck.SUGGESTIONS["unreadable"],
+                          "blocking": False},
+                         {"path": "C:/src/sub/x.db", "rel": "sub/x.db",
+                          "kind": "unreadable", "detail": "Locked.",
+                          "suggestion": precheck.SUGGESTIONS["unreadable"],
+                          "blocking": False}]}
+
+
+def test_back_up_now_with_a_last_precheck_does_not_open_every_source_file(
+        tab, tmp_path, monkeypatch):
+    asked = open_spy(monkeypatch)
+    job = make_job(tmp_path)
+    job["last_precheck"] = {"ok": True, "problems": 0}       # already checked once
+    started = capture_workers(tab, monkeypatch)
+
+    tab.run_backup_job(job)
+    report = run_worker(started[0][1])                        # the worker's walk
+
+    assert report["scanned"] == 2 and report["ok"] is True    # the walk did run
+    assert asked == []                                        # ...and opened nothing
+
+    # Positive control: the Add/Edit flow and --precheck-job DO open each file,
+    # so an empty `asked` above is not an instrument that could never record.
+    tab._precheck(job, lambda _report: None)
+    run_worker(started[1][1])
+    assert sorted(os.path.basename(p) for p in asked) == ["a.txt", "b.txt"]
+
+
+def test_the_cli_and_the_save_flow_still_open_each_file(tab, tmp_path, monkeypatch, cli, capsys):
+    from utils import scheduler
+    asked = open_spy(monkeypatch)
+    job = make_job(tmp_path)
+    backup_utils.save_job(job)
+
+    assert cli.precheck_job_cli(job["id"]) == 0
+    assert len(asked) == 2
+
+    monkeypatch.setattr(scheduler, "_run", lambda *a, **k: pytest.fail("real scheduler"))
+    monkeypatch.setattr(backup_utils, "sync_task", lambda job: (True, ""))
+    started = capture_workers(tab, monkeypatch)
+    tab._save_and_schedule(job, "Added")
+    run_worker(started[0][1])
+    assert len(asked) == 4
+
+
+def test_a_skip_only_precheck_asks_nothing_while_a_failing_one_still_does(tab, tmp_path):
+    from PySide6 import QtWidgets
+    went_on = []
+    job = {"id": "j1", "name": "J"}
+
+    tab._finish_precheck(job, skip_only_report(), went_on.append, "Back up anyway")
+    assert tab.shown == [] and len(went_on) == 1             # no dialog, backup starts
+    assert tab.backup_status.text() == (
+        "2 file(s) cannot be read right now and will be skipped: locked.db, sub/x.db.")
+    assert tab.backup_status.objectName() == "StatusWarn"
+    assert not tab.backup_status.isHidden()
+    assert tab.recorded == ["j1"]                            # still recorded
+
+    # Positive control: a report that would fail the run does ask, and Cancel
+    # stops the backup.
+    tab.FakeDialog.answer = QtWidgets.QDialog.Rejected
+    tab._finish_precheck(job, dict(a_report(tmp_path), aborted=False), went_on.append,
+                         "Back up anyway")
+    assert tab.shown == ["Back up anyway"] and len(went_on) == 1
+    assert "not started" in tab.backup_status.text()
+
+
+def test_a_failing_precheck_dialog_keeps_cancel_as_the_focused_default(qt_app, tmp_path):
+    from tabs.backup_tab import PrecheckDialog
+    report = a_report(tmp_path)
+    report["problems"] = report["problems"][:1]               # only the failing one
+    report["counts"] = {"file_too_large": 1}
+    dialog = PrecheckDialog(None, {"name": "Photos"}, report, "Back up anyway")
+    assert dialog.close_button.text() == "Cancel" and dialog.close_button.isDefault()
+    assert dialog.focusWidget() is dialog.close_button
+
+
+def test_a_skip_only_result_after_add_edit_shows_inline_and_survives_the_remeasure(
+        tab, tmp_path):
+    went_on = []
+    tab._backup_notice = 'Added job "J".'
+    tab._finish_precheck({"id": "j1", "name": "J"}, skip_only_report(), went_on.append, "")
+    assert tab.shown == [] and len(went_on) == 1
+    assert tab._backup_notice.startswith('Added job "J". 2 file(s) cannot be read')
+    assert tab._backup_notice_warn is True
+    tab._finish_changes({})                                   # the remeasure lands
+    assert "locked.db" in tab.backup_status.text()
+    assert tab.backup_status.objectName() == "StatusWarn"
+
+
+def test_the_skip_note_names_five_files_and_counts_the_rest(tab):
+    report = skip_only_report()
+    report["counts"] = {"unreadable": 9}
+    report["problems"] = [dict(report["problems"][0], rel=f"f{n}.db") for n in range(5)]
+    assert tab._skip_note(report) == (
+        "9 file(s) cannot be read right now and will be skipped: "
+        "f0.db, f1.db, f2.db, f3.db, f4.db and 4 more.")
+    mixed = skip_only_report()
+    mixed["problems"][0] = dict(mixed["problems"][0], kind="bad_name")
+    assert "need attention but will not stop the backup" in tab._skip_note(mixed)
+
+
+def test_back_up_now_carries_the_skip_note_into_the_run_status(tab, tmp_path, monkeypatch):
+    job = make_job(tmp_path)
+    started = capture_workers(tab, monkeypatch)
+    tab._finish_precheck(job, skip_only_report(), lambda _r: tab._start_run(job),
+                         "Back up anyway")
+    assert started[0][0].startswith('Backing up "Pre"...')
+    assert "2 file(s) cannot be read right now" in started[0][0]
+    # Positive control: a clean check leaves the status line as it was.
+    clean = {"ok": True, "scanned": 2, "problems": [], "counts": {}, "blocking": 0,
+             "aborted": False, "fs": "NTFS"}
+    tab._finish_precheck(job, clean, lambda _r: tab._start_run(job), "Back up anyway")
+    assert started[1][0] == 'Backing up "Pre"...'
+
+
+def test_a_run_refused_as_busy_never_walks_the_source(tmp_path, cli, capsys, monkeypatch):
+    from utils import locks
+    job = make_job(tmp_path)
+    backup_utils.save_job(job)
+    walked = []
+    real = precheck._list_dir
+    monkeypatch.setattr(precheck, "_list_dir",
+                        lambda path: walked.append(path) or real(path))
+    asked = open_spy(monkeypatch)
+
+    holder = locks.acquire(backup_utils._job_lock_path(job), "test holder")
+    try:
+        assert cli.run_backup_job_cli(job["id"]) == 4
+    finally:
+        holder.release()
+    assert walked == [] and asked == []                       # nothing was walked
+    assert "last_precheck" not in backup_utils.get_job(job["id"])
+
+    # Positive control: the same job with the lock free IS pre-checked (so the
+    # empty `walked` above is the lock's doing), and without opening any file.
+    assert cli.run_backup_job_cli(job["id"]) == 0
+    assert walked and asked == []
+    assert backup_utils.get_job(job["id"])["last_precheck"]["scanned"] == 2
+
+
+def test_the_first_run_precheck_happens_after_the_lock_is_held(tmp_path, cli, monkeypatch):
+    job = make_job(tmp_path)
+    backup_utils.save_job(job)
+    lock_path = backup_utils._job_lock_path(job)
+    seen = []
+
+    def check(job_, **kwargs):
+        """Record whether the run lock exists at the moment the check runs."""
+        seen.append(os.path.exists(lock_path))
+        return real(job_, **kwargs)
+    real = precheck.precheck
+    monkeypatch.setattr(precheck, "precheck", check)
+    assert cli.run_backup_job_cli(job["id"]) == 0
+    assert seen == [True]
+
+
+def test_run_job_calls_after_lock_once_held_and_never_when_busy(tmp_path):
+    from utils import locks
+    job = make_job(tmp_path)
+    calls = []
+    backup_utils.run_job(job, after_lock=lambda: calls.append(
+        os.path.exists(backup_utils._job_lock_path(job))))
+    assert calls == [True]                                    # held when called
+
+    holder = locks.acquire(backup_utils._job_lock_path(job), "test holder")
+    try:
+        result = backup_utils.run_job(job, after_lock=lambda: calls.append("busy run"))
+    finally:
+        holder.release()
+    assert result["busy"] is True and calls == [True]
+
+
+# --- an empty source ----------------------------------------------------------------
+
+def test_an_empty_source_is_a_blocking_problem_and_the_run_refuses_it_too(tmp_path):
+    job = make_job(tmp_path, {})
+    report = precheck.precheck(job)
+    assert kinds(report) == [("source_empty", "")]
+    assert report["ok"] is False and report["blocking"] == 1
+    assert report["problems"][0]["path"] == job["source"]
+    assert "holds no files" in report["problems"][0]["detail"]
+    assert report["problems"][0]["suggestion"] == precheck.SUGGESTIONS["source_empty"]
+    result = backup_utils.run_job(job)
+    assert result["ok"] is False and "source folder is empty" in result["message"]
+
+    # A folder holding only empty folders is empty to the run, so to the check.
+    (Path(job["source"]) / "a" / "b").mkdir(parents=True)
+    assert kinds(precheck.precheck(job)) == [("source_empty", "")]
+    assert backup_utils.run_job(job)["ok"] is False
+
+    # Positive control: one real file anywhere and both agree it is fine.
+    (Path(job["source"]) / "a" / "b" / "f.txt").write_bytes(b"x")
+    assert precheck.precheck(job)["problems"] == []
+    assert backup_utils.run_job(job)["ok"] is True
+
+
+def test_a_source_whose_files_cannot_be_stat_ed_is_empty_but_one_that_cannot_be_opened_is_not(
+        tmp_path, monkeypatch):
+    job = make_job(tmp_path, {"a.txt": b"a"})
+    real = precheck._list_dir
+    monkeypatch.setattr(precheck, "_list_dir",
+                        lambda path: [(n, d, None if not d else s) for n, d, s in real(path)])
+    assert kinds(precheck.precheck(job)) == [("unreadable", "a.txt"),
+                                             ("source_empty", "")]
+    monkeypatch.setattr(precheck, "_list_dir", real)
+    monkeypatch.setattr(precheck, "_can_open", lambda path: PermissionError(13, "locked"))
+    assert kinds(precheck.precheck(job)) == [("unreadable", "a.txt")]    # still counts
+
+
+def test_a_missing_source_is_not_also_reported_empty(tmp_path):
+    job = make_job(tmp_path, {})
+    job["source"] = str(tmp_path / "gone")
+    assert kinds(precheck.precheck(job)) == [("source_unavailable", "")]
+
+
+def test_a_source_root_that_cannot_be_listed_is_not_also_reported_empty(tmp_path, monkeypatch):
+    job = make_job(tmp_path)
+
+    def refuse(path):
+        raise PermissionError(13, "denied")
+    monkeypatch.setattr(precheck, "_list_dir", refuse)
+    assert kinds(precheck.precheck(job)) == [("source_unavailable", "")]
+
+
+def test_the_cli_reports_an_empty_source_with_exit_5(tmp_path, cli, capsys):
+    job = make_job(tmp_path, {})
+    backup_utils.save_job(job)
+    assert cli.precheck_job_cli(job["id"]) == 5
+    out = capsys.readouterr().out
+    assert "Source folder is empty" in out and "1 of which would fail the backup" in out
+
+
+# --- a source folder whose own name ends in a dot -----------------------------------
+
+@windows_only
+def test_a_source_folder_ending_in_a_dot_is_accepted_by_the_dialog_and_the_open_button(
+        tmp_path, qt_app):
+    from PySide6 import QtWidgets
+    from tabs.backup_tab import BackupJobDialog, PrecheckDialog
+    plain = str(tmp_path) + os.sep + "dotted."
+    os.mkdir(_x(tmp_path) + os.sep + "dotted.")               # extended form: no stripping
+    with open(_x(tmp_path) + os.sep + "dotted." + os.sep + "f.txt", "wb") as handle:
+        handle.write(b"x")
+    assert os.path.isdir(plain) is False                      # the plain check misses it
+
+    dialog = BackupJobDialog(None)
+    dialog.name_edit.setText("Dotted")
+    dialog.source_edit.setText(plain)
+    dialog.target_edit.setText(str(tmp_path / "dst"))
+    dialog.on_save()
+    assert dialog.error.isHidden() and dialog.result() == QtWidgets.QDialog.Accepted
+    assert dialog.job["source"] == plain
+
+    problem = {"path": plain, "kind": "source_empty"}
+    assert PrecheckDialog._folder_of(problem) == plain
+    # Positive controls: a folder that is not there is still refused, and "".
+    missing = BackupJobDialog(None)
+    missing.name_edit.setText("Gone")
+    missing.source_edit.setText(str(tmp_path / "gone."))
+    missing.target_edit.setText(str(tmp_path / "dst"))
+    missing.on_save()
+    assert not missing.error.isHidden() and "does not exist" in missing.error.text()
+    assert PrecheckDialog._folder_of({"path": str(tmp_path / "gone."),
+                                      "kind": "source_empty"}) == ""

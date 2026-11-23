@@ -99,6 +99,7 @@ KIND_LABELS = {
     "case_collision": "Names differ only by capital letters",
     "unreadable": "Cannot be read right now",
     "source_unavailable": "Source folder not found",
+    "source_empty": "Source folder is empty",
     "target_unavailable": "Backup drive not available",
 }
 
@@ -111,6 +112,8 @@ SUGGESTIONS = {
     "unreadable": ("Close the program using it, or check its permissions, "
                    "then back up again."),
     "source_unavailable": "Connect the drive the source folder is on, or edit the job.",
+    "source_empty": ("Check that the drive the source folder is on is connected, or "
+                     "edit the job to point at the folder that holds your files."),
     "target_unavailable": "Connect the backup drive, or edit the job.",
 }
 
@@ -304,6 +307,11 @@ def precheck(job: Dict,
       as "will be skipped" and is NOT blocking.
     * `source_unavailable` / `target_unavailable` -- the source folder is
       missing, or the target's drive is not there at all.
+    * `source_empty` -- the walk found no file whose size could be read. This
+      is the run's own refusal (`preflight`: `tree_totals(source)` counts no
+      file), mirrored exactly, so a pre-check never says ok where the run
+      fails: a folder holding only empty folders is empty, a file that cannot
+      be stat'ed does not count, and one that only cannot be OPENED does.
 
     `ok` is True only when nothing BLOCKING was found (something that would
     fail the run) and the walk was not aborted; non-blocking problems leave it
@@ -316,13 +324,17 @@ def precheck(job: Dict,
     created or written, on the target or anywhere else. `progress(scanned)` is
     called per file and `should_abort()` checked per entry, like the other
     long operations; an abort returns at once with `aborted: True`, `ok:
-    False`. `check_open=False` skips the per-file open (the run-failure path
-    uses it: it only wants the path or size offenders).
+    False`. `check_open=False` skips the per-file open, which is what costs
+    the time on a big tree (Defender scans each open: 10,142 files took 1.2 s
+    without it and 72 s with it on a first pass). The run-failure path, Back
+    up now and the first unattended run use it: a file that cannot be opened
+    is simply skipped, and reported, by the run itself. `--precheck-job` and
+    the Add/Edit flow keep it, where a locked file is worth reporting.
     """
     start = time.monotonic()
     problems: List[Dict] = []
     counts: Dict[str, int] = {}
-    state = {"scanned": 0, "blocking": 0, "aborted": False}
+    state = {"scanned": 0, "readable": 0, "blocking": 0, "aborted": False}
     source = job.get("source", "") or ""
     target = job.get("target", "") or ""
 
@@ -417,6 +429,7 @@ def precheck(job: Dict,
                     "Its size cannot be read right now, so it will be skipped.",
                     blocking=False)
                 continue
+            state["readable"] += 1
             if limits["max_file"] is not None and size > limits["max_file"]:
                 add(path, rel, "file_too_large",
                     f"It is {size:,} bytes; a {limits['fs']} drive holds files of at "
@@ -428,6 +441,13 @@ def precheck(job: Dict,
                         f"It cannot be opened for reading right now "
                         f"({error.strerror or error}), so it will be skipped.",
                         blocking=False)
+    # The run refuses a source with no readable file (`preflight`); say so here
+    # rather than report ok. Not when the root itself could not be listed: that
+    # is already `source_unavailable`.
+    if not state["readable"] and "source_unavailable" not in counts:
+        add(source, "", "source_empty",
+            f"The source folder {source} holds no files that can be read, so the "
+            "backup would stop with nothing backed up.")
     return report()
 
 

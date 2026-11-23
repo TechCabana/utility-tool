@@ -81,7 +81,8 @@ def run_job(job: Dict,
             on_progress: Optional[Callable[[int, int], None]] = None,
             should_abort: Optional[Callable[[], bool]] = None,
             on_phase: Optional[Callable[[str], None]] = None,
-            trigger: str = "manual") -> Dict:
+            trigger: str = "manual",
+            after_lock: Optional[Callable[[], None]] = None) -> Dict:
     """Take one versioned, checked copy of `job`'s source; prune old versions.
 
     Returns a plain result dict: `ok`, `message`, and on success `version`,
@@ -155,6 +156,10 @@ def run_job(job: Dict,
     result message says so.
 
     `preflight()` runs after the lock and nothing is created until it passes.
+    `after_lock`, if given, is called once the lock is held and before
+    pre-flight: work that walks the source (the first unattended run's
+    pre-check) belongs there, so a run refused as busy never starts it. It must
+    not raise; if it does, the lock is released and the exception propagates.
 
     **Run log (card 52).** Every call appends exactly one line to the job's log
     (`utils/runlog.py`) once the lock is released -- success, failure, cancelled,
@@ -165,7 +170,7 @@ def run_job(job: Dict,
     """
     start = datetime.now()
     try:
-        result = _locked_run(job, on_progress, should_abort, on_phase)
+        result = _locked_run(job, on_progress, should_abort, on_phase, after_lock)
     except BaseException as exc:
         runlog.append_run(job, {"ok": False, "message": f"{type(exc).__name__}: {exc}"},
                           trigger, start)
@@ -177,7 +182,8 @@ def run_job(job: Dict,
 def _locked_run(job: Dict,
                 on_progress: Optional[Callable[[int, int], None]],
                 should_abort: Optional[Callable[[], bool]],
-                on_phase: Optional[Callable[[str], None]]) -> Dict:
+                on_phase: Optional[Callable[[str], None]],
+                after_lock: Optional[Callable[[], None]] = None) -> Dict:
     """`run_job` without the log: take the per-job lock, run, release it."""
     lock_path = _job_lock_path(job)
     if lock_path is None:
@@ -191,6 +197,8 @@ def _locked_run(job: Dict,
         return {"ok": False, "message": f"Could not take the backup lock: {exc}. "
                 "Nothing was changed."}
     try:
+        if after_lock is not None:
+            after_lock()
         result = _run_job(job, on_progress, should_abort, on_phase)
     finally:
         lock.release()
