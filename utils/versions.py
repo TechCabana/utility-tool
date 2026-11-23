@@ -301,7 +301,8 @@ def release_hold_question(files: int, baseline: int) -> str:
             f"{baseline}. Stop keeping the earlier one?")
 
 
-def prune_versions(job: Dict, protect: Iterable[str] = ()) -> List[str]:
+def prune_versions(job: Dict, protect: Iterable[str] = (),
+                   newest: Optional[str] = None) -> List[str]:
     """Delete the oldest versions beyond the job's retention count.
 
     Returns the names actually removed. A version that cannot be deleted (a
@@ -319,9 +320,18 @@ def prune_versions(job: Dict, protect: Iterable[str] = ()) -> List[str]:
     deleted and do not count toward retention, so a held job keeps at most
     `retention` ordinary versions plus the protected ones. An empty `protect`
     is the plain retention prune.
+
+    `newest` is the version the calling run has just made: it is treated as
+    the newest whatever its name says. Names are local clock time, so in the
+    hour the clocks go back a later run can carry an EARLIER name; ordered by
+    name alone, a retention-1 job deleted the backup it had just made and
+    kept the older one.
     """
     keep = max(1, int(job.get("retention", DEFAULT_RETENTION)))
     names = version_names(job)
+    if newest in names:
+        names.remove(newest)
+        names.append(newest)
     protected = next((name for name in reversed(names)
                       if is_verified(job, name)), None)
     protect = set(protect)

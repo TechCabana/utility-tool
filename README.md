@@ -202,9 +202,9 @@ are skipped, not followed.
 started, for example `20261025-013000`. When the clocks go back in autumn, one hour happens
 twice. If a job ran once in each pass of that hour, and the second run's clock time is the
 earlier one, Safekeep sorts the two the wrong way round and treats the older as the newer:
-Restore picks it by default, and the clean-up that keeps only the last few versions can delete
-the newer one instead of the older. It needs two backups of one job inside that single hour, so
-it is rare. It is a known limit, accepted for now.
+Restore picks the older one by default, and a later run's clean-up removes the newer of the two
+first. A run never deletes the backup it has just made, whatever its name. It needs two backups
+of one job inside that single hour, so it is rare. It is a known limit, accepted for now.
 
 **What the check proves.** While it copies, Safekeep records a SHA-256 checksum of each file,
 taken from the bytes it actually read from the source. Before a new version is kept, the job's
@@ -425,6 +425,7 @@ utility-tool/
     ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder
     ├── test_backup_utils.py
     ├── test_activity.py
+    ├── test_clock_change.py
     ├── test_empty_job_list.py
     ├── test_fs_utils.py
     ├── test_interrupted_run.py

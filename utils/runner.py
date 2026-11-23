@@ -723,7 +723,7 @@ def _backup(job: Dict,
     held = is_sanity_drop(baseline, files)
     if not held:
         baseline = 0
-    pruned = prune_versions(job, protect={baseline_stamp} if held else ())
+    pruned = prune_versions(job, protect={baseline_stamp} if held else (), newest=stamp)
     if mode == "quick":
         message = (f"Backed up {files} file(s) to {final} and quick-checked "
                    f"{sampled} of {files} file(s) (sizes of all, hashes of a sample)")

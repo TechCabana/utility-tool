@@ -120,8 +120,8 @@ def prune_calls(monkeypatch):
     calls = []
     real = runner.prune_versions
     monkeypatch.setattr(runner, "prune_versions",
-                        lambda job, protect=(): calls.append((job["id"], set(protect)))
-                        or real(job, protect))
+                        lambda job, protect=(), **kw: calls.append((job["id"], set(protect)))
+                        or real(job, protect, **kw))
     return calls
 
 
