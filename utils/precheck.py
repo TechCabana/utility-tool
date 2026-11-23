@@ -19,6 +19,7 @@ Qt-free, like the rest of the engine. One-way dependencies: this module
 imports fs_utils, preflight and versions; only runner (and the UI / CLI) import
 it. Patch `utils.precheck.volume_info` / `._list_dir` / `._can_open` in tests.
 """
+import functools
 import os
 import time
 from datetime import datetime
@@ -112,6 +113,36 @@ SUGGESTIONS = {
     "source_unavailable": "Connect the drive the source folder is on, or edit the job.",
     "target_unavailable": "Connect the backup drive, or edit the job.",
 }
+
+
+@functools.lru_cache(maxsize=None)
+def _upcase(char: str) -> str:
+    """`char` upper-cased the way Windows compares file names.
+
+    Windows: ntdll's RtlUpcaseUnicodeChar, one UTF-16 unit to one, which is
+    what NTFS and FAT use. NOT `str.casefold()`/`upper()`: those map "ß" to
+    "ss" and fold "ς" with "σ", names NTFS keeps side by side (measured), so
+    "Straße.txt" beside "Strasse.txt" was reported as a collision that would
+    fail the backup. A character outside the BMP is two UTF-16 units Windows
+    leaves alone. Elsewhere (never reached today: no target filesystem is known
+    off Windows) a one-to-one `upper()`. Cached: names reuse few characters.
+    """
+    if ord(char) > 0xFFFF:
+        return char
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.RtlUpcaseUnicodeChar.restype = wintypes.WCHAR
+        ntdll.RtlUpcaseUnicodeChar.argtypes = (wintypes.WCHAR,)
+        return ntdll.RtlUpcaseUnicodeChar(char)
+    upper = char.upper()
+    return upper if len(upper) == 1 else char
+
+
+def _fold(name: str) -> str:
+    """The key under which a case-insensitive target files `name`."""
+    return "".join(_upcase(char) for char in name)
 
 
 def _units(text: str) -> int:
@@ -357,7 +388,7 @@ def precheck(job: Dict,
                 return report()
             path = os.path.join(current, name)
             rel = f"{rel_dir}/{name}" if rel_dir else name
-            folded = name.casefold()
+            folded = _fold(name)
             if limits["case_insensitive"] and folded in seen:
                 add(path, rel, "case_collision",
                     f'"{name}" and "{seen[folded]}" are in the same folder and '

@@ -290,6 +290,41 @@ def test_names_differing_only_by_case_collide_on_a_case_insensitive_target(
     assert kinds(precheck.precheck(job)) == [("case_collision", "report.TXT")]
 
 
+# Pairs that Python's casefold() calls equal but NTFS stores side by side
+# (measured), and pairs NTFS really treats as one name.
+CASE_PAIRS = [("Straße.txt", "Strasse.txt"), ("ﬁle.txt", "file.txt"), ("ı.txt", "I.txt"),
+              ("ς.txt", "σ.txt"), ("Ǆ.txt", "ǅ.txt"), ("Ab.txt", "aB.txt"),
+              ("é.txt", "É.txt"), ("ж.txt", "Ж.txt")]
+
+
+@windows_only
+@pytest.mark.parametrize("first, second", CASE_PAIRS)
+def test_a_case_collision_is_reported_exactly_when_ntfs_itself_says_so(
+        tmp_path, monkeypatch, fs, first, second):
+    """The case check must fold names the way Windows does, not as casefold().
+
+    casefold() maps "ß" to "ss", so "Straße.txt" and "Strasse.txt" were reported
+    as a collision that "would make the backup fail" (and `--precheck-job`
+    exited 5) although NTFS keeps both and the backup copies both. The answer
+    is taken from the real filesystem here: create one name, then try to
+    create the other in the same folder.
+    """
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    (probe / first).write_bytes(b"1")
+    try:
+        with open(probe / second, "xb"):
+            pass
+        ntfs_collides = False
+    except FileExistsError:
+        ntfs_collides = True
+    job = make_job(tmp_path, {})
+    fake_tree(monkeypatch, job["source"], {first: 1, second: 1})
+    fs("NTFS")
+    reported = [kind for kind, _rel in kinds(precheck.precheck(job))]
+    assert (reported == ["case_collision"]) is ntfs_collides, (first, second, reported)
+
+
 # --- unreadable ---------------------------------------------------------------------
 
 @windows_only
