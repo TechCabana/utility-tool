@@ -11,6 +11,7 @@
 
 [Overview](#overview) ·
 [Installation](#installation) ·
+[What a backup keeps](#what-a-backup-keeps-and-what-a-check-proves) ·
 [Architecture](#architecture) ·
 [Testing](#testing) ·
 [Contributing & Licence](#contributing--licence)
@@ -188,6 +189,61 @@ malware, just of an indie tool that hasn't paid for a certificate.
 
 ---
 
+## What a backup keeps, and what a check proves
+
+**What is copied.** Every ordinary file under the source folder, with its modified time. On
+Windows the hidden, system, archive and read-only marks are kept too, so a hidden file is still
+hidden after a restore. Two things are left out. Alternate data streams are not backed up: these
+are the extra data Windows can attach to a file, such as the "downloaded from the internet" mark
+(`Zone.Identifier`), so a restored file does not carry that mark. Symbolic links and junctions
+are skipped, not followed.
+
+**Version names use local time.** A version is named for the computer's clock when its backup
+started, for example `20261025-013000`. When the clocks go back in autumn, one hour happens
+twice. If a job ran once in each pass of that hour, and the second run's clock time is the
+earlier one, Safekeep sorts the two the wrong way round and treats the older as the newer:
+Restore picks it by default, and the clean-up that keeps only the last few versions can delete
+the newer one instead of the older. It needs two backups of one job inside that single hour, so
+it is rare. It is a known limit, accepted for now.
+
+**What the check proves.** While it copies, Safekeep records a SHA-256 checksum of each file,
+taken from the bytes it actually read from the source. Before a new version is kept, the job's
+Verification setting (under Advanced in the job form) decides how the copy is checked:
+
+- **Full** (the default) re-reads every copied file from the backup drive and compares its size
+  and checksum with the record, and confirms every file on the record is there.
+- **Quick** checks the size of every file and re-reads a sample (about 5%, at most 500 files,
+  always including the largest and the most recently changed one).
+- **Off** checks nothing. The version is kept but marked "not verified", and it never counts as
+  the last known-good copy.
+
+A failed check fails the run: nothing is pruned and earlier backups are left as they were. A
+passing Full check means every file that was copied is on the backup drive with the bytes
+Safekeep read. It does not mean:
+
+- **Every source file is in the backup.** A file that cannot be read, such as one another
+  program has locked, is tried once more at the end of the copy and then skipped. The job reads
+  "OK, N skipped" instead of "OK", and its Status tooltip gives the count and up to five names.
+  If more than 30% of the files (and at least three) could not be copied, the run fails instead.
+- **The source stood still.** Safekeep does not take a snapshot. A file that changes while it
+  is being copied is saved as Safekeep read it, and the check confirms the copy matches that
+  read, not that the file was in a consistent state at that moment.
+- **The backup stays intact.** The check runs once, right after the copy, and its re-read can
+  be answered from the computer's memory rather than the disk. Nothing re-checks stored versions
+  later, so bit rot on the backup drive goes unnoticed until you restore; a scheduled deeper
+  check is not built yet. A restore does compare each file it copies against the record and
+  names any that do not match.
+- **You can restore it.** Nothing yet restores a sample to prove a backup can be brought back;
+  a test restore is planned, not built.
+
+**An interrupted run is not resumed.** If the power goes or the program is killed part-way
+through a run, Safekeep does not pick the copy up where it stopped. The half-finished copy is
+never treated as a version, the job's Status reads "Interrupted: started ... and never
+finished", and the next run starts again from the beginning. A backup drive that is unplugged
+mid-run is a failed run instead, reported with its cause, and the next run likewise starts over.
+
+---
+
 ## Architecture
 
 ### Tools and technologies
@@ -332,7 +388,7 @@ skipped, nothing held".
 
 ```
 utility-tool/
-├── main.py               app entry point; window shell, sidebar, tab wiring, headless --run-backup-job path
+├── main.py               app entry point; window shell, sidebar, tab wiring, headless --run-backup-job / --precheck-job / --release-hold paths
 ├── requirements.txt      pinned dependencies (PySide6, pytest)
 ├── LICENSE                MIT
 ├── assets/
@@ -357,6 +413,7 @@ utility-tool/
 │   ├── copying.py          tree walk, hashing copy, copy_tree and its failure types
 │   ├── verify.py           full and quick checks of a finished copy
 │   ├── preflight.py        pre-run checks (source, target, same drive, space)
+│   ├── precheck.py         read-only check of every file the target cannot hold
 │   ├── runner.py           run_job and changes-since
 │   ├── runlog.py           per-job run log, one JSON line per run, newest 200 kept
 │   ├── scheduler.py        Windows Task Scheduler and macOS launchd registration
@@ -368,12 +425,20 @@ utility-tool/
     ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder
     ├── test_backup_utils.py
     ├── test_activity.py
+    ├── test_empty_job_list.py
     ├── test_fs_utils.py
+    ├── test_interrupted_run.py
     ├── test_jobs_file.py
+    ├── test_lock_start_time.py
     ├── test_locks.py
+    ├── test_long_paths.py
     ├── test_migrate.py
+    ├── test_precheck.py
     ├── test_preflight.py
+    ├── test_release_hold.py
     ├── test_restore_candidates.py
+    ├── test_restore_check.py
+    ├── test_retry_skipped.py
     ├── test_review_gate_batch2.py
     ├── test_runlog.py
     ├── test_sanity_guard.py
@@ -405,9 +470,9 @@ utility-tool/
 pytest tests/
 ```
 
-Covers the Qt-free layer only (`utils/backup_utils.py` and the modules it re-exports, `utils/runlog.py`, `utils/locks.py`, `utils/activity.py`,
+Covers the Qt-free layer only (`utils/backup_utils.py` and the modules it re-exports, `utils/precheck.py`, `utils/runlog.py`, `utils/locks.py`, `utils/activity.py`,
 `utils/fs_utils.py`, `utils/migrate.py` and the design tokens in `styles/tokens.py`), using real `tmp_path` files;
-the scheduler, free space and volume identity are injected rather than touched. 395 tests,
+the scheduler, free space and volume identity are injected rather than touched. Over 700 tests,
 all passing; the run takes over a minute, since several tests wait a second for a distinct version stamp. The Qt-driven `tabs/` layer (including the Backup screen's
 worker thread and UI) has no automated coverage and stays manually
 verified, per the [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps
