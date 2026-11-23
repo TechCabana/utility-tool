@@ -21,7 +21,7 @@ _SESSION_APPDATA = tempfile.mkdtemp(prefix="safekeep-tests-")
 os.environ["APPDATA"] = _SESSION_APPDATA
 atexit.register(shutil.rmtree, _SESSION_APPDATA, ignore_errors=True)
 
-from utils import jobs_store, runlog  # noqa: E402
+from utils import copying, jobs_store, runlog  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -42,3 +42,13 @@ def isolated_logs_dir(tmp_path_factory, monkeypatch):
     path = tmp_path_factory.mktemp("logs")
     monkeypatch.setattr(runlog, "_logs_dir", lambda: str(path))
     return path
+
+
+@pytest.fixture(autouse=True)
+def no_retry_pause(monkeypatch):
+    """Skip the half-second wait before the retry pass (utils/copying.py).
+
+    Tests that skip files would each sleep it; the ones that care about the
+    pass replace `copying._retry_pause` with a hook of their own instead.
+    """
+    monkeypatch.setattr(copying, "RETRY_PAUSE_SECONDS", 0)

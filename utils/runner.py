@@ -621,7 +621,8 @@ def _backup(job: Dict,
 
             files, copied_bytes, errors = copy_tree(
                 source, partial, on_progress=on_progress,
-                should_abort=should_abort, on_copied=record, stats=stats)
+                should_abort=should_abort, on_copied=record, stats=stats,
+                retry_skipped=True)
     except BackupAborted:
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": "Backup cancelled"}
@@ -734,6 +735,13 @@ def _backup(job: Dict,
     # `errors` has one entry per unreadable FOLDER, so count the files that
     # never landed against the count taken before the copy instead.
     not_copied = max(len(errors), stats.get("not_copied", 0))
+    # Card b5CfTkL8: files that could not be read at first and were copied by
+    # the one retry after the walk. They are in the backup, so they are in
+    # `files`, the manifest and the verification, and not in the skipped count.
+    retried = stats.get("retried", 0)
+    if retried:
+        message += (f". {retried} file(s) could not be read at first and were "
+                    "copied on the second try")
     if errors:
         message += (f". {not_copied} file(s) could not be read and were "
                     "skipped, so they are not in this backup")
@@ -744,7 +752,7 @@ def _backup(job: Dict,
         message += ("" if message.endswith(".") else ".") + f" Removed {len(pruned)} old version(s)"
     return {"ok": True, "message": message, "version": stamp, "files": files,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
-            "not_copied": not_copied,
+            "not_copied": not_copied, "retried": retried,
             "pruning_held": held, "baseline_files": baseline,
             "baseline_stamp": baseline_stamp if held else None,
             "verified": mode != "off", "verify_mode": mode, "manifest": manifest,

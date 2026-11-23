@@ -12,7 +12,10 @@ the one app-level log, `logs/app.jsonl`. Every line carries exactly `LINE_KEYS`:
 
     v, start, end, trigger, job, name, outcome, files, bytes, skipped,
     skipped_paths, skipped_more, pruned, version, verify_mode, cause, message,
-    pruning_held, offenders, baseline_files, baseline_stamp
+    pruning_held, offenders, baseline_files, baseline_stamp, retried
+
+`retried` (card b5CfTkL8) counts the files that could not be read at first and
+were copied by the one retry after the walk; they are in `files`, not `skipped`.
 
 `offenders` (card 104) lists, from the source root, the files a run that failed
 as "path_too_long" or "file_too_large" found the drive cannot hold (at most
@@ -69,7 +72,7 @@ OUTCOMES = ("ok", "ok_skipped", "ok_pruning_held", "failed", "cancelled", "busy"
 LINE_KEYS = ("v", "start", "end", "trigger", "job", "name", "outcome", "files",
              "bytes", "skipped", "skipped_paths", "skipped_more", "pruned",
              "version", "verify_mode", "cause", "message", "pruning_held",
-             "offenders", "baseline_files", "baseline_stamp")
+             "offenders", "baseline_files", "baseline_stamp", "retried")
 LOCK_TIMEOUT = 2.0
 
 
@@ -169,6 +172,7 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
                            if isinstance(result.get("baseline_stamp"), str)
                            and jobs_store._STAMP_RE.fullmatch(result["baseline_stamp"])
                            else None),
+        "retried": _count(result.get("retried")),
     }
 
 
