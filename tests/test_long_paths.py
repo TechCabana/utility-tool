@@ -385,3 +385,22 @@ def test_relative_to_keeps_trailing_dots_and_ignores_case():
     assert relative_to("C:\\Src\\dir.\\f.txt", "C:\\Src") == "dir.\\f.txt"
     assert relative_to("c:\\src\\a\\notes.", "C:\\SRC\\") == "a\\notes."
     assert relative_to("C:\\other\\f", "C:\\Src") == "..\\other\\f"   # not under root: relpath
+
+
+@windows_only
+@pytest.mark.parametrize("path, root, expected", [
+    ("E:\\notes.", "E:\\", "notes."),
+    ("E:\\dir.\\memo ", "e:\\", "dir.\\memo "),
+    ("E:\\notes.", "E:", "notes."),
+    ("\\\\srv\\share\\notes.", "\\\\srv\\share\\", "notes."),
+    ("\\\\srv\\share\\dir.\\f", "\\\\srv\\share", "dir.\\f"),
+])
+def test_relative_to_keeps_trailing_dots_under_a_drive_or_share_root(path, root, expected):
+    """A drive or share root normalises WITH its separator ("E:\\"), so the
+    prefix test must not add a second one. Missing that sent every path under
+    a root source to relpath, which strips the dot: the copy wrote "notes."
+    while the manifest said "notes", and verification failed every run of a
+    job whose source is a whole drive (seen for real through a `subst` drive).
+    """
+    from utils.fs_utils import relative_to
+    assert relative_to(path, root) == expected

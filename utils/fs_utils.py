@@ -109,10 +109,14 @@ def relative_to(path: str, root: str) -> str:
     in the manifest and the run log. The engine builds every path it measures
     as `os.path.join(root, ...)`, so a prefix cut is exact; a path that is not
     under `root` falls back to `relpath`.
+
+    A drive or share root keeps its separator when normalised ("E:\\",
+    "\\\\srv\\share\\", "/"), so the prefix gets one only if it lacks it.
     """
     norm_path, norm_root = os.path.normpath(path), os.path.normpath(root)
-    if os.path.normcase(norm_path).startswith(os.path.normcase(norm_root) + os.sep):
-        return norm_path[len(norm_root) + 1:]
+    prefix = norm_root if norm_root.endswith(os.sep) else norm_root + os.sep
+    if os.path.normcase(norm_path).startswith(os.path.normcase(prefix)):
+        return norm_path[len(prefix):]
     return os.path.relpath(path, root)
 
 
