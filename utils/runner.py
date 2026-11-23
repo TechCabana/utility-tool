@@ -15,9 +15,10 @@ import time
 from datetime import datetime
 from typing import Callable, Dict, Optional
 
-from utils import jobs_store, locks, runlog, verify
+from utils import jobs_store, locks, precheck, runlog, verify
 from utils.copying import (BackupAborted, SourceUnavailable, TargetWriteFailed,
                            _writing, copy_tree, walk_tree)
+from utils.fs_utils import long_path, plain_error
 from utils.jobs_store import job_verify_mode
 from utils.preflight import _preflight_and_sweep, target_volume
 from utils.verify import _quick_verify
@@ -65,12 +66,12 @@ def _claim_stamp(root: str, job: Dict) -> Optional[str]:
         stamp = datetime.now().strftime(VERSION_FORMAT)
         partial = os.path.join(root, stamp + ".partial")
         try:
-            os.mkdir(partial)
+            os.mkdir(long_path(partial))
         except FileExistsError:
             continue
-        if (os.path.exists(os.path.join(root, stamp))
-                or os.path.exists(manifest_path(job, stamp))):
-            os.rmdir(partial)
+        if (os.path.exists(long_path(os.path.join(root, stamp)))
+                or os.path.exists(long_path(manifest_path(job, stamp)))):
+            os.rmdir(long_path(partial))
             continue
         return stamp
     return None
@@ -196,6 +197,8 @@ def _locked_run(job: Dict,
     if lock.recovered is not None:
         who = (f"process {lock.recovered}" if lock.recovered > 0
                else "an earlier run")
+        if lock.recovered_reused:
+            who += ", whose id has since been reused by another process"
         message = result.get("message", "")
         if not message.endswith((".", "!")):
             message += "."
@@ -269,10 +272,10 @@ def _backup(job: Dict,
 
     root = job_root(job)
     try:
-        os.makedirs(root, exist_ok=True)
+        os.makedirs(long_path(root), exist_ok=True)
         stamp = _claim_stamp(root, job)
     except OSError as exc:
-        return {"ok": False, "message": f"Target folder is not writable: {exc}"}
+        return {"ok": False, "message": f"Target folder is not writable: {plain_error(exc)}"}
     if stamp is None:
         return {"ok": False, "message": (
             "Another backup of this job is starting at the same moment, so this "
@@ -290,7 +293,7 @@ def _backup(job: Dict,
         # is a target write failure like any other (a full drive refuses a
         # manifest line as readily as a data file) and is reported the same.
         with _writing(manifest_tmp):
-            out = open(manifest_tmp, "w", encoding="utf-8", newline="\n")
+            out = open(long_path(manifest_tmp), "w", encoding="utf-8", newline="\n")
         with out:
             with _writing(manifest_tmp):
                 out.write(json.dumps({"type": "header", "version": MANIFEST_VERSION,
@@ -321,8 +324,8 @@ def _backup(job: Dict,
         # the same: what was copied is a fraction of the tree and must never
         # be promoted, or it would prune the last complete backup.
         _discard(partial, manifest_tmp)
-        leftover = [p for p in (partial, manifest_tmp) if os.path.exists(p)]
-        if not os.path.isdir(root):
+        leftover = [p for p in (partial, manifest_tmp) if os.path.exists(long_path(p))]
+        if not os.path.isdir(long_path(root)):
             # The drive itself went away: "does not exist" here means "cannot
             # be seen", and the half-written copy is still on it.
             cleanup = ("the incomplete copy could not be removed because the "
@@ -331,12 +334,23 @@ def _backup(job: Dict,
             cleanup = "the incomplete copy could not be removed: " + ", ".join(leftover)
         else:
             cleanup = "the incomplete copy was removed"
-        return {"ok": False, "cause": exc.cause,
-                "message": (f"Backup failed: {exc}. Nothing was saved or pruned "
-                            f"and earlier backups are untouched; {cleanup}.")}
+        result = {"ok": False, "cause": exc.cause,
+                  "message": (f"Backup failed: {exc}. Nothing was saved or pruned "
+                              f"and earlier backups are untouched; {cleanup}.")}
+        if exc.cause in ("path_too_long", "file_too_large"):
+            # Card 104: name every file the drive cannot hold, not just the
+            # first one the copy tripped over, so the fix is one pass.
+            found = precheck.offenders(job, exc.cause,
+                                       getattr(exc, "path", ""), should_abort)
+            if found["paths"]:
+                more = f" and {found['more']} more" if found["more"] else ""
+                result["offenders"] = found["paths"]
+                result["message"] += (" Files the backup drive cannot hold: "
+                                      f"{', '.join(found['paths'])}{more}.")
+        return result
     except OSError as exc:
         _discard(partial, manifest_tmp)
-        return {"ok": False, "message": f"Backup failed: {exc}"}
+        return {"ok": False, "message": f"Backup failed: {plain_error(exc)}"}
 
     mode = job_verify_mode(job)
     sampled = 0
@@ -356,7 +370,7 @@ def _backup(job: Dict,
             _discard(partial, manifest_tmp)
             return {"ok": False, "message": "Backup cancelled"}
         except OSError as exc:
-            problem = f"its manifest could not be read back ({exc})"
+            problem = f"its manifest could not be read back ({plain_error(exc)})"
         else:
             if bad:
                 more = ", ..." if bad > len(named) else ""
@@ -374,21 +388,21 @@ def _backup(job: Dict,
                 "manifest": manifest_tmp, "files": files, "errors": errors}
 
     try:
-        with open(manifest_tmp, "a", encoding="utf-8", newline="\n") as out:
+        with open(long_path(manifest_tmp), "a", encoding="utf-8", newline="\n") as out:
             out.write(json.dumps({"type": "end", "files": files,
                                   "bytes": copied_bytes, "verify": mode,
                                   "verified": mode != "off"}) + "\n")
             out.flush()
             os.fsync(out.fileno())
-        os.replace(manifest_tmp, manifest)
-        os.replace(partial, final)
+        os.replace(long_path(manifest_tmp), long_path(manifest))
+        os.replace(long_path(partial), long_path(final))
     except OSError as exc:
         _discard(partial, manifest_tmp)
         try:
-            os.remove(manifest)
+            os.remove(long_path(manifest))
         except OSError:
             pass
-        return {"ok": False, "message": f"Could not finalise the backup: {exc}"}
+        return {"ok": False, "message": f"Could not finalise the backup: {plain_error(exc)}"}
 
     # Source sanity guard (card 51): a run that lost far more files than the
     # best retained version had still succeeds and its version is kept, and
@@ -452,7 +466,7 @@ def changes_since(job: Dict,
     matters.
     """
     source = job.get("source", "")
-    if not source or not os.path.isdir(source):
+    if not source or not os.path.isdir(long_path(source)):
         # `fixable` says the failure is one editing the job would resolve,
         # so the UI does not have to infer that from the message text. The
         # other two failures here are not: "never backed up" is a normal

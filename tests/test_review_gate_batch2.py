@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from utils import backup_utils, copying, jobs_store, locks, preflight, runner
+from utils.fs_utils import plain_path
 
 REPO = Path(__file__).resolve().parent.parent
 FILES = 30
@@ -238,7 +239,7 @@ def test_a_run_that_copies_nothing_never_becomes_the_newest_backup(tmp_path, mon
 
     def locked(path, mode="r", *args, **kwargs):
         """Every source file is held open by another program."""
-        if mode == "rb" and os.path.normcase(str(path)).startswith(source_root):
+        if mode == "rb" and os.path.normcase(plain_path(str(path))).startswith(source_root):
             raise PermissionError(errno.EACCES, "Permission denied", str(path))
         return real_open(path, mode, *args, **kwargs)
 

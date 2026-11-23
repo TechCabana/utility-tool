@@ -21,6 +21,8 @@ tests/test_backup_utils.py; loading it with `launchctl` is not. A failure
 there reports the real error rather than claiming success, which is the most
 that can honestly be promised until someone runs it.
 """
+import csv
+import io
 import os
 import subprocess
 import sys
@@ -286,6 +288,45 @@ def task_exists(job_id: str, legacy: bool = False) -> bool:
         return _launchd_exists(job_id, legacy)
     ok, _ = _run(["schtasks", "/query", "/tn", task_name(job_id, legacy)])
     return ok
+
+
+def list_scheduled_tasks() -> Tuple[List[str], str]:
+    """Every OS scheduler entry this app owns, as `(names, error)`.
+
+    Matched by naming prefix (current and pre-rename), so it works when the
+    jobs file is unreadable and the job ids are unknown. Read-only: nothing is
+    created, changed or removed. Never raises -- if the scheduler cannot be
+    asked, `names` is empty and `error` says why ("" otherwise), so a caller
+    can tell "none" from "could not list".
+
+    The macOS branch lists the LaunchAgents plists and has never been run on a
+    Mac.
+    """
+    if sys.platform == "darwin":
+        folder = os.path.dirname(launchd_plist_path("x"))
+        try:
+            files = sorted(os.listdir(folder))
+        except FileNotFoundError:
+            return [], ""   # no LaunchAgents folder, so no agents
+        except OSError as exc:
+            return [], f"Could not list scheduled tasks: {exc}"
+        return [name[:-len(".plist")] for name in files
+                if name.endswith(".plist")
+                and name.startswith((LAUNCHD_PREFIX, LEGACY_LAUNCHD_PREFIX))], ""
+    ok, output = _run(["schtasks", "/query", "/fo", "csv", "/nh"])
+    if not ok:
+        return [], f"Could not list scheduled tasks: {output or 'schtasks failed.'}"
+    names = []
+    try:
+        for row in csv.reader(io.StringIO(output)):
+            # First column is the full task path, e.g. "\Safekeep_Backup_ab12cd34";
+            # the same task can be listed once per trigger, so de-duplicate.
+            name = row[0].lstrip("\\") if row else ""
+            if name.startswith((TASK_PREFIX, LEGACY_TASK_PREFIX)) and name not in names:
+                names.append(name)
+    except csv.Error as exc:
+        return [], f"Could not list scheduled tasks: {exc}"
+    return names, ""
 
 
 def scheduler_name() -> str:

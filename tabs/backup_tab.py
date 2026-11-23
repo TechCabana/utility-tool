@@ -15,7 +15,7 @@ from typing import List, Optional
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
 
-from utils import backup_utils
+from utils import backup_utils, precheck
 from utils.fs_utils import human_size
 from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
                             add_field, divider, icon_button, section,
@@ -282,6 +282,160 @@ class BackupJobDialog(QtWidgets.QDialog):
                              "retention": self.retention.value(),
                              "target_volume": volume, "verify": verify})
         self.accept()
+
+
+class PrecheckDialog(QtWidgets.QDialog):
+    """The pre-check's report (card 104): one row per problem, each with what
+    is wrong, the fix, and an "Open folder" button for the folder holding it.
+
+    Two shapes. After a job is added or edited it only informs (`run_text`
+    empty: one Close button). Before Back up now it asks: "Back up anyway" and
+    Cancel, and `exec()` is Accepted only for "Back up anyway" -- a pre-check
+    never blocks a backup by itself, the run's own failure handling stays
+    authoritative. Colours come from the sheet through existing objectNames
+    only (StatusError for what would fail the run, StatusWarn for what would
+    be skipped); every control is a focusable QPushButton.
+    """
+
+    # Rows built in full; the rest are counted. Widgets per row are cheap, but
+    # a report of thousands would make the dialog slow to open.
+    ROWS_MAX = 50
+
+    # How a folder is opened; tests replace it so no file manager starts.
+    open_url = staticmethod(QtGui.QDesktopServices.openUrl)
+
+    def __init__(self, parent, job: dict, report: dict, run_text: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Pre-check")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.folder_buttons: List[QtWidgets.QPushButton] = []
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("Card")
+        outer.addWidget(panel)
+        body = QtWidgets.QVBoxLayout(panel)
+        body.setSpacing(10)
+
+        total = sum(report.get("counts", {}).values())
+        blocking = report.get("blocking", 0)
+        heading = QtWidgets.QLabel(
+            f"\"{job.get('name')}\": {total} file(s) need attention")
+        heading.setObjectName("H2")
+        heading.setWordWrap(True)
+        body.addWidget(heading)
+
+        if blocking:
+            lede = (f"{blocking} of them would make the backup fail. Fix them, "
+                    "then back up.")
+        else:
+            lede = ("None of them would make the backup fail, but they would "
+                    "not be in it.")
+        lede += (f" Checked {report.get('scanned', 0)} file(s) against the backup "
+                 f"drive ({report.get('fs', 'unknown')}); nothing was written.")
+        summary = QtWidgets.QLabel(lede)
+        summary.setObjectName("Hint")
+        summary.setWordWrap(True)
+        body.addWidget(summary)
+
+        rows = QtWidgets.QWidget()
+        rows.setObjectName("CardBody")
+        rows_layout = QtWidgets.QVBoxLayout(rows)
+        rows_layout.setContentsMargins(0, 0, 0, 0)
+        rows_layout.setSpacing(8)
+        problems = report.get("problems", [])
+        for index, problem in enumerate(problems[:self.ROWS_MAX]):
+            if index:
+                rows_layout.addWidget(divider())
+            rows_layout.addWidget(self._row(problem))
+        hidden = len(problems[self.ROWS_MAX:]) + report.get("problems_more", 0)
+        if hidden:
+            more = QtWidgets.QLabel(f"... and {hidden} more.")
+            more.setObjectName("Hint")
+            rows_layout.addWidget(more)
+        rows_layout.addStretch(1)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setAccessibleName("Pre-check problems")
+        scroll.setMinimumHeight(160)
+        scroll.setMaximumHeight(380)
+        scroll.setWidget(rows)
+        body.addWidget(scroll, 1)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch(1)
+        if run_text:
+            cancel = QtWidgets.QPushButton("Cancel")
+            cancel.setObjectName("Secondary")
+            cancel.clicked.connect(self.reject)
+            buttons.addWidget(cancel)
+            confirm = QtWidgets.QPushButton(run_text)
+            confirm.setObjectName("Primary")
+            confirm.clicked.connect(self.accept)
+            buttons.addWidget(confirm)
+            # Enter must not start a backup the user has not read about: the
+            # safe choice holds the focus, as in ConfirmDialog.
+            self.confirm_button, self.close_button = confirm, cancel
+        else:
+            close = QtWidgets.QPushButton("Close")
+            close.setObjectName("Primary")
+            close.clicked.connect(self.accept)
+            buttons.addWidget(close)
+            self.confirm_button, self.close_button = None, close
+        self.close_button.setDefault(True)
+        body.addLayout(buttons)
+        self.close_button.setFocus()
+
+    def _row(self, problem: dict) -> QtWidgets.QWidget:
+        """One problem: kind and path, what is wrong and the fix, Open folder."""
+        row = QtWidgets.QWidget()
+        row.setObjectName("CardBody")
+        grid = QtWidgets.QGridLayout(row)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+
+        label = precheck.KIND_LABELS.get(problem["kind"], problem["kind"])
+        kind = QtWidgets.QLabel(label if problem.get("blocking")
+                                else f"{label} - will be skipped")
+        kind.setObjectName("StatusError" if problem.get("blocking") else "StatusWarn")
+        grid.addWidget(kind, 0, 0)
+
+        path = ElidedLabel(problem["path"])
+        path.setObjectName("Data")
+        grid.addWidget(path, 1, 0)
+
+        text = QtWidgets.QLabel(f"{problem['detail']} {problem['suggestion']}")
+        text.setObjectName("Hint")
+        text.setWordWrap(True)
+        grid.addWidget(text, 2, 0)
+
+        folder = self._folder_of(problem)
+        button = QtWidgets.QPushButton("Open folder")
+        button.setObjectName("Secondary")
+        button.setAccessibleName(f"Open the folder holding {os.path.basename(problem['path'])}")
+        button.setToolTip(folder or "The folder is not available")
+        button.setEnabled(bool(folder))
+        button.clicked.connect(lambda _checked=False, f=folder: self.open_url(
+            QtCore.QUrl.fromLocalFile(f)))
+        grid.addWidget(button, 0, 1, 3, 1, Qt.AlignTop)
+        grid.setColumnStretch(0, 1)
+        self.folder_buttons.append(button)
+        return row
+
+    @staticmethod
+    def _folder_of(problem: dict) -> str:
+        """The folder to open for a problem: the one holding the offender (the
+        source folder itself for a missing source or target); "" if gone."""
+        path = problem["path"]
+        folder = path if problem["kind"] in ("source_unavailable",
+                                             "target_unavailable") else os.path.dirname(path)
+        return folder if folder and os.path.isdir(folder) else ""
 
 
 # The Backup tables' columns, defined once as (label, stretch, minimum width)
@@ -789,10 +943,23 @@ class BackupTab(QtWidgets.QWidget):
             hint="Your jobs could not be read, so nothing has been changed or "
                  "run. Restoring brings back the last good copy, which may "
                  "not include your most recent edit; the damaged file is "
-                 "kept beside it, not deleted.",
+                 "kept beside it, not deleted. With no backup copy, start "
+                 "with an empty list instead: the damaged file is kept aside "
+                 "under a new name.",
             cta_text="Restore from backup copy",
         )
         self.jobs_damaged.cta.clicked.connect(self.restore_jobs_file)
+        # The way out when there is no usable backup copy (card OsE7AgPP):
+        # offered only then, and behind a confirmation.
+        self.start_empty_btn = QtWidgets.QPushButton("Start with an empty list")
+        self.start_empty_btn.setObjectName("Secondary")
+        self.start_empty_btn.setVisible(False)
+        self.start_empty_btn.clicked.connect(self.start_with_empty_list)
+        empty_row = QtWidgets.QHBoxLayout()
+        empty_row.addStretch(1)
+        empty_row.addWidget(self.start_empty_btn)
+        empty_row.addStretch(1)
+        self.jobs_damaged.layout().addLayout(empty_row)
         self.jobs_damaged.setVisible(False)
         jv.addWidget(self.jobs_damaged)
 
@@ -806,6 +973,17 @@ class BackupTab(QtWidgets.QWidget):
         self.backup_status.setWordWrap(True)
         self.backup_status.setVisible(False)
         jv.addWidget(self.backup_status)
+
+        # Shown by start_with_empty_list() beside its notice, which names the
+        # folder the damaged file was kept in.
+        self.open_kept_btn = QtWidgets.QPushButton("Open folder")
+        self.open_kept_btn.setObjectName("Secondary")
+        self.open_kept_btn.setVisible(False)
+        self.open_kept_btn.clicked.connect(self._open_kept_folder)
+        kept_row = QtWidgets.QHBoxLayout()
+        kept_row.addWidget(self.open_kept_btn)
+        kept_row.addStretch(1)
+        jv.addLayout(kept_row)
 
         # --- restore ------------------------------------------------------
         # Same surface, second section. `rv` stays a separate name so the two
@@ -908,6 +1086,7 @@ class BackupTab(QtWidgets.QWidget):
             return
         self._jobs_damaged = False
         self.jobs_damaged.setVisible(False)
+        self.start_empty_btn.setVisible(False)
         self._clear_layout(self.jobs_layout)
         self._clear_layout(self.restore_layout)
 
@@ -948,6 +1127,7 @@ class BackupTab(QtWidgets.QWidget):
                        self.restore_empty, self.restore_header):
             widget.setVisible(False)
         self.jobs_damaged.setVisible(True)
+        self.start_empty_btn.setVisible(not exc.has_backup)
         self._set_backup_controls(enabled=self.backup_thread is None)
         self._say(str(exc), ok=False)
 
@@ -970,6 +1150,67 @@ class BackupTab(QtWidgets.QWidget):
             self._backup_notice = ""
             self._say(message)
 
+    # How a folder is opened; tests replace it so no file manager starts.
+    open_url = staticmethod(QtGui.QDesktopServices.openUrl)
+
+    def _left_behind_text(self) -> str:
+        """The OS scheduler entries this app owns, in words (read-only).
+
+        With the jobs file unreadable the lost job ids are unknown, so this
+        lists every entry by the app's naming prefix. A failure to ask the
+        scheduler says so rather than claiming there are none.
+        """
+        names, error = backup_utils.list_scheduled_tasks()
+        where = backup_utils.scheduler_name()
+        if error:
+            return f"{error} Check {where} yourself for tasks left behind."
+        if not names:
+            return f"{where} holds no Safekeep tasks."
+        return (f"Scheduled tasks currently in {where} (they are not removed, "
+                "and no longer find their job, so they back nothing up): "
+                + ", ".join(names) + ".")
+
+    def start_with_empty_list(self):
+        """Confirm, then set the damaged jobs file aside and start empty.
+
+        Only for a damaged file with no usable backup copy. The file is
+        renamed to a `.corrupt-` name, never deleted; scheduled tasks are only
+        listed, never touched.
+        """
+        if self.backup_thread is not None or not self._jobs_damaged or self._can_restore_jobs:
+            return
+        left = self._left_behind_text()
+        choice = ConfirmDialog.choose(
+            self,
+            "Start with an empty job list?",
+            f"Your jobs could not be read and there is no backup copy. The "
+            f"damaged file is not deleted: it is renamed to "
+            f"{backup_utils.JOBS_FILENAME}.corrupt-<date and time> in the "
+            "same folder, so it can still be recovered by hand. Then you can "
+            "add jobs again. Backups already written to your target folders "
+            f"are not touched.\n\n{left}",
+            confirm_text="Start with an empty list",
+        )
+        if choice != "confirm":
+            return
+        try:
+            kept = backup_utils.quarantine_jobs_file()
+        except (backup_utils.QuarantineRefused, OSError) as exc:
+            self.refresh_backup()
+            self._say(f"{exc} Nothing was changed.", ok=False)
+            return
+        self._kept_folder = os.path.dirname(kept)
+        self.refresh_backup()   # no jobs file now: the normal empty state
+        self._say(f"Started with an empty job list. The damaged file was kept "
+                  f"as '{os.path.basename(kept)}' in {self._kept_folder}. {left}")
+        self.open_kept_btn.setVisible(True)
+
+    def _open_kept_folder(self):
+        """Open the folder holding the kept-aside damaged jobs file."""
+        folder = getattr(self, "_kept_folder", "")
+        if folder:
+            self.open_url(QtCore.QUrl.fromLocalFile(folder))
+
     def _clear_layout(self, layout: QtWidgets.QLayout):
         while layout.count():
             item = layout.takeAt(0)
@@ -990,6 +1231,7 @@ class BackupTab(QtWidgets.QWidget):
         self.job_add_btn.setEnabled(enabled and not self._jobs_damaged)
         self.restore_refresh_btn.setEnabled(enabled)
         self.jobs_damaged.cta.setEnabled(enabled and self._can_restore_jobs)
+        self.start_empty_btn.setEnabled(enabled)
         if enabled:
             return
         for host in (self.jobs_host, self.restore_host):
@@ -997,6 +1239,7 @@ class BackupTab(QtWidgets.QWidget):
                 button.setEnabled(False)
 
     def _say(self, message: str, ok: bool = True, warn: bool = False):
+        self.open_kept_btn.setVisible(False)   # belongs to its own notice only
         self.backup_status.setObjectName(
             "StatusError" if not ok else "StatusWarn" if warn else "Hint")
         # An objectName change after the sheet was applied needs the style
@@ -1045,7 +1288,12 @@ class BackupTab(QtWidgets.QWidget):
             message += f" It could not be scheduled: {detail}"
         self._say(message, ok=ok or job.get("schedule") == "manual")
         self.refresh_backup()
-        self.refresh_changes()
+        # Card 104: check the job against its drive before its first night.
+        # The save line rides across the check and the remeasure after it
+        # (`_backup_notice`); a clean tree adds no dialog.
+        self._backup_notice = message
+        self._backup_notice_warn = not (ok or job.get("schedule") == "manual")
+        self._precheck(job, lambda _report: self.refresh_changes())
 
     def remove_backup_job(self, job: dict):
         """Confirm, then drop the job and its scheduled task together.
@@ -1096,7 +1344,51 @@ class BackupTab(QtWidgets.QWidget):
             )
         self.refresh_backup()
 
+    def _precheck(self, job: dict, then, run_text: str = ""):
+        """Pre-check `job` off the UI thread, record it, then call `then(report)`.
+
+        Clean: `then` runs at once, with no dialog. Problems: the report dialog
+        opens first; with `run_text` it asks (Cancel or `run_text`) and `then`
+        runs only if the user goes ahead, without it it only informs. A check
+        that could not run at all says so and carries on: it never stands
+        between the user and a backup.
+        """
+        if self.backup_thread is not None:
+            return
+        self._start_backup(
+            f"Checking \"{job.get('name')}\" against its backup drive...",
+            # No file total exists before the walk, so the bar stays
+            # indeterminate and no per-file progress signal is sent.
+            lambda _progress, abort, _phase: precheck.precheck(job, None, abort),
+            lambda report: self._finish_precheck(job, report, then, run_text))
+
+    def _finish_precheck(self, job: dict, report: dict, then, run_text: str):
+        """Record the pre-check, show its report if it found anything, go on."""
+        if "scanned" not in report:   # the worker caught an unexpected error
+            self._say(f"The pre-check could not run: {report.get('message', '')}",
+                      warn=True)
+            then(report)
+            return
+        if report.get("aborted"):
+            return   # the app is closing
+        try:
+            backup_utils.record_precheck(job["id"], precheck.summary(report))
+        except (backup_utils.JobsFileCorrupt, OSError):
+            pass   # the report is still shown; only the stored copy is stale
+        if report["problems"]:
+            dialog = PrecheckDialog(self, job, report, run_text)
+            if dialog.exec() != QtWidgets.QDialog.Accepted and run_text:
+                self._say(f"Backup of \"{job.get('name')}\" not started.")
+                return
+        then(report)
+
     def run_backup_job(self, job: dict):
+        """Back up now: pre-check first, then the run (card 104)."""
+        self._precheck(job, lambda _report: self._start_run(job),
+                       run_text="Back up anyway")
+
+    def _start_run(self, job: dict):
+        """Take the backup itself on the worker thread."""
         if self.backup_thread is not None:
             return
         self._start_backup(
@@ -1164,9 +1456,21 @@ class BackupTab(QtWidgets.QWidget):
             f"Restoring \"{job.get('name')}\" from {version}...",
             lambda progress, abort, _phase: backup_utils.restore_version(
                 job, version, destination, progress, abort),
-            lambda result: self._say(result.get("message", ""),
-                                     ok=result.get("ok", False)),
+            self._finish_restore,
         )
+
+    def _finish_restore(self, result: dict):
+        """Show how a restore went, in warning style when its check found a problem.
+
+        `ok` means the files were copied. A file that did not match the backup
+        (or was not on its checksum list, or was missing from it) is a warning
+        on a successful restore, not a failure: the copy is there and the
+        message names what to look at. "Could not be checked" is plain news.
+        """
+        problem = bool(result.get("mismatched") or result.get("not_in_manifest")
+                       or result.get("missing_from_version"))
+        self._say(result.get("message", ""), ok=result.get("ok", False),
+                  warn=bool(result.get("ok") and problem))
 
     def refresh_changes(self):
         """Measure every job's drift since its last backup, off the UI thread.

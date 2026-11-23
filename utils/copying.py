@@ -14,7 +14,7 @@ import shutil
 import stat
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from utils.fs_utils import _is_link_like
+from utils.fs_utils import _is_link_like, long_path, plain_error, relative_to
 
 
 class BackupAborted(Exception):
@@ -66,10 +66,14 @@ class TargetWriteFailed(Exception):
         self.path, self.error = path, error
         cause = (_WINERROR_CAUSES.get(getattr(error, "winerror", None))
                  or _ERRNO_CAUSES.get(error.errno) or "target_write_failed")
-        # ponytail: Windows' C runtime reports a path over MAX_PATH as a plain
-        # ENOENT, so length decides. Mislabels a vanished drive at a >=260
-        # path when long paths are enabled; the run still fails either way.
-        if cause == "target_unavailable" and os.name == "nt" and len(path) >= 260:
+        # ponytail: Windows reports a path it cannot hold as a plain ENOENT
+        # near 32,767 characters even in the extended-length form every engine
+        # call now uses (measured: a folder from ~32,762, a file at 32,767), so
+        # length decides there. Not at MAX_PATH any more: a 300-character path
+        # is writable, so ENOENT on one means the drive went away, and calling
+        # it "too long" listed innocent files as offenders. Mislabels a drive
+        # that vanished at a >=32,000 path; the run still fails either way.
+        if cause == "target_unavailable" and os.name == "nt" and len(path) >= 32_000:
             cause = "path_too_long"
         self.cause = cause
         super().__init__(self.reason("backup drive"))
@@ -140,7 +144,7 @@ class SourceUnavailable(Exception):
 def _source_gone(source: str) -> bool:
     """True if `source` can no longer be listed (gone, moved, unplugged)."""
     try:
-        with os.scandir(source):
+        with os.scandir(long_path(source)):
             return False
     except OSError:
         return True
@@ -161,16 +165,19 @@ def _iter_tree(root: str) -> Iterator[Optional[Tuple[str, int, float]]]:
     while stack:
         current = stack.pop()
         try:
-            with os.scandir(current) as entries:
+            with os.scandir(long_path(current)) as entries:
                 for entry in entries:
                     try:
+                        # entry.path is in long_path's form; the walk keeps
+                        # its own plain path so relative paths are unchanged.
+                        path = os.path.join(current, entry.name)
                         if _is_link_like(entry):
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
+                            stack.append(path)
                             continue
                         stat = entry.stat(follow_symlinks=False)
-                        rel = os.path.relpath(entry.path, root).replace("\\", "/")
+                        rel = relative_to(path, root).replace("\\", "/")
                         yield rel, stat.st_size, stat.st_mtime
                     except OSError:
                         yield None
@@ -272,16 +279,19 @@ def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
     Errors are classified where they happen: failing to open or read `src`
     raises the OSError (the caller skips that file); failing to create,
     write, close or stamp `dst` raises TargetWriteFailed (the caller fails
-    the whole copy).
+    the whole copy). Both are plain paths; the OS calls use `long_path`.
     """
     digest = hashlib.sha256()
     size = 0
     read_error = None
-    with open(src, "rb") as fsrc:
+    lsrc = long_path(src)
+    with open(lsrc, "rb") as fsrc:
         mtime = os.fstat(fsrc.fileno()).st_mtime
+        with _writing(dst):
+            ldst = long_path(dst)  # past Windows' limit: a target failure
         try:
             with _writing(dst):
-                with _open_for_write(dst) as fdst:
+                with _open_for_write(ldst) as fdst:
                     while True:
                         try:
                             chunk = fsrc.read(CHUNK)
@@ -296,15 +306,15 @@ def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
             if read_error is not None:
                 raise read_error
             try:
-                shutil.copystat(src, dst)
+                shutil.copystat(lsrc, ldst)
             except OSError as exc:
-                if exc.filename == src:
+                if exc.filename == lsrc:
                     raise  # stat of the source failed: a skip, not the target's
                 raise TargetWriteFailed(dst, exc) from exc
-            _copy_windows_attributes(src, dst)
+            _copy_windows_attributes(lsrc, ldst)
         except BaseException:
             try:
-                os.remove(dst)
+                os.remove(ldst)
             except OSError:
                 pass
             raise
@@ -370,11 +380,11 @@ def copy_tree(source: str, destination: str,
         size, mtime, sha = _hash_copy(src, dst)
         if on_copied is not None:
             try:
-                on_copied(os.path.relpath(src, source).replace("\\", "/"),
+                on_copied(relative_to(src, source).replace("\\", "/"),
                           size, mtime, sha)
             except BaseException:
                 try:
-                    os.remove(dst)
+                    os.remove(long_path(dst))
                 except OSError:
                     pass
                 raise
@@ -385,19 +395,21 @@ def copy_tree(source: str, destination: str,
 
     def copy_dir(src_dir: str, dst_dir: str) -> None:
         """Copy one folder, depth first. OSError if `src_dir` is unreadable."""
-        with os.scandir(src_dir) as listing:
+        with os.scandir(long_path(src_dir)) as listing:
             entries = list(listing)
         with _writing(dst_dir):
-            os.makedirs(dst_dir, exist_ok=True)
+            os.makedirs(long_path(dst_dir), exist_ok=True)
         for entry in entries:
+            # Plain paths throughout; entry.path is in long_path's form.
+            src = os.path.join(src_dir, entry.name)
             dst = os.path.join(dst_dir, entry.name)
             try:
                 if _is_link_like(entry):
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    copy_dir(entry.path, dst)
+                    copy_dir(src, dst)
                 else:
-                    copy_one(entry.path, dst)
+                    copy_one(src, dst)
             except OSError as exc:
                 # Source-side failures land here; the destination's are
                 # TargetWriteFailed and pass straight up. A full drive or an
@@ -410,10 +422,10 @@ def copy_tree(source: str, destination: str,
                 # Path from the source root (forward slashes, as in the
                 # manifest) so the run log says WHICH file; the "<path>: <error>"
                 # shape is relied on by record_run and runlog.
-                rel = os.path.relpath(entry.path, source).replace("\\", "/")
-                errors.append(f"{rel}: {exc}")
+                rel = relative_to(src, source).replace("\\", "/")
+                errors.append(f"{rel}: {plain_error(exc)}")
         try:
-            shutil.copystat(src_dir, dst_dir)
+            shutil.copystat(long_path(src_dir), long_path(dst_dir))
         except OSError:
             pass  # folder times are cosmetic: changes-since compares files only
 

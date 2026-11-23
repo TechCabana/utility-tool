@@ -12,7 +12,11 @@ the one app-level log, `logs/app.jsonl`. Every line carries exactly `LINE_KEYS`:
 
     v, start, end, trigger, job, name, outcome, files, bytes, skipped,
     skipped_paths, skipped_more, pruned, version, verify_mode, cause, message,
-    pruning_held
+    pruning_held, offenders
+
+`offenders` (card 104) lists, from the source root, the files a run that failed
+as "path_too_long" or "file_too_large" found the drive cannot hold (at most
+`SKIPPED_PATHS_MAX`); it is empty otherwise.
 
 `outcome` is one of `OUTCOMES`. PATHS AND COUNTS ONLY, never file contents or
 OS error text beyond what a result's own message already carries. The line is
@@ -50,7 +54,8 @@ APP_LOG_NAME = "app"
 OUTCOMES = ("ok", "ok_skipped", "ok_pruning_held", "failed", "cancelled", "busy")
 LINE_KEYS = ("v", "start", "end", "trigger", "job", "name", "outcome", "files",
              "bytes", "skipped", "skipped_paths", "skipped_more", "pruned",
-             "version", "verify_mode", "cause", "message", "pruning_held")
+             "version", "verify_mode", "cause", "message", "pruning_held",
+             "offenders")
 LOCK_TIMEOUT = 2.0
 
 
@@ -135,6 +140,11 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
         "cause": _text(result.get("cause")),
         "message": str(result.get("message", ""))[:MESSAGE_MAX],
         "pruning_held": result.get("pruning_held") is True,
+        # Paths only, from the source root; anything that is not a string is
+        # dropped rather than logged.
+        "offenders": [p for p in (result.get("offenders") or [])
+                      if isinstance(p, str)][:SKIPPED_PATHS_MAX]
+        if isinstance(result.get("offenders"), list) else [],
     }
 
 

@@ -4,10 +4,12 @@
 What is left of the old `utils/presets.py` and `utils/disk_utils.py` once the
 image, rename and disk-cleanup tools were removed: the OS app-data directory
 every stored file lives in, the one symlink/junction predicate the backup walk
-relies on, and byte formatting for the Restore table.
+relies on, the extended-length path form every engine filesystem call goes
+through (`long_path`), and byte formatting for the Restore table.
 
 Qt-free by design (CLAUDE.md §3/§8) -- plain paths in, plain values out.
 """
+import errno
 import os
 import sys
 
@@ -48,6 +50,100 @@ def app_dir_for(name: str) -> str:
     if os.name == "nt":
         return os.path.join(os.getenv("APPDATA") or os.path.expanduser("~\\AppData\\Roaming"), name)
     return os.path.join(os.path.expanduser("~/.config"), name)
+
+
+# Windows' extended-length path limit, in characters, prefix included. Python
+# itself refuses a longer path with a ValueError, which is not an OSError and
+# would escape every per-file handler in the engine.
+_MAX_EXTENDED = 32767
+_EXTENDED = "\\\\?\\"
+_EXTENDED_UNC = "\\\\?\\UNC\\"
+
+
+def long_path(path: str) -> str:
+    """`path` in Windows' extended-length form, for the OS call itself only.
+
+    A version lives at `<target>\\<job id>\\<stamp>.partial\\...`, so every
+    copied file's path is ~35 characters longer than its source's. Without
+    the `\\\\?\\` prefix, whether a path past 260 characters (MAX_PATH) can be
+    opened depends on the machine's LongPathsEnabled policy, which is off by
+    default -- so a deep file was silently impossible to back up on most PCs.
+
+    The prefix also switches OFF Win32's normalisation, so the path is made
+    absolute and normalised first (`..`, forward slashes, a trailing
+    separator); a UNC path `\\\\server\\share` becomes `\\\\?\\UNC\\server\\share`.
+    An already-prefixed path is returned unchanged. A no-op off Windows.
+
+    Use the result only as the argument of the filesystem call; anything
+    shown, stored or logged keeps the plain path (`plain_path` undoes this).
+    Raises OSError(ENAMETOOLONG) past Windows' 32,767-character limit, so a
+    caller's OSError handling classifies it rather than crashing.
+    """
+    if os.name != "nt" or not path:
+        return path
+    path = os.fspath(path)
+    slashed = path.replace("/", "\\")
+    if slashed.startswith((_EXTENDED, "\\\\.\\")):
+        # Already extended (or a device path): left as is, bar the slashes,
+        # which this form would read as part of a name.
+        extended = slashed
+    else:
+        # normpath(join(cwd, path)), not abspath: on Windows abspath calls
+        # GetFullPathName, which silently strips trailing dots and spaces, so
+        # a file named "notes." would be opened as "notes" and never found.
+        full = os.path.normpath(os.path.join(os.getcwd(), path))
+        extended = (_EXTENDED_UNC + full[2:] if full.startswith("\\\\")
+                    else _EXTENDED + full)
+    if len(extended) > _MAX_EXTENDED:
+        raise OSError(errno.ENAMETOOLONG,
+                      f"Path is longer than Windows' limit of {_MAX_EXTENDED} characters",
+                      path)
+    return extended
+
+
+def relative_to(path: str, root: str) -> str:
+    """`path` relative to `root`, by string prefix, never touching the filesystem.
+
+    `os.path.relpath` calls abspath, which on Windows strips trailing dots and
+    spaces from every component, so a file named "notes." came out as "notes"
+    in the manifest and the run log. The engine builds every path it measures
+    as `os.path.join(root, ...)`, so a prefix cut is exact; a path that is not
+    under `root` falls back to `relpath`.
+
+    A drive or share root keeps its separator when normalised ("E:\\",
+    "\\\\srv\\share\\", "/"), so the prefix gets one only if it lacks it.
+    """
+    norm_path, norm_root = os.path.normpath(path), os.path.normpath(root)
+    prefix = norm_root if norm_root.endswith(os.sep) else norm_root + os.sep
+    if os.path.normcase(norm_path).startswith(os.path.normcase(prefix)):
+        return norm_path[len(prefix):]
+    return os.path.relpath(path, root)
+
+
+def plain_path(path):
+    """Undo `long_path`: the ordinary form of an extended-length path.
+
+    Anything else (a plain path, None, bytes) is returned unchanged.
+    """
+    if not isinstance(path, str):
+        return path
+    if path.startswith(_EXTENDED_UNC):
+        return "\\\\" + path[len(_EXTENDED_UNC):]
+    if path.startswith(_EXTENDED):
+        return path[len(_EXTENDED):]
+    return path
+
+
+def plain_error(exc: OSError) -> OSError:
+    """`exc` with any extended-length file names put back in plain form.
+
+    An OSError names the path it was called with, so one raised by a call
+    made through `long_path` would show `\\\\?\\C:\\...` in a message the user
+    reads. Edits `exc` in place and returns it, for use inside an f-string.
+    """
+    exc.filename = plain_path(exc.filename)
+    exc.filename2 = plain_path(exc.filename2)
+    return exc
 
 
 def _is_link_like(entry: os.DirEntry) -> bool:

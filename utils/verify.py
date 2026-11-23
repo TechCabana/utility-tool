@@ -14,6 +14,7 @@ import stat
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from utils.copying import CHUNK, BackupAborted
+from utils.fs_utils import long_path
 
 
 # Quick mode's sample: about this fraction of the files, at least one, at
@@ -74,7 +75,7 @@ def _manifest_files(manifest: str, should_abort: Optional[Callable[[], bool]]
     Checks `should_abort` per line (raising BackupAborted) so both verify
     passes cancel promptly. Raises OSError if the manifest cannot be read.
     """
-    with open(manifest, "r", encoding="utf-8") as handle:
+    with open(long_path(manifest), "r", encoding="utf-8") as handle:
         for line in handle:
             if should_abort is not None and should_abort():
                 raise BackupAborted()
@@ -101,7 +102,7 @@ def _rehash(path: str) -> Tuple[int, str]:
     """
     digest = hashlib.sha256()
     size = 0
-    with open(path, "rb") as copied:
+    with open(long_path(path), "rb") as copied:
         while True:
             chunk = copied.read(CHUNK)
             if not chunk:
@@ -172,7 +173,7 @@ def _quick_verify(partial: str, manifest: str,
                 named.append("(damaged manifest line)")
             continue
         try:
-            info = os.stat(_copied_path(partial, entry))
+            info = os.stat(long_path(_copied_path(partial, entry)))
             ok = stat.S_ISREG(info.st_mode) and info.st_size == entry.get("size")
         except OSError:
             ok = False

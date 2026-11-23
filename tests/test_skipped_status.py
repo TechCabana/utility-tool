@@ -10,6 +10,7 @@ import os
 import pytest
 
 from utils import backup_utils, copying, jobs_store
+from utils.fs_utils import plain_path
 
 
 @pytest.fixture(autouse=True)
@@ -118,7 +119,7 @@ def test_an_unlistable_folder_counts_its_files_not_one(job, monkeypatch):
         # `sub` is listed three times: pre-flight's count, the copy's own
         # count, then the copy itself. The two counts must see its 4 files;
         # only the copy's listing (the third) fails.
-        if os.path.normcase(os.path.abspath(str(path))) == bad:
+        if os.path.normcase(os.path.abspath(plain_path(str(path)))) == bad:
             listings.append(path)
             if len(listings) > 2:
                 raise PermissionError(errno.EACCES, "Access is denied", str(path))

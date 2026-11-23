@@ -10,7 +10,7 @@ import shutil
 from typing import Callable, Dict, Optional, Tuple
 
 from utils.copying import tree_totals
-from utils.fs_utils import human_size
+from utils.fs_utils import human_size, long_path
 from utils.jobs_store import job_pruning_held
 from utils.versions import sweep_stale
 
@@ -140,7 +140,7 @@ def preflight(job: Dict,
     volume = volume or volume_id
     source = job.get("source", "")
     target = job.get("target", "")
-    if not source or not os.path.isdir(source):
+    if not source or not os.path.isdir(long_path(source)):
         return f"Source folder not found: {source or '(not set)'}"
     if not target:
         return "No target folder is set for this job"
