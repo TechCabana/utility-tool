@@ -314,7 +314,8 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `retention` | int | Versions to keep; older ones are deleted after a run |
 | `target_volume` | string | The target drive's volume id, recorded on save or first run; a run onto a different drive is refused |
 | `verify` | string | `full` (default: re-read every copied file), `quick` (all sizes, a sample of hashes) or `off`; a missing or unknown value runs as `full` |
-| `last_result` | string | `ok`, or `failed: <message>` |
+| `last_result` | string | `ok`, `failed: <message>`, or `interrupted: started <time> and never finished` (a run that began and was killed or crashed before it recorded a result; `last_run` is then when it began) |
+| `running` | object | Present only while a run is under way, or after one died: `{since, pid, start_time, stamp, token}`, written just before copying and removed when the run records its outcome. A marker whose process is gone is shown as "Interrupted" and recorded as `interrupted` in `last_result` and the run log. Do not edit it by hand |
 | `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
 | `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed run leaves all three unchanged |
 

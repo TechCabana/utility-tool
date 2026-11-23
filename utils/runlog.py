@@ -24,6 +24,13 @@ its file count and its version stamp (0 and null when there is none). The
 release itself is logged as one line with `outcome` "hold_released", `files`
 the count the source had and `trigger` "manual" (the Backup screen) or "cli".
 
+A run that started and never recorded an outcome (the process was killed, the
+machine lost power, it crashed) is logged ONCE, when the next run, the headless
+start or the Backup screen first finds its start marker with no owner left
+(`runner.settle_interrupted`): `outcome` "interrupted", `trigger` "recovery",
+`start` and `end` both the time the lost run began (the moment it died is not
+known), `version` the version stamp it had claimed. No path, no file count.
+
 `outcome` is one of `OUTCOMES`. PATHS AND COUNTS ONLY, never file contents or
 OS error text beyond what a result's own message already carries. The line is
 built from that explicit field list (`build_line`), never from the whole result
@@ -58,7 +65,7 @@ SKIPPED_PATHS_MAX = 50
 MESSAGE_MAX = 2000
 APP_LOG_NAME = "app"
 OUTCOMES = ("ok", "ok_skipped", "ok_pruning_held", "failed", "cancelled", "busy",
-            "hold_released")
+            "hold_released", "interrupted")
 LINE_KEYS = ("v", "start", "end", "trigger", "job", "name", "outcome", "files",
              "bytes", "skipped", "skipped_paths", "skipped_more", "pruned",
              "version", "verify_mode", "cause", "message", "pruning_held",
@@ -102,6 +109,8 @@ def _outcome(result: Dict, skipped: int) -> str:
     """Map a `run_job` result onto one of `OUTCOMES`."""
     if result.get("busy"):
         return "busy"
+    if result.get("interrupted") is True:
+        return "interrupted"
     if result.get("hold_released") is True:
         return "hold_released"
     if result.get("ok"):

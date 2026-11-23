@@ -236,6 +236,32 @@ def _judge(holder: Dict, age: float) -> Tuple[bool, bool]:
     return age > VERIFIED_OWNER_STALE_AFTER, False  # the real owner, however long it has run
 
 
+def is_held(path: str) -> bool:
+    """True when the lock file at `path` is held by an owner `acquire` would
+    respect, i.e. a run (or a release) is in progress right now.
+
+    Read-only: it never takes, changes or removes the lock. It judges the file
+    with the same `_judge` / `CORRUPT_GRACE` rules `acquire` uses, so the two
+    cannot disagree about "stale". A lock that is mid-create or mid-delete
+    (unreadable for a moment) reads as held, as `acquire` treats it.
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    holder = _parse(raw)
+    try:
+        age = _age(path, holder)
+    except OSError:
+        return False  # removed between the read and the stat
+    if holder is None:
+        return age <= CORRUPT_GRACE
+    return not _judge(holder, age)[0]
+
+
 class Lock:
     """A held lock. Release it (or use it as a context manager).
 

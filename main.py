@@ -299,6 +299,18 @@ def load_fonts(directory=None):
             print(f"[WARN] Could not load font '{path}'")
 
 
+def interrupted_notice(job):
+    """The one plain line for a job whose previous run began and never
+    finished, or "" when it did not (or a live run is in progress)."""
+    from utils import backup_utils
+    from utils.fs_utils import short_when
+    found = backup_utils.job_interrupted(job)
+    if not found:
+        return ""
+    return (f"The previous run of this backup was interrupted (started "
+            f"{short_when(found['since'])}) and never finished.")
+
+
 def run_backup_job_cli(job_id):
     """Run one backup job with no GUI at all, and return a process exit code.
 
@@ -315,7 +327,9 @@ def run_backup_job_cli(job_id):
     and the job's last result is left as it was); 5 is `--precheck-job`'s
     "problems found" (see `precheck_job_cli`). If the run finished but its
     result could not be written back (the jobs-file lock timed out), the exit
-    code is still the run's own, 0 or 1, and the message says so.
+    code is still the run's own, 0 or 1, and the message says so. If the job's
+    previous run began and never finished, one `[WARN]` line says so first and
+    the run goes ahead; it changes no exit code.
     """
     from utils import backup_utils, runlog
 
@@ -350,6 +364,12 @@ def run_backup_job_cli(job_id):
     # was not refused as busy, which must leave the jobs file untouched. It
     # runs through `after_lock`, i.e. once the job's run lock is held, so a run
     # refused as busy never walks the source first.
+    notice = interrupted_notice(job)
+    if notice:
+        # Card PQPfznG1: the last run of this job began and never finished. Say
+        # so, then carry on; the run itself records that fact in the run log
+        # and replaces the marker. Loud on stderr, exit code unchanged.
+        print("[WARN] " + notice, file=sys.stderr)
     checked = {}
 
     def check_first_run():

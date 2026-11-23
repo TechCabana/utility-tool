@@ -170,6 +170,104 @@ def job_hold_released(job: Dict) -> Optional[Dict]:
     return release
 
 
+# ---------------------------------------------------------------------------
+# The "a run has started" marker (card PQPfznG1)
+# ---------------------------------------------------------------------------
+#
+# A run used to write nothing to its job until it finished, so a run that was
+# killed (Task Scheduler stopping it on battery, a shutdown, a crash) left the
+# PREVIOUS run's "ok" standing: the owner was told a backup succeeded that
+# never completed. Now the run records, just before it copies, a `running`
+# field on its job:
+#
+#     running = {"since": "<local ISO time>", "pid": N, "start_time": "<opaque>"|None,
+#                "stamp": "<version stamp>"|None, "token": "<random>"}
+#
+# `record_run` removes it in the same atomic write that records the outcome of
+# ANY finished run. A marker that is still there while its owner process is
+# gone is an interrupted run (`runner.job_interrupted`). The file is the one
+# thing the Backup tab and the headless run already read, which is why the
+# marker lives on the job rather than in the run log.
+#
+# `pid` + `start_time` are the same owner identity the per-job lock records
+# (`locks.process_start_time`), so "is the owner alive" has one source of truth
+# (`locks._judge`) and a reused pid is told from the real owner.
+
+def job_running(job: Dict) -> Optional[Dict]:
+    """The start marker stored on `job` as `{since, pid, start_time, stamp}`, or
+    None when there is none or it is junk.
+
+    A hand-edited or half-written value must read as "no marker", never crash
+    the Backup tab: `since` must parse as a time, `pid` must be a positive
+    whole number (not a bool), `start_time` text or null. A `stamp` that is not
+    a version name is dropped (the marker stays valid without it).
+    """
+    marker = job.get("running")
+    if not isinstance(marker, dict):
+        return None
+    since, pid, start_time = marker.get("since"), marker.get("pid"), marker.get("start_time")
+    if not isinstance(since, str):
+        return None
+    try:
+        datetime.fromisoformat(since)
+    except ValueError:
+        return None
+    if not _count(pid) or not (start_time is None or isinstance(start_time, str)):
+        return None
+    stamp = marker.get("stamp")
+    if not (isinstance(stamp, str) and _STAMP_RE.fullmatch(stamp)):
+        stamp = None
+    return {"since": since, "pid": pid, "start_time": start_time, "stamp": stamp}
+
+
+def new_running_marker(stamp: Optional[str]) -> Dict:
+    """A marker for a run of THIS process starting now (`stamp` is the version
+    it claimed). The clock is read here, not in the runner, so a test that
+    freezes the runner's clock does not change what a marker holds."""
+    pid = os.getpid()
+    return {"since": datetime.now().isoformat(timespec="seconds"), "pid": pid,
+            "start_time": locks.process_start_time(pid), "stamp": stamp,
+            "token": uuid.uuid4().hex}
+
+
+def running_owner_gone(marker: Dict) -> bool:
+    """True when the process that wrote `marker` is no longer running it.
+
+    Asks `locks._judge`, the question the per-job lock asks of its holder: a
+    dead pid, or a live pid whose start time differs (the pid was reused), is
+    gone; a live pid with the SAME start time is the owner however long it has
+    run (a backup of more than a day stays "running"); an owner whose start
+    time was not recorded or cannot be read now is unverified and gets the
+    lock's age rule instead.
+    """
+    try:
+        age = (datetime.now() - datetime.fromisoformat(marker["since"])).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        age = 0.0
+    stale, _reused = locks._judge(
+        {"pid": marker["pid"], "start_time": marker.get("start_time")}, max(age, 0.0))
+    return stale
+
+
+def set_running(job_id: str, marker: Dict) -> bool:
+    """Store `marker` as `job_id`'s `running` field; False if there is no such job.
+
+    Re-reads the job under the jobs-file lock and sets ONLY this field, as
+    `record_run` and `record_precheck` do: the caller's job dict can be older
+    than a hold released, a pre-check recorded or a schedule edited meanwhile,
+    and writing it back would undo them. Raises JobsFileCorrupt or OSError
+    like `save_job`; the runner treats both as "no marker", never as a failed
+    backup.
+    """
+    with _jobs_file_lock():
+        job = get_job(job_id)
+        if job is None:
+            return False
+        job["running"] = marker
+        _save_job(job)
+    return True
+
+
 def _backup_path() -> str:
     """Where the last good copy of the jobs file is kept."""
     return JOBS_FILE + ".bak"
@@ -476,6 +574,12 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
             job["target_volume"] = result["target_volume"]
         job["last_run"] = datetime.now().isoformat(timespec="seconds")
         job["last_result"] = ("ok" if result.get("ok") else "failed") +             (f": {result.get('message', '')}" if not result.get("ok") else "")
+        # The run is over, whatever the outcome: the start marker goes in the
+        # SAME atomic write as the result, never before it. Cleared first and
+        # recorded after, a crash between the two would leave the previous
+        # "ok" standing with no sign a run ever began -- the lie this marker
+        # exists to prevent. See `job_running`.
+        job.pop("running", None)
         # A run that finished but left files behind is still "ok" (readers of
         # last_result keep working); the count and a few names ride beside it
         # so the screen can say so. The count is the one the run's own message

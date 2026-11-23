@@ -6,7 +6,6 @@ the app was cut down to backup only. The widgets, the worker and the job flow
 are the same code as before; only the host changed, from a QTabWidget page to
 a sidebar page of its own.
 """
-import datetime
 import os
 import re
 from pathlib import Path
@@ -16,7 +15,7 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
 
 from utils import backup_utils, precheck
-from utils.fs_utils import human_size, long_path
+from utils.fs_utils import human_size, long_path, short_when
 from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
                             add_field, divider, icon_button, section,
                             section_header, table_header)
@@ -480,6 +479,14 @@ RESTORE_ACTION_WIDTH = 110
 # larger backup aside (card 51): a failure never clears that hold.
 HELD_AFTER_FAILURE = "Older backups are being kept because the source shrank."
 
+# The Status tooltip of a job whose last run started and never finished (card
+# PQPfznG1): the likely causes, in plain words, and that nothing is left to fix.
+INTERRUPTED_DETAIL = (
+    "This backup started but stopped before it finished, so no result was "
+    "recorded. Usual causes: the computer was unplugged, shut down or put to "
+    "sleep while it ran, or the program crashed. The next run starts cleanly; "
+    "any half-finished copy it left behind is removed by the normal clean-up.")
+
 # The button on a held job's card that says the shrink was on purpose (card
 # QnFM2GMZ), and what its confirmation adds to the two counts it names.
 RELEASE_HOLD_TEXT = "This is expected: forget the larger backup"
@@ -671,6 +678,16 @@ class JobRow(QtWidgets.QWidget):
     def _status(self, job: dict):
         """The Status column: what the last run did, or that none has run."""
         result = job.get("last_result", "")
+        # Card PQPfznG1: a run that began and never finished is a failure, said
+        # with its start time. Checked before "Never run" because a FIRST run
+        # that died has a start marker and no last_run. `job_interrupted` is
+        # None while a live run owns the marker, so the settled text on the job
+        # (the previous run's fact) is read too and keeps showing meanwhile.
+        interrupted = backup_utils.job_interrupted(job)
+        if interrupted or result.startswith(backup_utils.INTERRUPTED_PREFIX):
+            since = interrupted["since"] if interrupted else job.get("last_run", "")
+            return (f"Interrupted: started {short_when(since)} and never finished",
+                    "StatusError")
         if not job.get("last_run"):
             return "Never run", "Hint"
         if result.startswith("ok"):
@@ -689,7 +706,12 @@ class JobRow(QtWidgets.QWidget):
     def _warning_detail(job: dict) -> str:
         """Everything behind an "OK, ..." warning: the skipped files and/or
         the held-pruning sentence with its two counts. For a failed run, only
-        the line saying older backups are still kept aside ("" if not)."""
+        the line saying older backups are still kept aside ("" if not). An
+        interrupted run says why that happens and that nothing is wrong now."""
+        if (backup_utils.job_interrupted(job)
+                or job.get("last_result", "").startswith(backup_utils.INTERRUPTED_PREFIX)):
+            return INTERRUPTED_DETAIL + (
+                "\n\n" + HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else "")
         if not job.get("last_result", "").startswith("ok"):
             # Failure stays the status; a hold an earlier run set survives it.
             return HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else ""
@@ -728,17 +750,8 @@ class JobRow(QtWidgets.QWidget):
         A run from a previous year keeps its year, since that is exactly the
         case where the year IS the point.
         """
-        stamp = job.get("last_run", "")
-        if not stamp:
-            return "-"
-        try:
-            moment = datetime.datetime.fromisoformat(stamp)
-        except (TypeError, ValueError):
-            # Never let an unparseable stored value break the row.
-            return stamp.replace("T", " ")[:16]
-        if moment.year != datetime.datetime.now().year:
-            return moment.strftime("%d %b %Y")
-        return moment.strftime("%d %b %H:%M")
+        # `short_when` never raises on an unparseable stored value.
+        return short_when(job.get("last_run", ""))
 
 
 class RestoreRow(QtWidgets.QWidget):
@@ -1144,6 +1157,12 @@ class BackupTab(QtWidgets.QWidget):
         """
         try:
             self.jobs = backup_utils.load_jobs()
+            # A run that died leaves a start marker behind; record it as an
+            # interrupted run now (once, and only if no live run owns it) so the
+            # job stops reading as its earlier "ok" for every reader, then
+            # re-read. A read-only no-op for every job without a stale marker.
+            if backup_utils.settle_all_interrupted(self.jobs):
+                self.jobs = backup_utils.load_jobs()
         except backup_utils.JobsFileCorrupt as exc:
             self._show_jobs_damaged(exc)
             return
