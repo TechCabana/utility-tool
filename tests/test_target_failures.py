@@ -400,8 +400,16 @@ def test_windows_error_codes_map_to_causes(winerror, cause):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="MAX_PATH is a Windows limit")
-def test_a_missing_path_past_max_path_is_called_too_long():
-    long_path = "C:\\" + "d" * 300 + "\\f.bin"
+def test_a_missing_path_is_called_too_long_only_near_the_extended_limit():
+    # Every engine call uses the extended-length form (card 56), so a path of
+    # 300 characters is writable: ENOENT there means the drive went away, and
+    # calling it "too long" also listed innocent files as offenders. Only near
+    # Windows' 32,767-character limit does a plain ENOENT mean the length.
     error = OSError(errno.ENOENT, "No such file or directory")
-    assert backup_utils.TargetWriteFailed(long_path, error).cause == "path_too_long"
+    error.winerror = 3   # ERROR_PATH_NOT_FOUND, what Windows really reports
+    past_max_path = "C:\\" + "d" * 300 + "\\f.bin"
+    near_limit = "C:\\" + "\\".join(["d" * 100] * 324) + "\\f.bin"
+    assert 32_700 < len(near_limit) < 32_767
+    assert backup_utils.TargetWriteFailed(past_max_path, error).cause == "target_unavailable"
+    assert backup_utils.TargetWriteFailed(near_limit, error).cause == "path_too_long"
     assert backup_utils.TargetWriteFailed("C:\\d\\f.bin", error).cause == "target_unavailable"

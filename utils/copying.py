@@ -66,12 +66,14 @@ class TargetWriteFailed(Exception):
         self.path, self.error = path, error
         cause = (_WINERROR_CAUSES.get(getattr(error, "winerror", None))
                  or _ERRNO_CAUSES.get(error.errno) or "target_write_failed")
-        # ponytail: Windows reports a path it cannot hold as a plain ENOENT --
-        # past MAX_PATH without the extended-length form, and near 32,767
-        # characters even with it (measured: a folder from ~32,762, a file
-        # at 32,767) -- so length decides. Mislabels a drive that vanished at
-        # a >=260 path; the run still fails either way.
-        if cause == "target_unavailable" and os.name == "nt" and len(path) >= 260:
+        # ponytail: Windows reports a path it cannot hold as a plain ENOENT
+        # near 32,767 characters even in the extended-length form every engine
+        # call now uses (measured: a folder from ~32,762, a file at 32,767), so
+        # length decides there. Not at MAX_PATH any more: a 300-character path
+        # is writable, so ENOENT on one means the drive went away, and calling
+        # it "too long" listed innocent files as offenders. Mislabels a drive
+        # that vanished at a >=32,000 path; the run still fails either way.
+        if cause == "target_unavailable" and os.name == "nt" and len(path) >= 32_000:
             cause = "path_too_long"
         self.cause = cause
         super().__init__(self.reason("backup drive"))
