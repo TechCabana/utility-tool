@@ -306,20 +306,34 @@ flowchart LR
    and asks first when a newer version was never verified or when none is; it never writes
    over the live source.
 5. A run that cannot finish honestly fails instead of saving a partial copy: if the backup
-   drive fills up, disappears or refuses a write, or the source folder disappears or most of
-   its files cannot be read, nothing is promoted or pruned and earlier versions are left as
-   they were. Files that are merely locked by another program are skipped and counted in the
-   result, and the job then reads "OK, N skipped" rather than plain OK. A run that copied more
+   drive fills up, disappears or refuses a write, or the source folder disappears, or at least
+   three files and more than 30% of them cannot be read, or nothing at all could be copied,
+   nothing is promoted or pruned and earlier versions are left as they were. A file that cannot
+   be read at first (often one another program has locked) gets one more try once the rest of
+   the tree is copied; if it still cannot be read it is skipped and counted in the result, and
+   the job then reads "OK, N skipped" rather than plain OK. A run that copied more
    than 30% fewer files than the largest version still kept (verified or not) succeeds and
    keeps that larger version aside ("pruning held") while the others are pruned as usual, so
    an emptied source cannot roll the last complete copy out of retention and a source that
    stays smaller costs one extra version, not unbounded growth. The hold ends when the count
-   recovers; a failed run does not clear it, and a low-space failure says it is in force.
+   recovers, or when the owner says the shrink was expected ("This is expected: forget the
+   larger backup" on the job, or `main.py --release-hold <id>`); a failed run does not clear
+   it, and a low-space failure says it is in force.
    Every run appends one line to `logs/<job id>.jsonl` in the
    app-data folder (the newest 200 are kept). Only one run of a job happens at a time (a lock file in the app-data folder); a
    second one, such as the scheduled task firing during a manual run, is refused and the
    headless path exits 4. Abandoned leftovers of failed runs older than 7 days are removed at
    the start of the next run, except the most recent one, which is kept for inspection.
+6. The headless entry points and their exit codes:
+
+   | Command | Exit codes |
+   | --- | --- |
+   | `main.py --run-backup-job <id>` | 0 ok, 1 failed, 2 no such job, 3 jobs file damaged, 4 already running |
+   | `main.py --precheck-job <id>` | 0 nothing to fix, 5 any problem found (even files that would only be skipped), 2 no such job, 3 jobs file damaged |
+   | `main.py --release-hold <id>` | 0 released or nothing to release, 1 could not be saved, 2 no such job, 3 jobs file damaged, 4 job is running |
+
+   A job's first unattended run, if it was never checked, is pre-checked once it holds the
+   job's lock; the check only warns and never stops the run.
 
 <details>
 <summary><b>Why this approach, and what was rejected</b></summary>
@@ -374,6 +388,8 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `running` | object | Present only while a run is under way, or after one died: `{since, pid, start_time, stamp, token}`, written just before copying and removed when the run records its outcome. A marker whose process is gone is shown as "Interrupted" and recorded as `interrupted` in `last_result` and the run log. Do not edit it by hand |
 | `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
 | `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed run leaves all three unchanged |
+| `last_precheck` | object | The last pre-check's summary: `{time, ok, aborted, fs, scanned, problems, blocking, counts, sample}` (counts by kind, up to five paths from the source root). Absent until a job is first checked |
+| `hold_released` | object | Present after the owner released a pruning hold: `{stamp, files, level, since, time}`, the version let go and its file count, the source's file count then, and the newest version at that moment. Versions older than `since` no longer count as the larger backup to compare with |
 
 The file is replaced atomically on every save, and the previous good copy is kept as
 `backup_jobs.json.bak`. A damaged file is reported as damaged, never read as "no jobs"; the
@@ -472,10 +488,10 @@ utility-tool/
 pytest tests/
 ```
 
-Covers the Qt-free layer only (`utils/backup_utils.py` and the modules it re-exports, `utils/precheck.py`, `utils/runlog.py`, `utils/locks.py`, `utils/activity.py`,
+Covers mainly the Qt-free layer (`utils/backup_utils.py` and the modules it re-exports, `utils/precheck.py`, `utils/runlog.py`, `utils/locks.py`, `utils/activity.py`,
 `utils/fs_utils.py`, `utils/migrate.py` and the design tokens in `styles/tokens.py`), using real `tmp_path` files;
 the scheduler, free space and volume identity are injected rather than touched. Over 700 tests,
-all passing; the run takes over a minute, since several tests wait a second for a distinct version stamp. The Qt-driven `tabs/` layer (including the Backup screen's
+all passing; the run takes about four minutes, since several tests wait a second for a distinct version stamp and some start real processes. A few tests drive parts of the Backup screen offscreen (its pre-check, release and interrupted-run paths), but most of the Qt-driven `tabs/` layer (including the Backup screen's
 worker thread and UI) has no automated coverage and stays manually
 verified, per the [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps
 above.
