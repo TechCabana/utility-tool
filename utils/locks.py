@@ -222,8 +222,10 @@ def _judge(holder: Dict, age: float) -> Tuple[bool, bool]:
     if not pid_alive(pid):
         return True, False
     recorded = holder.get("start_time")
-    if recorded is None:
-        return age > STALE_AFTER, False  # written before start times, or unreadable then
+    if not isinstance(recorded, str) or not recorded:
+        # Written before start times, unreadable then, or not something this
+        # app writes: proves nothing, and must never read as "differs".
+        return age > STALE_AFTER, False
     current = process_start_time(pid)
     if current is None:
         # Cannot read it now (access denied, no `ps`): the owner is unverified,

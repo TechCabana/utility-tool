@@ -167,6 +167,24 @@ def test_a_null_recorded_start_time_is_treated_as_old_format(tmp_path):
     lock.release()
 
 
+@pytest.mark.parametrize("garbage", [123, "", [OWN_START], {"t": 1}, True])
+def test_a_recorded_start_time_that_is_not_text_is_treated_as_old_format(tmp_path, garbage):
+    """Anything this app could not have written proves nothing about the owner.
+
+    Compared as-is, any non-text value "differed" from the live owner's real
+    start time, so a fresh lock held by a running backup was taken over as a
+    reused pid -- two runs writing one job at once.
+    """
+    path = str(tmp_path / "a.lock")
+    write_lock(path, os.getpid(), start_time=garbage)   # live owner, fresh lock
+    with pytest.raises(locks.LockBusy):
+        locks.acquire(path)
+    write_lock(path, os.getpid(), started=old_started(), start_time=garbage)
+    lock = locks.acquire(path)                         # the 24 h rule still applies
+    assert lock.recovered_reused is False
+    lock.release()
+
+
 # --- the current start time cannot be read: fall back to the age rule --------
 
 def test_unreadable_current_start_time_falls_back_to_the_age_rule(tmp_path, monkeypatch):
