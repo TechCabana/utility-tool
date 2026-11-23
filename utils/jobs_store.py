@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from datetime import datetime
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -325,6 +326,28 @@ def load_jobs() -> List[Dict]:
             JOBS_FILE, has_backup) from exc
 
 
+# Windows refuses to replace a file another process has open (WinError 5),
+# and readers (`load_jobs` in the Backup screen, a headless run's `get_job`,
+# an antivirus scan) open the jobs file without taking the jobs-file lock. A
+# read lasts milliseconds, so a few short retries ride it out; without them a
+# run's start marker was silently dropped (a killed run then still read "ok")
+# and record_run failed outright.
+REPLACE_ATTEMPTS = 20
+REPLACE_PAUSE_SECONDS = 0.05
+
+
+def _replace(temp: str, path: str) -> None:
+    """`os.replace`, retried briefly while another process has `path` open."""
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(REPLACE_PAUSE_SECONDS)
+
+
 def _write_atomic(path: str, data: bytes) -> None:
     """Replace `path` with `data` so a crash leaves the old file or the new.
 
@@ -344,7 +367,7 @@ def _write_atomic(path: str, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, path)
+        _replace(temp, path)
     except BaseException as exc:
         try:
             os.remove(temp)
