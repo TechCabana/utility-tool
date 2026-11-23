@@ -38,7 +38,8 @@ from utils.jobs_store import (  # noqa: F401
     job_skipped_sample, job_verify_mode, job_running, new_running_marker, running_owner_gone,
     set_running, JOBS_FILE, _jobs_file_lock, JOBS_FILENAME, JobsFileCorrupt,
     load_jobs, _locks_dir, new_job, quarantine_jobs_file, QuarantineRefused, _read_valid, record_precheck, record_run, remove_job,
-    restore_jobs_from_backup, _save_job, save_job, save_jobs, SCHEDULES, VERIFY_MODES,
+    restore_jobs_from_backup, _save_job, save_job, save_job_settings, save_jobs, SCHEDULES,
+    SETTINGS_KEYS, VERIFY_MODES,
     _write_atomic,
 )
 from utils.versions import (  # noqa: F401

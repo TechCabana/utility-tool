@@ -1389,7 +1389,9 @@ class BackupTab(QtWidgets.QWidget):
         is more useful than one combined "failed".
         """
         try:
-            backup_utils.save_job(job)
+            # Settings only: the row's copy can be older than a run, a
+            # pre-check or a release recorded since, and must not undo them.
+            backup_utils.save_job_settings(job)
         except backup_utils.JobsFileCorrupt as exc:
             # Nothing was written; the job is not stored or scheduled.
             self.refresh_backup()

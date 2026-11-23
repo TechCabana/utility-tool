@@ -531,6 +531,31 @@ def save_job(job: Dict) -> None:
         _save_job(job)
 
 
+# What the job form edits. Everything else on a stored job is written by runs,
+# pre-checks and releases (`record_run`, `record_precheck`, `set_running`,
+# `runner.release_hold`) and must not be rolled back by an edit.
+SETTINGS_KEYS = ("name", "source", "target", "schedule", "at", "retention",
+                 "target_volume", "verify")
+
+
+def save_job_settings(job: Dict) -> None:
+    """Save what the job form edits: a new job whole, an existing one by
+    updating only `SETTINGS_KEYS` on a fresh read under the jobs-file lock.
+
+    The Backup screen loads its jobs once and edits that copy. Saved whole, a
+    copy loaded while a run was going wrote back that run's start marker after
+    it had finished (the job then read "Interrupted" and the run log gained a
+    false line), and a copy older than a release undid it. Raises like
+    `save_job`.
+    """
+    with _jobs_file_lock():
+        stored = get_job(job["id"])
+        if stored is not None:
+            stored.update({key: job[key] for key in SETTINGS_KEYS if key in job})
+            job = stored
+        _save_job(job)
+
+
 def remove_job(job_id: str) -> None:
     """Drop the job with this id. Raises JobsFileCorrupt if the file is damaged."""
     with _jobs_file_lock():
