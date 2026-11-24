@@ -121,7 +121,7 @@ def test_a_run_writes_a_sibling_manifest_matching_independent_hashes(tree):
     assert lines[0]["stamp"] == result["version"]
     assert lines[-1] == {"type": "end", "files": 4, "bytes": result["bytes"],
                          "verify": "full", "verified": True,
-                         "finished_utc": result["finished_utc"]}
+                         "finished_utc": result["finished_utc"], "protected": True}
     assert backup_utils.valid_finished_utc(result["finished_utc"])
     entries = {e["path"]: e for e in lines[1:-1]}
     assert all(e["type"] == "file" for e in entries.values())

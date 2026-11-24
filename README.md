@@ -205,6 +205,12 @@ their own backup", and the headless run prints a `[WARN]` line to stderr (exit c
 unchanged). Windows' own profile junctions (`My Documents`, `Application Data` and the like,
 which point back into the same profile) are not counted.
 
+**Stored files are marked read-only.** Once a backup is finished its files and its checksum
+list are marked read-only (on macOS and Linux the write permission is dropped), so an accidental
+save or script is refused, which protects against accidents but not against someone who clears
+the mark on purpose, and a restored file is an ordinary writable file unless the original was
+read-only; backups made by earlier versions are not marked.
+
 **Version names use local time; their order does not.** A version is named for the computer's
 clock when its backup started, for example `20261025-013000`. When the clocks go back in
 autumn, one hour happens twice, so a backup made later can carry an earlier name than one made
@@ -464,7 +470,8 @@ utility-tool/
 │   ├── locks.py            cross-process lock files: one run per job, one writer of the jobs file
 │   └── migrate.py          one-time copy of data, tasks and settings from the UtilityTool name
 └── tests/                 pytest suite over utils/ and styles/ (Qt-free layer only, see Testing)
-    ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder
+    ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder; clears read-only marks under the temp folder when the session ends
+    ├── helpers.py          clears or reads the read-only mark on files inside finished versions
     ├── test_backup_utils.py
     ├── test_activity.py
     ├── test_changed_during_copy.py
@@ -480,6 +487,7 @@ utility-tool/
     ├── test_migrate.py
     ├── test_precheck.py
     ├── test_preflight.py
+    ├── test_read_only_versions.py
     ├── test_release_hold.py
     ├── test_restore_candidates.py
     ├── test_restore_check.py

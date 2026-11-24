@@ -16,7 +16,7 @@ import time
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from utils.fs_utils import (_is_link_like, is_legacy_profile_link, long_path,
-                            plain_error, relative_to)
+                            plain_error, relative_to, remove_file)
 
 
 class BackupAborted(Exception):
@@ -279,10 +279,14 @@ class CopyResult(tuple):
     (a test's stand-in for `_hash_copy`) simply reads as "not changed".
     """
 
-    def __new__(cls, size: int, mtime: float, sha: str, changed: bool = False):
-        """The three values, and whether the source changed under the read."""
+    def __new__(cls, size: int, mtime: float, sha: str, changed: bool = False,
+                read_only: bool = False):
+        """The three values, whether the source changed under the read, and
+        whether the SOURCE file was read-only (card fEC32w6P: recorded in the
+        manifest, because the stored copy's own bit now means "protected")."""
         self = super().__new__(cls, (size, mtime, sha))
         self.changed = changed
+        self.read_only = read_only
         return self
 
 
@@ -333,6 +337,9 @@ def _hash_copy(src: str, dst: str) -> CopyResult:
         with open(lsrc, "rb") as fsrc:
             before = os.fstat(fsrc.fileno())
             mtime = before.st_mtime
+            # No write bit at all = read-only. Windows reports the read-only
+            # attribute as mode 0o444, so this is the same test there.
+            read_only = not before.st_mode & 0o222
             with _writing(dst):
                 ldst = long_path(dst)  # past Windows' limit: a target failure
             with _writing(dst):
@@ -370,11 +377,14 @@ def _hash_copy(src: str, dst: str) -> CopyResult:
         # a failure to open the source or build the path leaves nothing of ours.
         if ldst is not None:
             try:
-                os.remove(ldst)
+                # remove_file, not os.remove: copystat may already have made
+                # the half-copy read-only (a read-only source), and Windows
+                # will not delete that.
+                remove_file(ldst)
             except OSError:
                 pass
         raise
-    return CopyResult(size, mtime, digest.hexdigest(), changed)
+    return CopyResult(size, mtime, digest.hexdigest(), changed, read_only)
 
 
 # One short pause before the retry pass, and only when a file was skipped.
@@ -424,7 +434,8 @@ def copy_tree(source: str, destination: str,
     destination folders are reused, as copytree's `dirs_exist_ok=True` did.
 
     Every file is copied by `_hash_copy`. With `on_copied`,
-    `on_copied(relative path, size, mtime, sha256)` is called once it has
+    `on_copied(relative path, size, mtime, sha256)` (plus `changed=True` and/or
+    `ro=True`, only when they apply, see `copy_one`) is called once it has
     landed -- `run_job` streams that into the version's manifest. If
     `on_copied` fails the file just copied is deleted, so the tree never holds
     a file its manifest does not list.
@@ -506,7 +517,7 @@ def copy_tree(source: str, destination: str,
                     # stray file in the version (`_hash_copy` only cleans up
                     # after a destination IT opened).
                     try:
-                        os.remove(long_path(dst))
+                        remove_file(dst)
                     except OSError:
                         pass
                     raise
@@ -517,14 +528,21 @@ def copy_tree(source: str, destination: str,
         size, mtime, sha = result
         rel = relative_to(src, source).replace("\\", "/")
         if on_copied is not None:
+            # Keyword arguments only when they say something, so a callback
+            # that takes four arguments never sees them: `changed` (card
+            # RnuRsA2V) and `ro` (card fEC32w6P: the SOURCE file was
+            # read-only, which the manifest records because the stored copy's
+            # own bit now means "protected").
+            extra = {}
+            if flagged:
+                extra["changed"] = True
+            if getattr(result, "read_only", False):
+                extra["ro"] = True
             try:
-                if flagged:
-                    on_copied(rel, size, mtime, sha, changed=True)
-                else:
-                    on_copied(rel, size, mtime, sha)
+                on_copied(rel, size, mtime, sha, **extra)
             except BaseException:
                 try:
-                    os.remove(long_path(dst))
+                    remove_file(dst)
                 except OSError:
                     pass
                 raise

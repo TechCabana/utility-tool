@@ -12,6 +12,7 @@ Qt-free by design (CLAUDE.md §3/§8) -- plain paths in, plain values out.
 import datetime
 import errno
 import os
+import stat
 import sys
 
 APP_NAME = "Safekeep"
@@ -145,6 +146,93 @@ def plain_error(exc: OSError) -> OSError:
     exc.filename = plain_path(exc.filename)
     exc.filename2 = plain_path(exc.filename2)
     return exc
+
+
+# ---------------------------------------------------------------------------
+# The read-only mark (card fEC32w6P)
+# ---------------------------------------------------------------------------
+# One place that turns a file's write protection on and off, so a finished
+# version can be marked and every delete path can undo it the same way.
+# `os.chmod` is already a read-modify-write of the attributes on Windows (it
+# toggles only FILE_ATTRIBUTE_READONLY and keeps hidden/system/archive), and on
+# POSIX these helpers touch only the write bits.
+
+_WRITE_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+
+
+def mode_with_write(mode: int, writable: bool) -> int:
+    """`mode` with write permission off (every write bit dropped) or on (the
+    owner's write bit added; nothing else changes). Pure, so the POSIX
+    arithmetic is testable on any platform."""
+    return mode | stat.S_IWUSR if writable else mode & ~_WRITE_BITS
+
+
+def set_read_only(path: str, read_only: bool) -> None:
+    """Make the file at `path` read-only (`read_only=True`) or writable again.
+
+    Windows: the read-only attribute, nothing else. POSIX: True drops every
+    write bit; False adds the OWNER's write bit back only (the group/other
+    bits a file had are not recoverable from the read-only form). Plain path in
+    (`long_path` is applied here). Raises OSError.
+    """
+    target = long_path(path)
+    os.chmod(target, mode_with_write(stat.S_IMODE(os.stat(target).st_mode), not read_only))
+
+
+def is_read_only(path: str) -> bool:
+    """True when `path` has no write permission at all (the read-only attribute
+    on Windows, no write bit elsewhere). False for anything that cannot be
+    looked at."""
+    try:
+        return not os.stat(long_path(path)).st_mode & _WRITE_BITS
+    except OSError:
+        return False
+
+
+def clear_read_only(path: str) -> None:
+    """Make `path` writable, whatever it is (file or folder). Raises OSError.
+
+    The one way every delete path undoes the mark: `remove_file`, the
+    `shutil.rmtree` hook and the sweep all come here.
+    """
+    target = long_path(path)
+    os.chmod(target, stat.S_IMODE(os.lstat(target).st_mode) | stat.S_IWUSR)
+
+
+def remark(path: str) -> None:
+    """Best-effort `set_read_only(path, True)`: for undoing a clear after the
+    delete it was for failed. Never raises."""
+    try:
+        set_read_only(path, True)
+    except OSError:
+        pass
+
+
+def remove_file(path: str) -> None:
+    """`os.remove`, but a read-only FILE is made writable and removed.
+
+    Windows refuses to delete a read-only file (PermissionError), and finished
+    versions and their manifests are now marked read-only. FileNotFoundError
+    and every other failure propagate unchanged; so does the original
+    PermissionError when clearing the mark does not help (a locked file).
+    """
+    target = long_path(path)
+    try:
+        os.remove(target)
+    except PermissionError as exc:
+        if os.path.islink(target) or not os.path.isfile(target):
+            raise
+        try:
+            clear_read_only(path)
+        except OSError:
+            raise exc from None
+        try:
+            os.remove(target)
+        except OSError:
+            # Still undeletable (locked): put the mark back, so a failed
+            # delete does not leave a protected file quietly writable.
+            remark(path)
+            raise
 
 
 def _is_link_like(entry: os.DirEntry) -> bool:

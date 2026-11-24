@@ -9,13 +9,13 @@ import json
 import os
 import re
 import shutil
-import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from utils.copying import BackupAborted, SourceUnavailable, TargetWriteFailed, copy_tree
-from utils.fs_utils import _is_link_like, long_path, plain_error
+from utils.fs_utils import (_is_link_like, clear_read_only, is_read_only, long_path,
+                            plain_error, remark, remove_file, set_read_only)
 from utils.jobs_store import (DEFAULT_RETENTION, FINISHED_UTC_FORMAT, VERIFY_MODES,
                               job_hold_released, valid_finished_utc)
 
@@ -102,6 +102,13 @@ def version_datetime(name: str) -> Optional[datetime]:
 # A file line carries `"changed": true` (card RnuRsA2V) only when the file was
 # still changing while its second copy was read: kept, flagged, hash of what
 # was read. Older manifests lack it; every reader ignores it.
+# A file line carries `"ro": true` (card fEC32w6P) only when the SOURCE file was
+# read-only. A finished version's files are marked read-only (see "Protecting a
+# finished version" below), so the stored copy's own bit can no longer say what
+# the source's was; this key does. The trailer carries `"protected": true` when
+# the run was made by a build that does both (records `ro`, marks the version):
+# restore reads `ro` only for such versions. Older manifests lack both keys and
+# readers ignore keys they do not know.
 # A version is verified iff its folder exists and its manifest ends in a
 # verified trailer. Legacy versions (made before manifests) have none and are
 # simply unverified, as is an "off" version.
@@ -166,6 +173,9 @@ def read_manifest_summary(job: Dict, stamp: str) -> Optional[Dict]:
     finished = valid_finished_utc(summary.pop("finished_utc", None))
     if finished:
         summary["finished_utc"] = finished
+    # Only a real `true` counts; anything else is the same as absent.
+    if summary.pop("protected", None) is True:
+        summary["protected"] = True
     return summary
 
 
@@ -178,7 +188,12 @@ def verify_mode(job: Dict, stamp: str) -> Optional[str]:
 
 def is_verified(job: Dict, stamp: str) -> bool:
     """True iff version `stamp` exists and its manifest ends verified -- a
-    "full" or "quick" run. An "off" version is complete but never verified."""
+    "full" or "quick" run. An "off" version is complete but never verified.
+
+    This is deliberately only "the manifest says so": it does NOT re-read the
+    stored files, so a file edited after the run (the read-only mark makes
+    that an accident to be refused, not a thing prevented) still reads as
+    verified. Catching that is the deep-verify card's job, not this one's."""
     summary = read_manifest_summary(job, stamp)
     return (os.path.isdir(long_path(version_path(job, stamp)))
             and summary is not None and summary["verified"] is True)
@@ -398,6 +413,77 @@ def release_hold_question(files: int, baseline: int) -> str:
             f"{baseline}. Stop keeping the earlier one?")
 
 
+# ---------------------------------------------------------------------------
+# Protecting a finished version (card fEC32w6P, spec safety item 9)
+# ---------------------------------------------------------------------------
+# A version is an ordinary folder the user is invited to open, so an accidental
+# save, a drag in Explorer or a careless script could change a backup with no
+# sign. Once a version is final, every FILE in it and its manifest get the
+# read-only mark; a write is then refused until someone clears the mark on
+# purpose. This is protection against accidents, NOT against a determined
+# writer (clearing the mark is one click): tamper detection is the deep-verify
+# and encrypted-manifest cards' job, and `is_verified` still means only "the
+# manifest ends in a verified trailer".
+#
+# WHEN: `run_job` calls this right after the manifest and the folder are
+# promoted (`os.replace` of both) and BEFORE the prune, i.e. after everything
+# that writes into the version has finished (the copy, card 55's re-copy, card
+# 54's retry, verification all ran against the `.partial`), and the manifest's
+# trailer is final. Nothing writes a version afterwards.
+#
+# WHAT: files and the manifest only. Directories are not marked: on Windows a
+# folder's read-only bit protects nothing inside it and has Explorer side
+# effects, and on POSIX dropping a directory's write bit would stop retention
+# deleting its files. Only the read-only bit changes (read-modify-write, see
+# `fs_utils.set_read_only`): hidden, system and archive bits are kept.
+#
+# FAILURE IS NOT FATAL: a share that ignores attributes or a permission error
+# leaves that file writable and counted in `failed`; the version is complete
+# and valid either way, and restore treats a still-writable file in a
+# protected version as an ordinary writable one (see `restore_version`).
+#
+# Versions made by earlier builds are not marked and are not migrated.
+
+def protect_version(job: Dict, stamp: str) -> Dict[str, int]:
+    """Mark version `stamp`'s files and its manifest read-only.
+
+    Returns `{"marked": n, "failed": n}`. Never raises for a filesystem
+    problem: one file that cannot be marked (or a folder that cannot be listed)
+    counts once in `failed` and the walk carries on. Links and junctions are
+    never followed or touched.
+    """
+    marked = failed = 0
+    stack = [version_path(job, stamp)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(long_path(current)) as entries:
+                listing = list(entries)
+        except OSError:
+            failed += 1
+            continue
+        for entry in listing:
+            path = os.path.join(current, entry.name)
+            try:
+                if _is_link_like(entry):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(path)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                set_read_only(path, True)
+                marked += 1
+            except OSError:
+                failed += 1
+    try:
+        set_read_only(manifest_path(job, stamp), True)
+        marked += 1
+    except OSError:
+        failed += 1
+    return {"marked": marked, "failed": failed}
+
+
 def prune_versions(job: Dict, protect: Iterable[str] = (),
                    newest: Optional[str] = None) -> List[str]:
     """Delete the oldest versions beyond the job's retention count.
@@ -445,8 +531,10 @@ def prune_versions(job: Dict, protect: Iterable[str] = (),
             continue
         # Manifest first: a version whose folder deletion fails halfway must
         # not keep claiming to be verified.
+        # `remove_file` because the manifest is read-only once the version is
+        # protected (card fEC32w6P); a failure here leaves the version whole.
         try:
-            os.remove(long_path(manifest_path(job, name)))
+            remove_file(manifest_path(job, name))
         except FileNotFoundError:
             pass  # a legacy version has none
         except OSError:
@@ -462,13 +550,22 @@ def prune_versions(job: Dict, protect: Iterable[str] = (),
 def _make_writable_and_retry(func, path, _error) -> None:
     """`shutil.rmtree` error hook: clear read-only, then retry once.
 
-    Windows refuses to delete a read-only file, and a backup keeps the
-    source's read-only bit, so without this one read-only file in the source
-    made every older version of the job undeletable and retention silently
-    stopped working. A second failure propagates to the caller.
+    Windows refuses to delete a read-only file. A backup keeps the source's
+    read-only bit, and since card fEC32w6P every finished version's files are
+    read-only, so without this retention could never delete a version. A
+    second failure propagates to the caller.
     """
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+    was_read_only = is_read_only(path) and os.path.isfile(long_path(path))
+    clear_read_only(path)
+    try:
+        func(path)
+    except OSError:
+        # The delete still failed (a file another program holds open): the
+        # file keeps its mark rather than being left writable in a version
+        # that stays on disk (card fEC32w6P).
+        if was_read_only:
+            remark(path)
+        raise
 
 
 def _rmtree(path: str) -> None:
@@ -491,7 +588,7 @@ def _discard(partial: str, manifest_tmp: str) -> None:
     except OSError:
         pass  # best effort: a leftover .partial is never listed as a version
     try:
-        os.remove(long_path(manifest_tmp))
+        remove_file(manifest_tmp)
     except OSError:
         pass
 
@@ -579,8 +676,8 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
             else:
                 try:
                     os.unlink(long_path(path))
-                except PermissionError:  # read-only bit: clear it, retry once
-                    os.chmod(long_path(path), stat.S_IWRITE)
+                except PermissionError:  # read-only mark: clear it, retry once
+                    clear_read_only(path)
                     os.unlink(long_path(path))
         except OSError as exc:
             result["errors"].append(f"{name}: {plain_error(exc)}")
@@ -597,7 +694,8 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
 RESTORE_NAMED = 5
 
 
-def _read_manifest_hashes(job: Dict, stamp: str) -> Tuple[Optional[Dict[str, bytes]], Optional[str]]:
+def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None
+                          ) -> Tuple[Optional[Dict[str, bytes]], Optional[str]]:
     """`({relative path: sha256 digest}, None)` for version `stamp`, or
     `(None, reason)` when its manifest cannot be trusted.
 
@@ -613,6 +711,10 @@ def _read_manifest_hashes(job: Dict, stamp: str) -> Tuple[Optional[Dict[str, byt
     hex, to keep a 100,000-file manifest to tens of megabytes. Paths are in
     the manifest's own form (relative, forward slashes, case kept), which is
     the form `copy_tree` reports them in.
+
+    `ro_out`, if given, receives the path of every file line marked
+    `"ro": true` (the source file was read-only). It is only meaningful when
+    the manifest is trusted (the second value is None).
     """
     path = manifest_path(job, stamp)
     if not os.path.exists(long_path(path)):
@@ -634,6 +736,8 @@ def _read_manifest_hashes(job: Dict, stamp: str) -> Tuple[Optional[Dict[str, byt
                 if not isinstance(rel, str) or len(digest) != 32 or rel in hashes:
                     return None, "manifest damaged"
                 hashes[rel] = digest
+                if ro_out is not None and entry.get("ro") is True:
+                    ro_out.add(rel)
     except (OSError, ValueError):   # unreadable, bad JSON, bad UTF-8, bad hex
         return None, "manifest damaged"
     if len(hashes) != summary.get("files"):
@@ -733,6 +837,19 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
       unreadable is not restored, so it is in `errors` (as before) and not
       counted against `verified`.
 
+    **Permissions (card fEC32w6P).** The stored files of a version marked by
+    `protect_version` are read-only, and `_hash_copy` carries that over, so for
+    such a version (trailer `protected: true`, manifest trusted) each restored
+    file is made writable unless its manifest line says `ro: true` (the SOURCE
+    file was read-only), and then made read-only. A file that is still
+    writable in a protected version (its marking failed) is restored writable
+    like any other. A version without `protected` (made by an earlier build) or
+    with a manifest that cannot be trusted keeps the old rule: the copy keeps
+    whatever read-only bit the stored file has. A restore into a folder that
+    already holds a read-only file of the same name replaces it
+    (`copying._open_for_write`); one that cannot is a `no_permission` failure
+    naming the file.
+
     `ok` keeps its meaning (the files were copied); a mismatch is
     `ok=True, verified=False`, so callers that only look at `ok` behave as
     before and callers that care read `verified`. A cancelled restore
@@ -751,17 +868,32 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     folder = os.path.join(destination, f"{safe_name}-restored-{version}")
     existed = os.path.exists(long_path(folder))
     stats: Dict[str, int] = {}
-    expected, unchecked_reason = _read_manifest_hashes(job, version)
+    # Card fEC32w6P. Which restored files should be read-only. The stored files
+    # of a PROTECTED version (trailer `protected: true`) are read-only because
+    # of the protective mark, so their own bit says nothing about the source:
+    # a restored file is writable unless its manifest line says `ro: true`.
+    # A version made before the mark (no `protected`) keeps the old rule: the
+    # stored file's own bit IS the source's, and the copy carries it over. A
+    # manifest that cannot be trusted (`expected is None`) says nothing about
+    # `ro`, so the copy's attributes are left exactly as the copy made them.
+    summary = read_manifest_summary(job, version)
+    protected = bool(summary and summary.get("protected"))
+    read_only_paths: set = set()
+    expected, unchecked_reason = _read_manifest_hashes(
+        job, version, read_only_paths if protected else None)
+    fix_modes = protected and expected is not None
     check: Dict = {"checked": 0, "mismatched": [], "not_in_manifest": [],
                    "missing_from_version": [], "unchecked_reason": unchecked_reason,
                    "verified": False}
 
-    def compare(rel: str, _size: int, _mtime: float, sha: str) -> None:
-        """Compare one restored file's copy-time hash with its manifest entry.
+    def compare(rel: str, _size: int, _mtime: float, sha: str, **_flags) -> None:
+        """Compare one restored file's copy-time hash with its manifest entry,
+        and (protected version) give the restored file its source's mode.
 
         Pops the entry so what is left in `expected` at the end is what the
         restore did not produce. Never raises: `copy_tree` would delete the
-        file just copied if its callback failed.
+        file just copied if its callback failed. `_flags` swallows `ro=True`,
+        which `copy_tree` passes because the STORED file is read-only.
         """
         want = expected.pop(rel, None)
         if want is None:
@@ -770,6 +902,14 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
             check["checked"] += 1
         else:
             check["mismatched"].append(rel)
+        if fix_modes:
+            try:
+                set_read_only(os.path.join(folder, *rel.split("/")),
+                              rel in read_only_paths)
+            except OSError:
+                # Best effort: the file keeps the stored copy's read-only bit,
+                # which is the safe side; the restore itself is unaffected.
+                check["unrestored_modes"] = check.get("unrestored_modes", 0) + 1
 
     try:
         files, restored_bytes, errors = copy_tree(
@@ -830,5 +970,8 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
                     "could not be read from the backup and were skipped")
     if sentence and not sentence.startswith(" and "):
         message += sentence
+    if check.get("unrestored_modes"):
+        message += (f". {_files(check['unrestored_modes'])} could not be made "
+                    "writable and stayed read-only (clear the read-only mark to edit)")
     return dict(check, ok=True, message=message, path=folder, files=files,
                 bytes=restored_bytes, errors=errors)

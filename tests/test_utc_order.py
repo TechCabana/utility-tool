@@ -17,6 +17,7 @@ from datetime import datetime as real_datetime, timezone
 
 import pytest
 
+from helpers import clear_ro
 from utils import backup_utils, jobs_store, runner, versions
 
 N1, N2, N3 = "20260101-000000", "20260201-000000", "20260301-000000"
@@ -502,6 +503,7 @@ def strip_utc(job, stamp):
     """Rewrite version `stamp`'s manifest as an older build wrote it: no
     `finished_utc` in the trailer (and nothing else changed)."""
     path = backup_utils.manifest_path(job, stamp)
+    clear_ro(path)      # a finished version's manifest is read-only (card fEC32w6P)
     with open(path, encoding="utf-8") as fh:
         lines = fh.read().splitlines()
     end = json.loads(lines[-1])

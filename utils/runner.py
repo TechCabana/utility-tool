@@ -18,13 +18,14 @@ from typing import Callable, Dict, Optional
 from utils import jobs_store, locks, precheck, runlog, verify
 from utils.copying import (BackupAborted, SourceUnavailable, TargetWriteFailed,
                            _writing, copy_tree, walk_tree)
-from utils.fs_utils import long_path, plain_error
+from utils.fs_utils import long_path, plain_error, remove_file
 from utils.jobs_store import job_verify_mode
 from utils.preflight import _preflight_and_sweep, target_volume
 from utils.verify import _quick_verify
 from utils.versions import (MANIFEST_VERSION, VERSION_FORMAT, _discard, is_sanity_drop,
                             is_verified, job_root, latest_version, manifest_path,
-                            prune_versions, pruning_held_sentence, restore_candidates,
+                            protect_version, prune_versions, pruning_held_sentence,
+                            restore_candidates,
                             sanity_baseline, utc_stamp, version_path,
                             version_when)
 
@@ -120,7 +121,12 @@ def run_job(job: Dict,
        fsync, rename the manifest into place, and only then rename
        `.partial` to `<stamp>` -- so a version folder never exists without
        its finished manifest. An "off" version is promoted like any other.
-    4. Prune, which never removes the newest verified version, nor the
+       The trailer also says `protected: true` (see step 4).
+    4. Mark the promoted version's files and its manifest read-only
+       (`versions.protect_version`, card fEC32w6P): after every write into the
+       version is done, before the prune. A failure to mark is counted in
+       `protect_failed` (`protected` False) and never fails the run.
+    5. Prune, which never removes the newest verified version, nor the
        baseline the source sanity guard protects (see below).
 
     Source files that could not be read are reported in `errors` and left
@@ -645,7 +651,7 @@ def _backup(job: Dict,
                                       "stamp": stamp, "source": source}) + "\n")
 
             def record(rel: str, size: int, mtime: float, sha: str,
-                       changed: bool = False) -> None:
+                       changed: bool = False, ro: bool = False) -> None:
                 """Stream one file's manifest line straight to disk.
 
                 Raises TargetWriteFailed, not OSError: copy_tree would count
@@ -653,12 +659,17 @@ def _backup(job: Dict,
                 file the manifest omits. `changed` (card RnuRsA2V) adds
                 `"changed": true` to the line of a file that was still being
                 written on its second copy too; the key is absent otherwise,
-                and every reader ignores keys it does not know.
+                and every reader ignores keys it does not know. `ro` (card
+                fEC32w6P) adds `"ro": true` the same way when the SOURCE file
+                was read-only: finished versions are marked read-only, so the
+                stored copy's own bit can no longer say what the source's was.
                 """
                 line = {"type": "file", "path": rel, "size": size,
                         "mtime": mtime, "sha256": sha}
                 if changed:
                     line["changed"] = True
+                if ro:
+                    line["ro"] = True
                 with _writing(manifest_tmp):
                     out.write(json.dumps(line) + "\n")
                     out.flush()
@@ -749,7 +760,8 @@ def _backup(job: Dict,
             out.write(json.dumps({"type": "end", "files": files,
                                   "bytes": copied_bytes, "verify": mode,
                                   "verified": mode != "off",
-                                  "finished_utc": finished_utc}) + "\n")
+                                  "finished_utc": finished_utc,
+                                  "protected": True}) + "\n")
             out.flush()
             os.fsync(out.fileno())
         os.replace(long_path(manifest_tmp), long_path(manifest))
@@ -757,10 +769,22 @@ def _backup(job: Dict,
     except OSError as exc:
         _discard(partial, manifest_tmp)
         try:
-            os.remove(long_path(manifest))
+            remove_file(manifest)
         except OSError:
             pass
         return {"ok": False, "message": f"Could not finalise the backup: {plain_error(exc)}"}
+
+    # Card fEC32w6P: the version is final (manifest and folder promoted, nothing
+    # writes into it any more), so mark its files and manifest read-only now,
+    # before the prune. Never fails the run: a file that cannot be marked is
+    # counted and said so, and the version stays valid. The trailer's
+    # `protected: true` above is written first, so it states which RULES the
+    # version follows (restore reads `ro` lines), not that every mark landed.
+    try:
+        marking = protect_version(job, stamp)
+    except Exception:  # protect_version should not raise; a bug in it must not fail a good backup
+        marking = {"marked": 0, "failed": files + 1}
+    protect_failed = marking["failed"]
 
     # Source sanity guard (card 51): a run that lost far more files than the
     # best retained version had still succeeds and its version is kept, and
@@ -808,6 +832,9 @@ def _backup(job: Dict,
         message += (f". {changed} file(s) were still changing while they were "
                     "copied, even on a second try, so each may mix old and new "
                     "parts (changed during backup)")
+    if protect_failed:
+        message += (f". {protect_failed} file(s) could not be marked read-only, "
+                    "so they can be changed by accident (the backup itself is complete)")
     if held:
         message += ". " + pruning_held_sentence(files, baseline)
     if pruned:
@@ -826,6 +853,7 @@ def _backup(job: Dict,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
             "not_copied": not_copied, "retried": retried,
             "recopied": recopied, "changed": changed,
+            "protected": not protect_failed, "protect_failed": protect_failed,
             "changed_sample": changed_sample,
             "links_skipped": links, "links_folders": links_folders,
             "links_sample": links_sample, "links_sentence": sentence,

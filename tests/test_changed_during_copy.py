@@ -16,6 +16,7 @@ import threading
 
 import pytest
 
+from helpers import clear_ro
 from utils import backup_utils, copying, jobs_store, runlog
 from utils.fs_utils import long_path
 
@@ -626,6 +627,7 @@ def test_a_manifest_without_the_key_reads_exactly_like_one_with_it(job, monkeypa
 
     # An older manifest: the same file lines without the extra key.
     path = result["manifest"]
+    clear_ro(path)      # a finished version's manifest is read-only (card fEC32w6P)
     lines = [json.loads(l) for l in open(path, encoding="utf-8")]
     for entry in lines:
         entry.pop("changed", None)
