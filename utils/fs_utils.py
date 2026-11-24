@@ -9,6 +9,7 @@ through (`long_path`), and byte formatting for the Restore table.
 
 Qt-free by design (CLAUDE.md §3/§8) -- plain paths in, plain values out.
 """
+import datetime
 import errno
 import os
 import sys
@@ -188,3 +189,22 @@ def human_size(num_bytes: int) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} {_UNITS[-1]}"
+
+
+def short_when(stamp: str) -> str:
+    """An ISO timestamp as "09 Sep 08:49", the form the job table shows.
+
+    The year is dropped for a time in the current year (it is almost never what
+    is being read, and the long form set the column's minimum width) and kept,
+    without the time, for an earlier year, where the year IS the point. "-" for
+    an empty value; an unparseable one is shown as stored, trimmed, never raised.
+    """
+    if not stamp:
+        return "-"
+    try:
+        moment = datetime.datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return str(stamp).replace("T", " ")[:16]
+    if moment.year != datetime.datetime.now().year:
+        return moment.strftime("%d %b %Y")
+    return moment.strftime("%d %b %H:%M")

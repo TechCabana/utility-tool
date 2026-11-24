@@ -279,15 +279,21 @@ def test_a_source_that_goes_away_during_verification_does_not_matter(job, tmp_pa
     assert backup_utils.is_verified(job, result["version"])
 
 
-def test_a_source_that_blips_away_for_one_file_is_just_a_skip(job, tmp_path, monkeypatch):
+@pytest.mark.parametrize("blips,recovered", [
+    ({2}, True),                 # back for the retry (card b5CfTkL8): copied after all
+    ({2, FILES + 1}, False),     # gone for the retry too: one skipped file
+])
+def test_a_source_that_blips_away_for_one_file_is_just_a_skip(job, tmp_path, monkeypatch,
+                                                              blips, recovered):
     # Gone for exactly one file's read, back before the next look: the run
-    # sees a live root and one skipped file, not an unavailable source.
+    # sees a live root and one unreadable file, not an unavailable source. The
+    # single retry after the walk is the file's second look.
     real = backup_utils._hash_copy
     state = {"n": 0}
 
     def wrapper(src, dst):
         state["n"] += 1
-        if state["n"] != 2:
+        if state["n"] not in blips:
             return real(src, dst)
         move(job["source"], tmp_path / "away")
         try:
@@ -300,7 +306,12 @@ def test_a_source_that_blips_away_for_one_file_is_just_a_skip(job, tmp_path, mon
     result = backup_utils.run_job(job)
 
     assert result["ok"], result["message"]
-    assert result["files"] == FILES - 1 and len(result["errors"]) == 1
+    if recovered:
+        assert result["files"] == FILES and result["errors"] == []
+        assert result["retried"] == 1
+    else:
+        assert result["files"] == FILES - 1 and len(result["errors"]) == 1
+        assert result["retried"] == 0
 
 
 def test_a_root_replaced_by_an_empty_folder_fails_as_incomplete(job, tmp_path):

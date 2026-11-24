@@ -81,7 +81,8 @@ def run_job(job: Dict,
             on_progress: Optional[Callable[[int, int], None]] = None,
             should_abort: Optional[Callable[[], bool]] = None,
             on_phase: Optional[Callable[[str], None]] = None,
-            trigger: str = "manual") -> Dict:
+            trigger: str = "manual",
+            after_lock: Optional[Callable[[], None]] = None) -> Dict:
     """Take one versioned, checked copy of `job`'s source; prune old versions.
 
     Returns a plain result dict: `ok`, `message`, and on success `version`,
@@ -138,8 +139,12 @@ def run_job(job: Dict,
     and keeps its version, and that largest version is protected from
     pruning while the others prune by retention as usual (it does not count
     toward retention): `pruning_held` is True, `baseline_files` is its count
-    and the message says so. No baseline (a first run) never holds. See
-    `versions.sanity_baseline` and `prune_versions(protect=...)`.
+    and the message says so (`baseline_stamp` names it). No baseline (a first
+    run) never holds. See `versions.sanity_baseline` and
+    `prune_versions(protect=...)`. The owner can end a hold with
+    `release_hold`; the guard then ignores versions older than the release
+    (the acknowledgement is read from the jobs file, so a stale `job` dict
+    cannot undo it).
 
     `on_phase` is called with "copying" and then, unless the mode is "off",
     "verifying"; `on_progress` restarts from 0 for the verify pass (over the
@@ -155,6 +160,10 @@ def run_job(job: Dict,
     result message says so.
 
     `preflight()` runs after the lock and nothing is created until it passes.
+    `after_lock`, if given, is called once the lock is held and before
+    pre-flight: work that walks the source (the first unattended run's
+    pre-check) belongs there, so a run refused as busy never starts it. It must
+    not raise; if it does, the lock is released and the exception propagates.
 
     **Run log (card 52).** Every call appends exactly one line to the job's log
     (`utils/runlog.py`) once the lock is released -- success, failure, cancelled,
@@ -165,7 +174,7 @@ def run_job(job: Dict,
     """
     start = datetime.now()
     try:
-        result = _locked_run(job, on_progress, should_abort, on_phase)
+        result = _locked_run(job, on_progress, should_abort, on_phase, after_lock)
     except BaseException as exc:
         runlog.append_run(job, {"ok": False, "message": f"{type(exc).__name__}: {exc}"},
                           trigger, start)
@@ -177,7 +186,8 @@ def run_job(job: Dict,
 def _locked_run(job: Dict,
                 on_progress: Optional[Callable[[int, int], None]],
                 should_abort: Optional[Callable[[], bool]],
-                on_phase: Optional[Callable[[str], None]]) -> Dict:
+                on_phase: Optional[Callable[[str], None]],
+                after_lock: Optional[Callable[[], None]] = None) -> Dict:
     """`run_job` without the log: take the per-job lock, run, release it."""
     lock_path = _job_lock_path(job)
     if lock_path is None:
@@ -191,6 +201,13 @@ def _locked_run(job: Dict,
         return {"ok": False, "message": f"Could not take the backup lock: {exc}. "
                 "Nothing was changed."}
     try:
+        # A previous run of this job that died leaves its start marker behind;
+        # record that fact before this run replaces the marker. Nothing is
+        # written unless there is a stale marker, and a busy run (above) never
+        # gets here, so a refusal leaves the jobs file as it was.
+        settle_interrupted(job["id"], check_lock=False)
+        if after_lock is not None:
+            after_lock()
         result = _run_job(job, on_progress, should_abort, on_phase)
     finally:
         lock.release()
@@ -219,6 +236,156 @@ def _job_lock_path(job: Dict) -> Optional[str]:
     return os.path.join(jobs_store._locks_dir(), runlog.safe_id(job_id) + ".lock")
 
 
+# ---------------------------------------------------------------------------
+# Interrupted runs (card PQPfznG1)
+# ---------------------------------------------------------------------------
+#
+# The marker itself (`jobs_store.job_running`) is written by `_mark_running`
+# just before copying and removed by `record_run`. What reads it, and what it
+# means, lives here because the answer needs the per-job lock path.
+
+# `last_result` of a job whose run was found interrupted. It does not start
+# with "ok", so every reader that treats `startswith("ok")` as success (the
+# Backup tab's status and warning code) already treats it as a failure.
+INTERRUPTED_PREFIX = "interrupted"
+
+
+def interrupted_result(since: str) -> str:
+    """The `last_result` text for a run that began at `since` and never ended."""
+    return f"{INTERRUPTED_PREFIX}: started {since} and never finished"
+
+
+def _lock_live(job: Dict) -> bool:
+    """True when `job`'s per-job lock is held by a live owner: a run is under
+    way right now, whatever an older start marker says."""
+    path = _job_lock_path(job)
+    return path is not None and locks.is_held(path)
+
+
+def _stale_marker(job: Dict, check_lock: bool = True) -> Optional[Dict]:
+    """`job`'s start marker when nothing is running it any more, else None.
+
+    None for: no marker (or a junk one); an owner that is alive (running, however
+    long -- `jobs_store.running_owner_gone`); and, with `check_lock`, a per-job
+    lock held by a live owner, because then ANOTHER run is in progress (it took
+    over after the marked one died and has not marked itself yet). A caller
+    that holds the lock itself passes `check_lock=False`.
+    """
+    marker = jobs_store.job_running(job)
+    if marker is None or not jobs_store.running_owner_gone(marker):
+        return None
+    if check_lock and _lock_live(job):
+        return None
+    return marker
+
+
+def job_interrupted(job: Dict) -> Optional[Dict]:
+    """`{"since", "stamp", "settled"}` when `job`'s latest run began and never
+    finished, else None. Pure: reads the dict and the process table, writes
+    nothing, no Qt.
+
+    Two forms of the same fact. A start marker whose owner is gone is
+    `settled=False`; the same fact after `settle_interrupted` has recorded it
+    (`last_result` starts with "interrupted", `last_run` is when it began) is
+    `settled=True` with no `stamp`. A marker whose owner is alive, or whose job
+    is locked by a live run, is a run in progress, never "interrupted".
+    """
+    if jobs_store.job_running(job) is not None:
+        marker = _stale_marker(job)
+        return ({"since": marker["since"], "stamp": marker["stamp"], "settled": False}
+                if marker else None)
+    result = job.get("last_result")
+    if isinstance(result, str) and result.startswith(INTERRUPTED_PREFIX) and job.get("last_run"):
+        return {"since": job["last_run"], "stamp": None, "settled": True}
+    return None
+
+
+def settle_interrupted(job_id: str, check_lock: bool = True) -> Optional[Dict]:
+    """Turn a start marker with no owner into the recorded fact, exactly once.
+
+    Under the jobs-file lock, from a fresh read: if the job's marker is stale,
+    the job gets `last_run` = when that run began, `last_result` =
+    "interrupted: started ... and never finished" and loses the marker, in one
+    atomic write; then ONE line (outcome "interrupted") is appended to the run
+    log. The second call finds no marker, so it neither writes nor logs again,
+    however many processes look.
+
+    Why here and not in the renderer: every reader of `last_result` (not only
+    the Backup tab) sees a failure from then on, and the run log is complete
+    even if nobody ever runs the job again. It is called when a run starts
+    (`_locked_run`, which holds the lock: `check_lock=False`), when the headless
+    run starts, and when the Backup tab loads the jobs. The log line follows the
+    write, so a crash in between loses a line rather than duplicating one.
+
+    Returns the marker settled (`since`, `stamp`), or None when there was
+    nothing to settle or the jobs file could not be read or written (a damaged
+    file is reported by its usual paths, not here).
+    """
+    try:
+        with jobs_store._jobs_file_lock():
+            stored = jobs_store.get_job(job_id)
+            marker = _stale_marker(stored, check_lock) if stored else None
+            if marker is None:
+                return None
+            stored["last_run"] = marker["since"]
+            stored["last_result"] = interrupted_result(marker["since"])
+            stored.pop("running", None)
+            jobs_store._save_job(stored)
+    except (jobs_store.JobsFileCorrupt, OSError):
+        return None
+    began = datetime.fromisoformat(marker["since"])
+    runlog.append_run(
+        stored, {"ok": False, "interrupted": True, "cause": "interrupted",
+                 "version": marker["stamp"],
+                 "message": f"The run that started at {marker['since']} never "
+                            "finished: its process stopped before it recorded a result."},
+        "recovery", began, began)
+    return marker
+
+
+def settle_all_interrupted(jobs: list) -> bool:
+    """`settle_interrupted` for every job in `jobs` that reads as interrupted by
+    an unsettled marker; True if any was settled (the caller re-reads the file)."""
+    changed = False
+    for job in jobs:
+        info = job_interrupted(job)
+        if info is not None and not info["settled"] and settle_interrupted(job.get("id")):
+            changed = True
+    return changed
+
+
+def _mark_running(job: Dict, stamp: str, began: Optional[Dict]) -> None:
+    """Record that this run is about to copy, on the stored job.
+
+    Never fails the backup: a lock timeout, a damaged jobs file (its usual
+    handling still happens when `record_run` runs) or a job that is not in the
+    file just means no marker, and the run reads as it always did. On success
+    the marker is copied into `began` so `_abandon_run` knows this run owns one.
+    """
+    try:
+        marker = jobs_store.new_running_marker(stamp)
+        if jobs_store.set_running(job.get("id"), marker) and began is not None:
+            began.update(marker)
+    except Exception:  # ponytail: a marker is a courtesy; no retry, no log sink
+        pass
+
+
+def _abandon_run(job: Dict, exc: BaseException) -> None:
+    """A run that was marked is leaving by an exception no handler recorded:
+    record it as failed now, which also removes the marker.
+
+    Without this the job would keep a marker whose owner (this still-living
+    process) reads as "running" for as long as the process lives, and the
+    earlier "ok" would stand. Same write the caller's own `record_run` makes
+    (and a second one overwrites it harmlessly). Never raises.
+    """
+    try:
+        jobs_store.record_run(job.get("id"), {
+            "ok": False, "message": f"{type(exc).__name__}: {exc}"})
+    except Exception:
+        pass
+
+
 def _busy_message(holder: Optional[Dict]) -> str:
     """The plain-English refusal for a run that found its job already running."""
     if not holder:
@@ -231,6 +398,113 @@ def _busy_message(holder: Optional[Dict]) -> str:
             f"{holder.get('pid')}). Nothing was changed.")
 
 
+RELEASE_NOTHING = "Nothing to release: this backup is not holding any older version."
+RELEASE_BUSY = "A backup is running; try again when it finishes."
+
+
+def _released_message(baseline: int, retention) -> str:
+    """What a release tells the owner: the older backup is not kept aside any
+    more, and (honestly) it is still on disk until the normal clean-up."""
+    keep = max(1, int(retention)) if isinstance(retention, int) else jobs_store.DEFAULT_RETENTION
+    return (f"Done: the earlier backup ({baseline} files) is no longer kept "
+            "aside. Nothing was deleted now; it is removed in the normal "
+            f"clean-up once it is older than the {keep} backups you keep.")
+
+
+def _release_locked(job_id: str) -> Dict:
+    """The release itself; the caller holds the job's run lock.
+
+    Everything is decided from a fresh read under the jobs-file lock, because
+    the screen's idea of the job may be stale. Raises JobsFileCorrupt or
+    OSError (lock timeout, write failure) like `save_job`.
+    """
+    with jobs_store._jobs_file_lock():
+        job = jobs_store.get_job(job_id)
+        if job is None:
+            return {"ok": False, "released": False, "cause": "unknown_job",
+                    "message": f"There is no backup job with id '{job_id}'."}
+        baseline = jobs_store.job_baseline_files(job)
+        current = jobs_store.job_last_files(job)
+        if not jobs_store.job_pruning_held(job):
+            return {"ok": True, "released": False,
+                    "message": RELEASE_NOTHING, "baseline_files": 0,
+                    "current_files": current, "baseline_stamp": None}
+        newest = latest_version(job)
+        _, stamp = sanity_baseline(job, exclude=newest)
+        if newest is not None:
+            job["hold_released"] = {
+                "stamp": stamp or "", "files": baseline, "level": current,
+                "since": newest, "time": datetime.now().isoformat(timespec="seconds")}
+        job["last_pruning_held"] = False
+        job["last_baseline_files"] = 0
+        jobs_store._save_job(job)
+    return {"ok": True, "released": True,
+            "message": _released_message(baseline, job.get("retention")),
+            "baseline_files": baseline, "current_files": current,
+            "baseline_stamp": stamp}
+
+
+def release_hold(job_id: str, trigger: str = "manual") -> Dict:
+    """Let go of a pruning hold the owner says is expected (card QnFM2GMZ).
+
+    The source sanity guard keeps one older, larger backup (the baseline) aside
+    while the source stays more than 30% below it. A person who really did
+    delete folders on purpose has no other way to say so, so this records
+    that on the job -- `hold_released = {stamp, files, level, since, time}` --
+    and clears the hold markers so the card stops saying "pruning held".
+
+    **The rule it sets up** (applied by `versions.sanity_baseline`): versions
+    older than `since` -- the newest version at the moment of release, i.e.
+    the one holding the `level` the source was at -- are no longer compared
+    with. The next run prunes by plain retention, so the old large version
+    goes as soon as it is outside retention, and cannot re-hold in the
+    meantime just because it is still on disk. `level` becomes the reference:
+    a later run more than 30% below it holds again (protecting the then
+    largest version from `since` on), and a source that grows back is
+    guarded against its new size like any other. A second release simply
+    replaces the acknowledgement.
+
+    **It never deletes or moves anything.** Pruning happens only in a later
+    run, through `prune_versions`. With no active hold it is a no-op:
+    `ok=True, released=False` and a plain message, and nothing is written.
+
+    The job's run lock is taken first, so releasing while that job is running
+    is refused (`busy=True`, `ok=False`): the run's own `record_run` would
+    otherwise overwrite the acknowledgement. Then the jobs-file lock and a
+    fresh read, as `record_run` does.
+
+    Returns `{ok, released, message, baseline_files, current_files,
+    baseline_stamp}`; an unknown id is `ok=False, cause="unknown_job"`. Raises
+    JobsFileCorrupt for a damaged jobs file. A release is logged as one line
+    in the job's run log (`trigger` "manual" or "cli"); that never fails it.
+    """
+    start = datetime.now()
+    job = jobs_store.get_job(job_id)             # JobsFileCorrupt propagates
+    if job is None:
+        return {"ok": False, "released": False, "cause": "unknown_job",
+                "message": f"There is no backup job with id '{job_id}'."}
+    lock_path = _job_lock_path(job)
+    if lock_path is None:
+        return {"ok": False, "released": False,
+                "message": "This backup job has no usable id. Nothing was changed."}
+    try:
+        lock = locks.acquire(lock_path, f"release hold {job_id}")
+    except locks.LockBusy:
+        return {"ok": False, "released": False, "busy": True, "message": RELEASE_BUSY}
+    except OSError as exc:
+        return {"ok": False, "released": False,
+                "message": f"Could not take the backup lock: {exc}. Nothing was changed."}
+    try:
+        result = _release_locked(job_id)
+    finally:
+        lock.release()
+    if result.get("released"):
+        # After both locks are gone, as the run log requires.
+        runlog.append_run(job, dict(result, hold_released=True, files=result["current_files"]),
+                          trigger, start)
+    return result
+
+
 def _run_job(job: Dict,
              on_progress: Optional[Callable[[int, int], None]],
              should_abort: Optional[Callable[[], bool]],
@@ -240,7 +514,15 @@ def _run_job(job: Dict,
     if problem:
         result = {"ok": False, "message": problem}
     else:
-        result = _backup(job, on_progress, should_abort, on_phase)
+        began: Dict = {}   # filled by `_backup` once it has marked the job
+        try:
+            result = _backup(job, on_progress, should_abort, on_phase, began)
+        except BaseException as exc:
+            # Includes types no handler below expects (and KeyboardInterrupt):
+            # the marker must not outlive a run that is leaving by a raise.
+            if began:
+                _abandon_run(job, exc)
+            raise
     return _with_sweep(result, sweep)
 
 
@@ -263,11 +545,36 @@ def _with_sweep(result: Dict, sweep: Optional[Dict]) -> Dict:
     return result
 
 
+def _with_stored_release(job: Dict) -> Dict:
+    """`job`, carrying the "this is expected" acknowledgement the jobs FILE has.
+
+    A caller's job dict can be older than a release made meanwhile (the GUI
+    holds the jobs it loaded; `main.py --release-hold` writes the file), and
+    a run that judged the source with the stale dict would hold again at once.
+    So the stored acknowledgement wins over the dict's own. An unreadable jobs
+    file or a job not in it (a test's unsaved dict) leaves `job` as it was.
+    """
+    try:
+        stored = jobs_store.get_job(job.get("id"))
+    except (jobs_store.JobsFileCorrupt, OSError):
+        return job
+    release = jobs_store.job_hold_released(stored) if stored else None
+    return dict(job, hold_released=release) if release else job
+
+
 def _backup(job: Dict,
             on_progress: Optional[Callable[[int, int], None]],
             should_abort: Optional[Callable[[], bool]],
-            on_phase: Optional[Callable[[str], None]]) -> Dict:
-    """The copy, verify, promote and prune steps, after pre-flight has passed."""
+            on_phase: Optional[Callable[[str], None]],
+            began: Optional[Dict] = None) -> Dict:
+    """The copy, verify, promote and prune steps, after pre-flight has passed.
+
+    Once the version stamp is claimed -- every refusal that can happen before
+    any copying (a guard, an unwritable target, a stamp clash) is behind us --
+    the job is marked as started (`_mark_running`; `began` receives the marker),
+    so a run killed from here on reads as interrupted instead of leaving the
+    previous result standing. The caller's `record_run` removes the marker.
+    """
     source, target = job["source"], job["target"]
 
     root = job_root(job)
@@ -285,6 +592,7 @@ def _backup(job: Dict,
     manifest = manifest_path(job, stamp)
     manifest_tmp = manifest + ".tmp"
 
+    _mark_running(job, stamp, began)
     if on_phase is not None:
         on_phase("copying")
     stats: Dict[str, int] = {}
@@ -313,7 +621,8 @@ def _backup(job: Dict,
 
             files, copied_bytes, errors = copy_tree(
                 source, partial, on_progress=on_progress,
-                should_abort=should_abort, on_copied=record, stats=stats)
+                should_abort=should_abort, on_copied=record, stats=stats,
+                retry_skipped=True)
     except BackupAborted:
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": "Backup cancelled"}
@@ -410,11 +719,11 @@ def _backup(job: Dict,
     # rest prune as usual -- so a mostly-emptied source cannot roll every
     # complete copy out of retention, and a source that stays low cannot grow
     # the target without bound. The new version is excluded from the baseline.
-    baseline, baseline_stamp = sanity_baseline(job, exclude=stamp)
+    baseline, baseline_stamp = sanity_baseline(_with_stored_release(job), exclude=stamp)
     held = is_sanity_drop(baseline, files)
     if not held:
         baseline = 0
-    pruned = prune_versions(job, protect={baseline_stamp} if held else ())
+    pruned = prune_versions(job, protect={baseline_stamp} if held else (), newest=stamp)
     if mode == "quick":
         message = (f"Backed up {files} file(s) to {final} and quick-checked "
                    f"{sampled} of {files} file(s) (sizes of all, hashes of a sample)")
@@ -426,6 +735,13 @@ def _backup(job: Dict,
     # `errors` has one entry per unreadable FOLDER, so count the files that
     # never landed against the count taken before the copy instead.
     not_copied = max(len(errors), stats.get("not_copied", 0))
+    # Card b5CfTkL8: files that could not be read at first and were copied by
+    # the one retry after the walk. They are in the backup, so they are in
+    # `files`, the manifest and the verification, and not in the skipped count.
+    retried = stats.get("retried", 0)
+    if retried:
+        message += (f". {retried} file(s) could not be read at first and were "
+                    "copied on the second try")
     if errors:
         message += (f". {not_copied} file(s) could not be read and were "
                     "skipped, so they are not in this backup")
@@ -436,8 +752,9 @@ def _backup(job: Dict,
         message += ("" if message.endswith(".") else ".") + f" Removed {len(pruned)} old version(s)"
     return {"ok": True, "message": message, "version": stamp, "files": files,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
-            "not_copied": not_copied,
+            "not_copied": not_copied, "retried": retried,
             "pruning_held": held, "baseline_files": baseline,
+            "baseline_stamp": baseline_stamp if held else None,
             "verified": mode != "off", "verify_mode": mode, "manifest": manifest,
             "target_volume": target_volume(target)}
 

@@ -299,6 +299,18 @@ def load_fonts(directory=None):
             print(f"[WARN] Could not load font '{path}'")
 
 
+def interrupted_notice(job):
+    """The one plain line for a job whose previous run began and never
+    finished, or "" when it did not (or a live run is in progress)."""
+    from utils import backup_utils
+    from utils.fs_utils import short_when
+    found = backup_utils.job_interrupted(job)
+    if not found:
+        return ""
+    return (f"The previous run of this backup was interrupted (started "
+            f"{short_when(found['since'])}) and never finished.")
+
+
 def run_backup_job_cli(job_id):
     """Run one backup job with no GUI at all, and return a process exit code.
 
@@ -315,7 +327,9 @@ def run_backup_job_cli(job_id):
     and the job's last result is left as it was); 5 is `--precheck-job`'s
     "problems found" (see `precheck_job_cli`). If the run finished but its
     result could not be written back (the jobs-file lock timed out), the exit
-    code is still the run's own, 0 or 1, and the message says so.
+    code is still the run's own, 0 or 1, and the message says so. If the job's
+    previous run began and never finished, one `[WARN]` line says so first and
+    the run goes ahead; it changes no exit code.
     """
     from utils import backup_utils, runlog
 
@@ -347,9 +361,25 @@ def run_backup_job_cli(job_id):
     # or scheduled before the check existed) gets one before its first
     # unattended run. It never blocks the run -- the backup's own failure
     # handling stays authoritative -- and it is recorded only once the run
-    # was not refused as busy, which must leave the jobs file untouched.
-    first_check = _first_run_precheck(job) if "last_precheck" not in job else None
-    result = backup_utils.run_job(job, trigger="scheduled")
+    # was not refused as busy, which must leave the jobs file untouched. It
+    # runs through `after_lock`, i.e. once the job's run lock is held, so a run
+    # refused as busy never walks the source first.
+    notice = interrupted_notice(job)
+    if notice:
+        # Card PQPfznG1: the last run of this job began and never finished. Say
+        # so, then carry on; the run itself records that fact in the run log
+        # and replaces the marker. Loud on stderr, exit code unchanged.
+        print("[WARN] " + notice, file=sys.stderr)
+    checked = {}
+
+    def check_first_run():
+        """Pre-check this job, now that the run lock is ours."""
+        checked["report"] = _first_run_precheck(job)
+
+    result = backup_utils.run_job(
+        job, trigger="scheduled",
+        after_lock=None if "last_precheck" in job else check_first_run)
+    first_check = checked.get("report")
     if result.get("busy"):
         # Not a result of this job: recording it would overwrite the real last
         # run's outcome with "failed: already running".
@@ -423,12 +453,17 @@ def _first_run_precheck(job):
     report for the caller to record, or None if the check could not run.
 
     Prints any problems as warnings on stderr. Never raises and never stops
-    the run that follows.
+    the run that follows. The per-file open is skipped (`check_open=False`):
+    this runs while the job's lock is held, so a slow walk (Defender scans
+    each open, 72 s for 10,142 files on a first pass) would hold the lock and
+    delay the first backup for no gain -- a file that cannot be opened is
+    skipped, counted and named by the run itself, and nobody is watching an
+    unattended run's warnings to act on them first. `--precheck-job` keeps it.
     """
     from utils import precheck
     _safe_console()
     try:
-        report = precheck.precheck(job)
+        report = precheck.precheck(job, check_open=False)
     except Exception as exc:  # the backup's own handling stays authoritative
         print(f"[WARN] The pre-check could not run: {exc}", file=sys.stderr)
         return None
@@ -481,12 +516,54 @@ def precheck_job_cli(job_id):
     return 5
 
 
+def release_hold_cli(job_id):
+    """Tell a job its pruning hold is expected (`main.py --release-hold <job id>`),
+    print what happened and return a process exit code. No GUI.
+
+    The scripted twin of the Backup screen's "This is expected: forget the
+    larger backup" (card QnFM2GMZ). It never deletes anything: the earlier
+    backup goes in a later run's normal clean-up.
+
+    Exit codes: 0 released, or nothing to release (a no-op is not a failure),
+    2 no such job, 3 the jobs file is damaged (nothing was written), 4 the
+    job is running right now (nothing was written; try again afterwards), 1
+    the acknowledgement could not be saved (the jobs-file lock timed out or
+    the write failed).
+    """
+    from utils import backup_utils
+    _safe_console()
+    migrate.migrate_data()  # as --run-backup-job: the jobs file may be pre-rename
+    try:
+        result = backup_utils.release_hold(job_id, trigger="cli")
+    except backup_utils.JobsFileCorrupt as exc:
+        hint = f" Open {APP_NAME} to restore it." if exc.has_backup else ""
+        print(f"[ERROR] {exc}{hint}", file=sys.stderr)
+        return 3
+    except OSError as exc:
+        print(f"[ERROR] The hold could not be released: {exc}", file=sys.stderr)
+        return 1
+    if result.get("busy"):
+        print(f"[SKIPPED] {result['message']}", file=sys.stderr)
+        return 4
+    if result.get("cause") == "unknown_job":
+        print(f"[ERROR] No backup job with id '{job_id}'")
+        return 2
+    if not result["ok"]:
+        print(f"[ERROR] {result['message']}", file=sys.stderr)
+        return 1
+    print("[OK] " + result["message"])
+    return 0
+
+
 # Usage for the headless entry points, printed for a malformed command line.
 HEADLESS_USAGE = (
     "usage: main.py --run-backup-job <job id>   (exit 0 ok, 1 failed, 2 no such job,\n"
     "                                           3 jobs file damaged, 4 already running)\n"
     "       main.py --precheck-job <job id>     (exit 0 nothing to fix, 5 problems found,\n"
-    "                                           2 no such job, 3 jobs file damaged)")
+    "                                           2 no such job, 3 jobs file damaged)\n"
+    "       main.py --release-hold <job id>     (exit 0 released or nothing to release,\n"
+    "                                           1 could not save, 2 no such job,\n"
+    "                                           3 jobs file damaged, 4 job is running)")
 
 
 def main() -> int:
@@ -542,7 +619,10 @@ if __name__ == "__main__":
         sys.exit(run_backup_job_cli(sys.argv[2]))
     if len(sys.argv) >= 3 and sys.argv[1] == "--precheck-job":
         sys.exit(precheck_job_cli(sys.argv[2]))
-    if "--run-backup-job" in sys.argv or "--precheck-job" in sys.argv:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--release-hold":
+        sys.exit(release_hold_cli(sys.argv[2]))
+    if any(flag in sys.argv for flag in ("--run-backup-job", "--precheck-job",
+                                         "--release-hold")):
         print(HEADLESS_USAGE)
         sys.exit(2)
     sys.exit(main())

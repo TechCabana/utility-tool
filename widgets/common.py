@@ -381,7 +381,8 @@ class ConfirmDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, title: str, message: str,
                  confirm_text: str = "Delete", cancel_text: str = "Cancel",
-                 alternate_text: str = "", destructive: bool = True):
+                 alternate_text: str = "", destructive: bool = True,
+                 cancel_default: bool = False):
         super().__init__(parent)
         self.choice = None   # "confirm" / "alternate" once accepted
         self.setWindowTitle(title)
@@ -459,7 +460,13 @@ class ConfirmDialog(QtWidgets.QDialog):
         # Cancel holds focus, not the destructive button: Enter on an
         # unexamined dialog should not delete anything. A non-destructive
         # dialog puts the focus on its suggested choice instead.
-        (cancel if destructive else confirm).setFocus()
+        # `cancel_default` is for a choice that is not destructive but is not
+        # to be taken by an unexamined Enter either (releasing a pruning hold):
+        # Cancel is the default button and holds the focus.
+        if cancel_default:
+            confirm.setDefault(False)
+            cancel.setDefault(True)
+        (cancel if destructive or cancel_default else confirm).setFocus()
 
     def _finish(self, choice: str) -> None:
         """Record which button was pressed and close as accepted."""
@@ -476,11 +483,11 @@ class ConfirmDialog(QtWidgets.QDialog):
     @staticmethod
     def choose(parent, title: str, message: str, confirm_text: str,
                alternate_text: str = "", cancel_text: str = "Cancel",
-               destructive: bool = False) -> Optional[str]:
+               destructive: bool = False, cancel_default: bool = False) -> Optional[str]:
         """Show the dialog modally; return "confirm", "alternate" or None
         (cancelled or closed)."""
         dialog = ConfirmDialog(parent, title, message, confirm_text, cancel_text,
-                               alternate_text, destructive)
+                               alternate_text, destructive, cancel_default)
         dialog.exec()
         return dialog.choice
 

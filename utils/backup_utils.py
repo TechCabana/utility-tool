@@ -34,17 +34,20 @@ from datetime import datetime  # noqa: F401  -- tests subclass `backup_utils.dat
 
 from utils.jobs_store import (  # noqa: F401
     _backup_path, DEFAULT_RETENTION, DEFAULT_VERIFY, get_job, _has_usable_backup,
-    job_baseline_files, job_last_files, job_pruning_held, job_skipped,
-    job_skipped_sample, job_verify_mode, JOBS_FILE, _jobs_file_lock, JOBS_FILENAME, JobsFileCorrupt,
+    job_baseline_files, job_hold_released, job_last_files, job_pruning_held, job_skipped,
+    job_skipped_sample, job_verify_mode, job_running, new_running_marker, running_owner_gone,
+    set_running, JOBS_FILE, _jobs_file_lock, JOBS_FILENAME, JobsFileCorrupt,
     load_jobs, _locks_dir, new_job, quarantine_jobs_file, QuarantineRefused, _read_valid, record_precheck, record_run, remove_job,
-    restore_jobs_from_backup, _save_job, save_job, save_jobs, SCHEDULES, VERIFY_MODES,
+    restore_jobs_from_backup, _save_job, save_job, save_job_settings, save_jobs, SCHEDULES,
+    SETTINGS_KEYS, VERIFY_MODES,
     _write_atomic,
 )
 from utils.versions import (  # noqa: F401
     baseline_files, _discard, is_sanity_drop, is_verified, job_root, _last_line, latest_version,
     _make_writable_and_retry, manifest_path, _MANIFEST_RE, MANIFEST_SUFFIX,
     _MANIFEST_TMP_RE, MANIFEST_VERSION, _PARTIAL_RE, prune_versions,
-    pruning_held_sentence, read_manifest_summary, restore_candidates, restore_version, _rmtree,
+    pruning_held_sentence, read_manifest_summary, release_hold_question, restore_candidates,
+    restore_version, _rmtree,
     SANITY_DROP_FRACTION, sanity_baseline, sanity_drop_baseline, _STAMP, SWEEP_MAX_AGE_DAYS, sweep_stale, verified_versions, verify_mode, version_datetime, VERSION_FORMAT,
     version_names, version_path, _VERSION_RE, version_when,
 )
@@ -67,7 +70,10 @@ from utils.preflight import (  # noqa: F401
 )
 from utils.runner import (  # noqa: F401
     _backup, _busy_message, changes_since, CLAIM_ATTEMPTS, _claim_stamp,
-    _job_lock_path, MTIME_TOLERANCE, _run_job, run_job, _with_sweep,
+    _job_lock_path, MTIME_TOLERANCE, release_hold, RELEASE_BUSY, RELEASE_NOTHING, _run_job,
+    run_job, _with_stored_release, _with_sweep,
+    INTERRUPTED_PREFIX, interrupted_result, job_interrupted, settle_all_interrupted,
+    settle_interrupted,
 )
 from utils.scheduler import (  # noqa: F401
     job_argv, job_command, _launchctl, _launchd_domain, _launchd_exists, launchd_label,

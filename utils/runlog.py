@@ -12,11 +12,27 @@ the one app-level log, `logs/app.jsonl`. Every line carries exactly `LINE_KEYS`:
 
     v, start, end, trigger, job, name, outcome, files, bytes, skipped,
     skipped_paths, skipped_more, pruned, version, verify_mode, cause, message,
-    pruning_held, offenders
+    pruning_held, offenders, baseline_files, baseline_stamp, retried
+
+`retried` (card b5CfTkL8) counts the files that could not be read at first and
+were copied by the one retry after the walk; they are in `files`, not `skipped`.
 
 `offenders` (card 104) lists, from the source root, the files a run that failed
 as "path_too_long" or "file_too_large" found the drive cannot hold (at most
 `SKIPPED_PATHS_MAX`); it is empty otherwise.
+
+`baseline_files` and `baseline_stamp` (card QnFM2GMZ) name the older, larger
+backup a run held aside, or that the owner released with "This is expected":
+its file count and its version stamp (0 and null when there is none). The
+release itself is logged as one line with `outcome` "hold_released", `files`
+the count the source had and `trigger` "manual" (the Backup screen) or "cli".
+
+A run that started and never recorded an outcome (the process was killed, the
+machine lost power, it crashed) is logged ONCE, when the next run, the headless
+start or the Backup screen first finds its start marker with no owner left
+(`runner.settle_interrupted`): `outcome` "interrupted", `trigger` "recovery",
+`start` and `end` both the time the lost run began (the moment it died is not
+known), `version` the version stamp it had claimed. No path, no file count.
 
 `outcome` is one of `OUTCOMES`. PATHS AND COUNTS ONLY, never file contents or
 OS error text beyond what a result's own message already carries. The line is
@@ -51,11 +67,12 @@ SKIPPED_PATHS_MAX = 50
 # stay well under a megabyte" true whatever an exception's text turns out to be.
 MESSAGE_MAX = 2000
 APP_LOG_NAME = "app"
-OUTCOMES = ("ok", "ok_skipped", "ok_pruning_held", "failed", "cancelled", "busy")
+OUTCOMES = ("ok", "ok_skipped", "ok_pruning_held", "failed", "cancelled", "busy",
+            "hold_released", "interrupted")
 LINE_KEYS = ("v", "start", "end", "trigger", "job", "name", "outcome", "files",
              "bytes", "skipped", "skipped_paths", "skipped_more", "pruned",
              "version", "verify_mode", "cause", "message", "pruning_held",
-             "offenders")
+             "offenders", "baseline_files", "baseline_stamp", "retried")
 LOCK_TIMEOUT = 2.0
 
 
@@ -95,6 +112,10 @@ def _outcome(result: Dict, skipped: int) -> str:
     """Map a `run_job` result onto one of `OUTCOMES`."""
     if result.get("busy"):
         return "busy"
+    if result.get("interrupted") is True:
+        return "interrupted"
+    if result.get("hold_released") is True:
+        return "hold_released"
     if result.get("ok"):
         if result.get("pruning_held") is True:
             return "ok_pruning_held"
@@ -145,6 +166,13 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
         "offenders": [p for p in (result.get("offenders") or [])
                       if isinstance(p, str)][:SKIPPED_PATHS_MAX]
         if isinstance(result.get("offenders"), list) else [],
+        "baseline_files": _count(result.get("baseline_files")),
+        # A version name or nothing: never a path, whatever the result carries.
+        "baseline_stamp": (result.get("baseline_stamp")
+                           if isinstance(result.get("baseline_stamp"), str)
+                           and jobs_store._STAMP_RE.fullmatch(result["baseline_stamp"])
+                           else None),
+        "retried": _count(result.get("retried")),
     }
 
 

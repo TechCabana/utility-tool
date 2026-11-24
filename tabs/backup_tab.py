@@ -6,7 +6,6 @@ the app was cut down to backup only. The widgets, the worker and the job flow
 are the same code as before; only the host changed, from a QTabWidget page to
 a sidebar page of its own.
 """
-import datetime
 import os
 import re
 from pathlib import Path
@@ -16,7 +15,7 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt
 
 from utils import backup_utils, precheck
-from utils.fs_utils import human_size
+from utils.fs_utils import human_size, long_path, short_when
 from widgets.common import (ConfirmDialog, ElidedLabel, EmptyState, PageHeader,
                             add_field, divider, icon_button, section,
                             section_header, table_header)
@@ -251,7 +250,9 @@ class BackupJobDialog(QtWidgets.QDialog):
 
         if not name:
             return self._fail("Give the job a name.")
-        if not os.path.isdir(source):
+        # long_path, as the run and the pre-check use: a plain isdir drops a
+        # trailing dot, so a folder whose own name ends in one "did not exist".
+        if not source or not os.path.isdir(long_path(source)):
             return self._fail("The source folder does not exist.")
         if not target:
             return self._fail("Choose a target folder for the backups.")
@@ -288,6 +289,8 @@ class PrecheckDialog(QtWidgets.QDialog):
     """The pre-check's report (card 104): one row per problem, each with what
     is wrong, the fix, and an "Open folder" button for the folder holding it.
 
+    It opens only when something would FAIL the run (`blocking`); findings
+    that are merely skipped files show inline instead (`BackupTab._skip_note`).
     Two shapes. After a job is added or edited it only informs (`run_text`
     empty: one Close button). Before Back up now it asks: "Back up anyway" and
     Cancel, and `exec()` is Accepted only for "Back up anyway" -- a pre-check
@@ -433,9 +436,11 @@ class PrecheckDialog(QtWidgets.QDialog):
         """The folder to open for a problem: the one holding the offender (the
         source folder itself for a missing source or target); "" if gone."""
         path = problem["path"]
-        folder = path if problem["kind"] in ("source_unavailable",
+        folder = path if problem["kind"] in ("source_unavailable", "source_empty",
                                              "target_unavailable") else os.path.dirname(path)
-        return folder if folder and os.path.isdir(folder) else ""
+        # long_path: a folder whose own name ends in a dot is real but a plain
+        # isdir cannot see it.
+        return folder if folder and os.path.isdir(long_path(folder)) else ""
 
 
 # The Backup tables' columns, defined once as (label, stretch, minimum width)
@@ -474,6 +479,21 @@ RESTORE_ACTION_WIDTH = 110
 # larger backup aside (card 51): a failure never clears that hold.
 HELD_AFTER_FAILURE = "Older backups are being kept because the source shrank."
 
+# The Status tooltip of a job whose last run started and never finished (card
+# PQPfznG1): the likely causes, in plain words, and that nothing is left to fix.
+INTERRUPTED_DETAIL = (
+    "This backup started but stopped before it finished, so no result was "
+    "recorded. Usual causes: the computer was unplugged, shut down or put to "
+    "sleep while it ran, or the program crashed. The next run starts cleanly; "
+    "any half-finished copy it left behind is removed by the normal clean-up.")
+
+# The button on a held job's card that says the shrink was on purpose (card
+# QnFM2GMZ), and what its confirmation adds to the two counts it names.
+RELEASE_HOLD_TEXT = "This is expected: forget the larger backup"
+RELEASE_HOLD_NOTE = ("Nothing is deleted right now. The earlier backup is removed "
+                     "later, in the normal clean-up, once it is older than the "
+                     "number of backups you keep.")
+
 
 def _tail(path: str, segments: int = 2) -> str:
     """The last few segments of a path, for a narrow table column.
@@ -497,13 +517,23 @@ class JobRow(QtWidgets.QWidget):
     run_requested = QtCore.Signal(dict)
     edit_requested = QtCore.Signal(dict)
     remove_requested = QtCore.Signal(dict)
+    release_hold_requested = QtCore.Signal(dict)
 
     def __init__(self, job: dict):
         super().__init__()
         self.setObjectName("CardBody")
         self.job = job
 
-        h = QtWidgets.QHBoxLayout(self)
+        # The columns are one line; a job whose pruning is held gets a second
+        # line under them with the way out (card QnFM2GMZ), so a row without a
+        # hold is exactly as it was.
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        columns = QtWidgets.QWidget()
+        columns.setObjectName("CardBody")
+        outer.addWidget(columns)
+        h = QtWidgets.QHBoxLayout(columns)
         h.setContentsMargins(0, 10, 0, 10)
         # 4, not the app's usual 12, for a row like this: at 940px (the
         # app's minimum) four columns plus three action buttons plus six
@@ -550,6 +580,43 @@ class JobRow(QtWidgets.QWidget):
                 button.setObjectName("GhostDanger")
             button.clicked.connect(lambda _=False, s=signal: s.emit(self.job))
             h.addWidget(button)
+
+        # Only while a hold is active: nothing to forget otherwise. Built here,
+        # not hidden, so `release_btn is None` is the absence a test can check.
+        self.release_btn = None
+        if backup_utils.job_pruning_held(job):
+            outer.addWidget(self._release_strip(job))
+
+    def _release_strip(self, job: dict) -> QtWidgets.QWidget:
+        """The second line of a held job: what is being kept, and the button
+        that says "this is expected" (it asks before it does anything)."""
+        strip = QtWidgets.QWidget()
+        strip.setObjectName("CardBody")
+        row = QtWidgets.QHBoxLayout(strip)
+        row.setContentsMargins(0, 0, 0, 10)
+        row.setSpacing(8)
+
+        self.release_btn = QtWidgets.QPushButton(RELEASE_HOLD_TEXT)
+        self.release_btn.setObjectName("Secondary")
+        self.release_btn.setToolTip(
+            "Stop keeping the earlier, larger backup aside. Nothing is deleted "
+            "now; it is removed in the normal clean-up.")
+        self.release_btn.setAccessibleName(
+            f"{RELEASE_HOLD_TEXT} for {job.get('name', 'this job')}")
+        # Reachable and operable from the keyboard: Tab focuses it, Space
+        # clicks it, and autoDefault makes Enter click it outside a dialog too.
+        self.release_btn.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.release_btn.setAutoDefault(True)
+        self.release_btn.clicked.connect(lambda: self.release_hold_requested.emit(self.job))
+        row.addWidget(self.release_btn)
+
+        note = QtWidgets.QLabel(
+            f"An earlier backup with {backup_utils.job_baseline_files(job)} files "
+            "is being kept aside.")
+        note.setObjectName("Hint")
+        note.setWordWrap(True)
+        row.addWidget(note, 1)
+        return strip
 
     def _text(self, value: str) -> QtWidgets.QLabel:
         label = QtWidgets.QLabel(value)
@@ -611,6 +678,16 @@ class JobRow(QtWidgets.QWidget):
     def _status(self, job: dict):
         """The Status column: what the last run did, or that none has run."""
         result = job.get("last_result", "")
+        # Card PQPfznG1: a run that began and never finished is a failure, said
+        # with its start time. Checked before "Never run" because a FIRST run
+        # that died has a start marker and no last_run. `job_interrupted` is
+        # None while a live run owns the marker, so the settled text on the job
+        # (the previous run's fact) is read too and keeps showing meanwhile.
+        interrupted = backup_utils.job_interrupted(job)
+        if interrupted or result.startswith(backup_utils.INTERRUPTED_PREFIX):
+            since = interrupted["since"] if interrupted else job.get("last_run", "")
+            return (f"Interrupted: started {short_when(since)} and never finished",
+                    "StatusError")
         if not job.get("last_run"):
             return "Never run", "Hint"
         if result.startswith("ok"):
@@ -629,7 +706,12 @@ class JobRow(QtWidgets.QWidget):
     def _warning_detail(job: dict) -> str:
         """Everything behind an "OK, ..." warning: the skipped files and/or
         the held-pruning sentence with its two counts. For a failed run, only
-        the line saying older backups are still kept aside ("" if not)."""
+        the line saying older backups are still kept aside ("" if not). An
+        interrupted run says why that happens and that nothing is wrong now."""
+        if (backup_utils.job_interrupted(job)
+                or job.get("last_result", "").startswith(backup_utils.INTERRUPTED_PREFIX)):
+            return INTERRUPTED_DETAIL + (
+                "\n\n" + HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else "")
         if not job.get("last_result", "").startswith("ok"):
             # Failure stays the status; a hold an earlier run set survives it.
             return HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else ""
@@ -668,17 +750,8 @@ class JobRow(QtWidgets.QWidget):
         A run from a previous year keeps its year, since that is exactly the
         case where the year IS the point.
         """
-        stamp = job.get("last_run", "")
-        if not stamp:
-            return "-"
-        try:
-            moment = datetime.datetime.fromisoformat(stamp)
-        except (TypeError, ValueError):
-            # Never let an unparseable stored value break the row.
-            return stamp.replace("T", " ")[:16]
-        if moment.year != datetime.datetime.now().year:
-            return moment.strftime("%d %b %Y")
-        return moment.strftime("%d %b %H:%M")
+        # `short_when` never raises on an unparseable stored value.
+        return short_when(job.get("last_run", ""))
 
 
 class RestoreRow(QtWidgets.QWidget):
@@ -837,6 +910,9 @@ class BackupTab(QtWidgets.QWidget):
         # so the remeasure's own outcome does not erase what just happened.
         self._backup_notice = ""
         self._backup_notice_warn = False  # ...and whether that line is a warning
+        # What a skip-only pre-check found, carried into the status line of the
+        # Back up now run it did not interrupt (see `_finish_precheck`).
+        self._precheck_note = ""
 
         v = QtWidgets.QVBoxLayout(self)
         # Margins leave room for the card drop shadows to render un-clipped
@@ -1081,6 +1157,12 @@ class BackupTab(QtWidgets.QWidget):
         """
         try:
             self.jobs = backup_utils.load_jobs()
+            # A run that died leaves a start marker behind; record it as an
+            # interrupted run now (once, and only if no live run owns it) so the
+            # job stops reading as its earlier "ok" for every reader, then
+            # re-read. A read-only no-op for every job without a stale marker.
+            if backup_utils.settle_all_interrupted(self.jobs):
+                self.jobs = backup_utils.load_jobs()
         except backup_utils.JobsFileCorrupt as exc:
             self._show_jobs_damaged(exc)
             return
@@ -1100,6 +1182,7 @@ class BackupTab(QtWidgets.QWidget):
             row.run_requested.connect(self.run_backup_job)
             row.edit_requested.connect(self.edit_backup_job)
             row.remove_requested.connect(self.remove_backup_job)
+            row.release_hold_requested.connect(self.release_pruning_hold)
             self.jobs_layout.addWidget(row)
 
         self.restore_empty.setVisible(not self.jobs)
@@ -1149,6 +1232,43 @@ class BackupTab(QtWidgets.QWidget):
         if self.backup_thread is None:   # no worker started to show it later
             self._backup_notice = ""
             self._say(message)
+
+    def release_pruning_hold(self, job: dict):
+        """Ask, then stop keeping the earlier, larger backup aside (card QnFM2GMZ).
+
+        The counts in the question come from a fresh read of the jobs file, not
+        from the row, so it never quotes numbers a later run has changed. The
+        dialog is non-destructive wording -- nothing is deleted now, the older
+        backup goes in a later run's normal clean-up -- and Cancel is its
+        default button. Does nothing while a backup or restore is running.
+        """
+        if self.backup_thread is not None:
+            return
+        try:
+            fresh = backup_utils.get_job(job["id"])
+        except backup_utils.JobsFileCorrupt:
+            self.refresh_backup()
+            return
+        if fresh is None or not backup_utils.job_pruning_held(fresh):
+            # Gone, or a run ended the hold since the row was drawn.
+            self.refresh_backup()
+            self._say(backup_utils.RELEASE_NOTHING)
+            return
+        question = backup_utils.release_hold_question(
+            backup_utils.job_last_files(fresh), backup_utils.job_baseline_files(fresh))
+        choice = ConfirmDialog.choose(
+            self, "Stop keeping the earlier backup?", f"{question}\n\n{RELEASE_HOLD_NOTE}",
+            confirm_text="Stop keeping it", cancel_default=True)
+        if choice != "confirm":
+            return
+        try:
+            result = backup_utils.release_hold(fresh["id"])
+        except (backup_utils.JobsFileCorrupt, OSError) as exc:
+            self.refresh_backup()
+            self._say(f"The earlier backup is still being kept. {exc}", ok=False)
+            return
+        self.refresh_backup()
+        self._say(result["message"], ok=result["ok"])
 
     # How a folder is opened; tests replace it so no file manager starts.
     open_url = staticmethod(QtGui.QDesktopServices.openUrl)
@@ -1269,7 +1389,9 @@ class BackupTab(QtWidgets.QWidget):
         is more useful than one combined "failed".
         """
         try:
-            backup_utils.save_job(job)
+            # Settings only: the row's copy can be older than a run, a
+            # pre-check or a release recorded since, and must not undo them.
+            backup_utils.save_job_settings(job)
         except backup_utils.JobsFileCorrupt as exc:
             # Nothing was written; the job is not stored or scheduled.
             self.refresh_backup()
@@ -1344,14 +1466,20 @@ class BackupTab(QtWidgets.QWidget):
             )
         self.refresh_backup()
 
-    def _precheck(self, job: dict, then, run_text: str = ""):
+    def _precheck(self, job: dict, then, run_text: str = "", check_open: bool = True):
         """Pre-check `job` off the UI thread, record it, then call `then(report)`.
 
-        Clean: `then` runs at once, with no dialog. Problems: the report dialog
-        opens first; with `run_text` it asks (Cancel or `run_text`) and `then`
-        runs only if the user goes ahead, without it it only informs. A check
-        that could not run at all says so and carries on: it never stands
-        between the user and a backup.
+        Clean: `then` runs at once, with no dialog. Something that would fail
+        the run: the report dialog opens first; with `run_text` it asks (Cancel
+        or `run_text`) and `then` runs only if the user goes ahead, without it
+        it only informs. Only files that will be skipped: no dialog, one line in
+        the status area, and `then` runs (see `_finish_precheck`). A check that
+        could not run at all says so and carries on: it never stands between the
+        user and a backup.
+
+        `check_open=False` leaves out the per-file open (Back up now: a locked
+        file is skipped and reported by the run itself, and the open costs
+        minutes on a big tree); the Add/Edit flow keeps it.
         """
         if self.backup_thread is not None:
             return
@@ -1359,11 +1487,35 @@ class BackupTab(QtWidgets.QWidget):
             f"Checking \"{job.get('name')}\" against its backup drive...",
             # No file total exists before the walk, so the bar stays
             # indeterminate and no per-file progress signal is sent.
-            lambda _progress, abort, _phase: precheck.precheck(job, None, abort),
+            lambda _progress, abort, _phase: precheck.precheck(
+                job, None, abort, check_open=check_open),
             lambda report: self._finish_precheck(job, report, then, run_text))
 
+    @staticmethod
+    def _skip_note(report: dict) -> str:
+        """One plain sentence for a report whose problems would not fail the
+        run: how many files, the first few names, and how many more."""
+        problems = report.get("problems", [])
+        total = sum(report.get("counts", {}).values())
+        names = [p.get("rel") or p.get("path", "") for p in problems[:precheck.SAMPLE_MAX]]
+        cause = ("cannot be read right now and will be skipped"
+                 if all(p.get("kind") == "unreadable" for p in problems)
+                 else "need attention but will not stop the backup")
+        text = f"{total} file(s) {cause}: {', '.join(names)}"
+        if total > len(names):
+            text += f" and {total - len(names)} more"
+        return text + "."
+
     def _finish_precheck(self, job: dict, report: dict, then, run_text: str):
-        """Record the pre-check, show its report if it found anything, go on."""
+        """Record the pre-check, show its report if it found anything, go on.
+
+        The dialog appears only when something would FAIL the run (`blocking`).
+        Findings that are merely skipped files are not worth a question: they
+        show as one line in the status area and the backup goes ahead. After
+        Add/Edit that line rides in `_backup_notice` (so the remeasure that
+        follows does not erase it); for Back up now it is kept in
+        `_precheck_note` for the run's own status line.
+        """
         if "scanned" not in report:   # the worker caught an unexpected error
             self._say(f"The pre-check could not run: {report.get('message', '')}",
                       warn=True)
@@ -1375,24 +1527,37 @@ class BackupTab(QtWidgets.QWidget):
             backup_utils.record_precheck(job["id"], precheck.summary(report))
         except (backup_utils.JobsFileCorrupt, OSError):
             pass   # the report is still shown; only the stored copy is stale
-        if report["problems"]:
+        if report.get("blocking"):
             dialog = PrecheckDialog(self, job, report, run_text)
             if dialog.exec() != QtWidgets.QDialog.Accepted and run_text:
                 self._say(f"Backup of \"{job.get('name')}\" not started.")
                 return
+        elif report["problems"]:
+            note = self._skip_note(report)
+            self._say(note, warn=True)
+            if run_text:
+                self._precheck_note = note
+            else:
+                self._backup_notice = f"{self._backup_notice} {note}".strip()
+                self._backup_notice_warn = True
         then(report)
 
     def run_backup_job(self, job: dict):
-        """Back up now: pre-check first, then the run (card 104)."""
+        """Back up now: pre-check first, then the run (card 104).
+
+        No per-file open here (`check_open=False`): it cost 72 s on a 10,142
+        file tree, and a locked file is just skipped and reported by the run.
+        """
         self._precheck(job, lambda _report: self._start_run(job),
-                       run_text="Back up anyway")
+                       run_text="Back up anyway", check_open=False)
 
     def _start_run(self, job: dict):
         """Take the backup itself on the worker thread."""
         if self.backup_thread is not None:
             return
+        note, self._precheck_note = self._precheck_note, ""
         self._start_backup(
-            f"Backing up \"{job.get('name')}\"...",
+            f"Backing up \"{job.get('name')}\"..." + (f" {note}" if note else ""),
             lambda progress, abort, phase: backup_utils.run_job(
                 job, progress, abort, phase),
             lambda result: self._finish_run(job, result),

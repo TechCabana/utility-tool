@@ -12,6 +12,7 @@ import hashlib
 import os
 import shutil
 import stat
+import time
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from utils.fs_utils import _is_link_like, long_path, plain_error, relative_to
@@ -321,11 +322,27 @@ def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
     return size, mtime, digest.hexdigest()
 
 
+# One short pause before the retry pass, and only when a file was skipped.
+# Most locks are brief (a document being saved, an antivirus scan, a sync
+# client), and the rest of the tree having been copied is usually delay enough;
+# a small tree finishes in milliseconds, so half a second more is cheap and
+# makes the second attempt a real second chance. A named constant behind
+# `_retry_pause` so a test sets it to 0 or replaces the function outright.
+RETRY_PAUSE_SECONDS = 0.5
+
+
+def _retry_pause() -> None:
+    """Wait `RETRY_PAUSE_SECONDS` before the retry pass (patched by tests)."""
+    if RETRY_PAUSE_SECONDS > 0:
+        time.sleep(RETRY_PAUSE_SECONDS)
+
+
 def copy_tree(source: str, destination: str,
               on_progress: Optional[Callable[[int, int], None]] = None,
               should_abort: Optional[Callable[[], bool]] = None,
               on_copied: Optional[Callable[[str, int, float, str], None]] = None,
-              stats: Optional[Dict[str, int]] = None
+              stats: Optional[Dict[str, int]] = None,
+              retry_skipped: bool = False
               ) -> Tuple[int, int, List[str]]:
     """Copy `source` into `destination`, reporting `(done, total)` per file.
 
@@ -362,10 +379,23 @@ def copy_tree(source: str, destination: str,
     shortfall is just the locked files in `errors`. `stats`, if given, gets "expected" (that starting count) and
     "not_copied" (how many of them did not land): `errors` has one entry for
     a whole unreadable folder, so its length under-reports the files missed.
+
+    With `retry_skipped` (a backup; not a restore), every SOURCE FILE skipped
+    during the walk gets exactly one more attempt after the whole tree has
+    been walked, in the order it was skipped and through the same `copy_one`
+    as any other file, so its manifest line, counters and progress are those
+    of a file that copied first time. A recovered file leaves `errors`; one
+    that fails again is reported by name with its newest error. An unlistable
+    FOLDER is not retried. A retry that hits a target failure, a vanished
+    source or a cancellation ends the copy exactly as it would have on the
+    first pass: only a source-read failure is ever skipped. `stats["retried"]`
+    counts the files recovered.
     """
     total = tree_totals(source)[0]
     state = {"done": 0, "bytes": 0}
     errors: List[str] = []
+    # (source file, its destination, its index in `errors`) per skipped file.
+    skipped_files: List[Tuple[str, str, int]] = []
 
     def check_source_alive() -> None:
         """Stop the copy if the source root has gone away."""
@@ -393,6 +423,25 @@ def copy_tree(source: str, destination: str,
         if on_progress is not None:
             on_progress(state["done"], total)
 
+    def skip(src: str, dst: str, exc: OSError) -> str:
+        """The `errors` entry for a failed entry, or the run-ending exception.
+
+        Source-side failures are skips; the destination's are
+        TargetWriteFailed and pass straight up. A full drive or an over-size
+        file can only come from a write, so one arriving unclassified is
+        still the target's (belt and braces). Shared by the walk and the
+        retry pass so a retried file is classified exactly as on the first.
+        """
+        failed = TargetWriteFailed(dst, exc)
+        if failed.cause in ("no_space", "file_too_large"):
+            raise failed from exc
+        check_source_alive()  # a vanished root is not one more skip
+        # Path from the source root (forward slashes, as in the manifest) so
+        # the run log says WHICH file; the "<path>: <error>" shape is relied
+        # on by record_run and runlog.
+        rel = relative_to(src, source).replace("\\", "/")
+        return f"{rel}: {plain_error(exc)}"
+
     def copy_dir(src_dir: str, dst_dir: str) -> None:
         """Copy one folder, depth first. OSError if `src_dir` is unreadable."""
         with os.scandir(long_path(src_dir)) as listing:
@@ -403,37 +452,42 @@ def copy_tree(source: str, destination: str,
             # Plain paths throughout; entry.path is in long_path's form.
             src = os.path.join(src_dir, entry.name)
             dst = os.path.join(dst_dir, entry.name)
+            is_file = False
             try:
                 if _is_link_like(entry):
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     copy_dir(src, dst)
                 else:
+                    is_file = True
                     copy_one(src, dst)
             except OSError as exc:
-                # Source-side failures land here; the destination's are
-                # TargetWriteFailed and pass straight up. A full drive or an
-                # over-size file can only come from a write, so one arriving
-                # unclassified is still the target's (belt and braces).
-                failed = TargetWriteFailed(dst, exc)
-                if failed.cause in ("no_space", "file_too_large"):
-                    raise failed from exc
-                check_source_alive()  # a vanished root is not one more skip
-                # Path from the source root (forward slashes, as in the
-                # manifest) so the run log says WHICH file; the "<path>: <error>"
-                # shape is relied on by record_run and runlog.
-                rel = relative_to(src, source).replace("\\", "/")
-                errors.append(f"{rel}: {plain_error(exc)}")
+                errors.append(skip(src, dst, exc))
+                if is_file:
+                    skipped_files.append((src, dst, len(errors) - 1))
         try:
             shutil.copystat(long_path(src_dir), long_path(dst_dir))
         except OSError:
             pass  # folder times are cosmetic: changes-since compares files only
 
     copy_dir(source, destination)
+    retried = 0
+    if retry_skipped and skipped_files:
+        _retry_pause()
+        for src, dst, index in skipped_files:
+            try:
+                copy_one(src, dst)
+            except OSError as exc:
+                errors[index] = skip(src, dst, exc)
+            else:
+                errors[index] = None
+                retried += 1
+        errors[:] = [entry for entry in errors if entry is not None]
     check_source_alive()  # gone by the end: whatever copied is not the whole
     missing = max(0, total - state["done"])
     if stats is not None:
         stats["expected"], stats["not_copied"] = total, missing
+        stats["retried"] = retried
     # A copy holding NOTHING is never a backup, whatever the floor says: a
     # two-file source with both files locked is under SHORTFALL_MIN_FILES,
     # and promoting its empty copy as "verified" pruned the last real one.

@@ -54,6 +54,49 @@ def test_failed_replace_leaves_previous_contents_and_no_temp_file(jobs_file, mon
     assert _leftovers(jobs_file.parent) == []
 
 
+def _hold_open(path, seconds):
+    """Another process with `path` open for reading for `seconds` (as a
+    reader that does not take the jobs-file lock has it, only longer); returns
+    once the file is open."""
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys,time;f=open(sys.argv[1],'rb');print('open',flush=True);"
+         "time.sleep(float(sys.argv[2]))", str(path), str(seconds)],
+        stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "open"
+    return holder
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows refuses to replace an open file")
+def test_a_write_waits_out_a_brief_reader_instead_of_dropping_the_marker(jobs_file):
+    # A run's start marker used to be lost silently (and record_run failed)
+    # when any other process was reading the jobs file at that instant.
+    job = _job("busy-reader")
+    backup_utils.save_job(job)
+    holder = _hold_open(jobs_file, 0.3)
+    try:
+        assert jobs_store.set_running(job["id"], jobs_store.new_running_marker(None))
+    finally:
+        holder.wait()
+    assert "running" in backup_utils.get_job(job["id"])
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows refuses to replace an open file")
+def test_a_reader_that_never_lets_go_still_fails_the_write_loudly(jobs_file, monkeypatch):
+    backup_utils.save_job(_job("first"))
+    before = jobs_file.read_bytes()
+    monkeypatch.setattr(jobs_store, "REPLACE_ATTEMPTS", 3)
+    holder = _hold_open(jobs_file, 5)
+    try:
+        with pytest.raises(OSError, match="Could not write"):
+            backup_utils.save_job(_job("second"))
+    finally:
+        holder.kill()
+        holder.wait()
+    assert jobs_file.read_bytes() == before
+    assert _leftovers(jobs_file.parent) == []
+
+
 def test_failed_write_before_replace_cleans_up_the_temp_file(jobs_file, monkeypatch):
     backup_utils.save_job(_job("first"))
     before = jobs_file.read_bytes()
