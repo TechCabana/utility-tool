@@ -99,6 +99,9 @@ def version_datetime(name: str) -> Optional[datetime]:
 # written before modes existed has no "verify" key and reads as "full". A
 # trailer written before card ved3wVOQ has no "finished_utc" and orders by
 # name (see "Ordering" below); readers ignore keys they do not know.
+# A file line carries `"changed": true` (card RnuRsA2V) only when the file was
+# still changing while its second copy was read: kept, flagged, hash of what
+# was read. Older manifests lack it; every reader ignores it.
 # A version is verified iff its folder exists and its manifest ends in a
 # verified trailer. Legacy versions (made before manifests) have none and are
 # simply unverified, as is an "off" version.

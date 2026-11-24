@@ -695,9 +695,11 @@ class JobRow(QtWidgets.QWidget):
             # Silence is never success: a run that left files behind is not
             # plain OK, however green that would look.
             skipped = backup_utils.job_skipped(job)
+            changed = backup_utils.job_changed(job)
             held = backup_utils.job_pruning_held(job)
-            if skipped or held:
+            if skipped or changed or held:
                 parts = (([f"{skipped} skipped"] if skipped else [])
+                         + ([f"{changed} changed during backup"] if changed else [])
                          + (["pruning held"] if held else []))
                 return "OK, " + ", ".join(parts), "StatusWarn"
             return "OK", "StatusOk"
@@ -719,6 +721,8 @@ class JobRow(QtWidgets.QWidget):
         parts = []
         if backup_utils.job_skipped(job):
             parts.append(JobRow._skipped_detail(job))
+        if backup_utils.job_changed(job):
+            parts.append(JobRow._changed_detail(job))
         if backup_utils.job_pruning_held(job):
             parts.append(backup_utils.pruning_held_sentence(
                 backup_utils.job_last_files(job), backup_utils.job_baseline_files(job)))
@@ -735,6 +739,20 @@ class JobRow(QtWidgets.QWidget):
             text += "\n" + "\n".join(names)
             if skipped > len(names):
                 text += f"\nand {skipped - len(names)} more"
+        return text
+
+    @staticmethod
+    def _changed_detail(job: dict) -> str:
+        """What "OK, N changed during backup" means, and up to five names."""
+        changed = backup_utils.job_changed(job)
+        names = backup_utils.job_changed_sample(job)
+        text = ("These files were being changed while they were backed up, so the "
+                "copy may mix old and new parts. Close the program using them "
+                "and back up again.")
+        if names:
+            text += "\n" + "\n".join(names)
+            if changed > len(names):
+                text += f"\nand {changed - len(names)} more"
         return text
 
     def _last_run(self, job: dict) -> str:
@@ -1744,6 +1762,7 @@ class BackupTab(QtWidgets.QWidget):
         # A run that left files behind reads as a warning, not as plain news.
         warn = bool(result.get("ok") and (result.get("errors")
                                           or result.get("not_copied")
+                                          or result.get("changed")
                                           or result.get("pruning_held")))
         self._say(message, ok=result.get("ok", False), warn=warn)
         if result.get("ok"):

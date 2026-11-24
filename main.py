@@ -406,6 +406,14 @@ def run_backup_job_cli(job_id):
     if result.get("ok") and result.get("not_copied"):
         # Silence is never success, but the exit code stays the run's own.
         print(f"[WARN] {result['not_copied']} file(s) were not copied", file=sys.stderr)
+    if result.get("ok") and result.get("changed"):
+        # Card RnuRsA2V: kept, but still changing on the second copy. Same
+        # contract as a skip: loud on stderr, exit code unchanged.
+        names = result.get("changed_sample") or []
+        more = result["changed"] - len(names)
+        print(f"[WARN] {result['changed']} file(s) changed while they were being "
+              f"copied: {', '.join(names)}" + (f" and {more} more" if more > 0 else ""),
+              file=sys.stderr)
     if result.get("ok") and result.get("pruning_held"):
         # The source lost a large share of its files: pruning was held. Same
         # contract as a skip -- loud on stderr, exit code unchanged.

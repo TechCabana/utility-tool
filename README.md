@@ -229,9 +229,16 @@ Safekeep read. It does not mean:
   program has locked, is tried once more at the end of the copy and then skipped. The job reads
   "OK, N skipped" instead of "OK", and its Status tooltip gives the count and up to five names.
   If more than 30% of the files (and at least three) could not be copied, the run fails instead.
-- **The source stood still.** Safekeep does not take a snapshot. A file that changes while it
-  is being copied is saved as Safekeep read it, and the check confirms the copy matches that
-  read, not that the file was in a consistent state at that moment.
+- **The source stood still.** Safekeep does not take a snapshot. After copying each file it
+  looks at the source again, and a file whose size or modified time is not what it was before
+  the copy changed underneath the read, so it is copied once more. If it changed again, that
+  second copy is kept and the file is marked in the checksum list; the job then reads "OK, N
+  changed during backup" (with the skipped count first when there is one, for example "OK, 1
+  skipped, 1 changed during backup") and its Status tooltip names up to five of the files.
+  The check still only confirms that the copy matches what was read, so a marked file may mix
+  old and new parts: close the program using it and back up again. A change that leaves both
+  the size and the modified time as they were is not seen, and a snapshot of the source
+  (Windows shadow copy) is planned, not built.
 - **The backup stays intact.** The check runs once, right after the copy, and its re-read can
   be answered from the computer's memory rather than the disk. Nothing re-checks stored versions
   later, so bit rot on the backup drive goes unnoticed until you restore; a scheduled deeper
@@ -316,7 +323,10 @@ flowchart LR
    nothing is promoted or pruned and earlier versions are left as they were. A file that cannot
    be read at first (often one another program has locked) gets one more try once the rest of
    the tree is copied; if it still cannot be read it is skipped and counted in the result, and
-   the job then reads "OK, N skipped" rather than plain OK. A run that copied more
+   the job then reads "OK, N skipped" rather than plain OK. A file that changed while it
+   was being copied is copied once more (that is its one extra attempt, in total); one that
+   is still changing is kept and counted separately, and the job reads "OK, N changed during
+   backup". A run that copied more
    than 30% fewer files than the largest version still kept (verified or not) succeeds and
    keeps that larger version aside ("pruning held") while the others are pruned as usual, so
    an emptied source cannot roll the last complete copy out of retention and a source that
@@ -374,6 +384,8 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
     "last_result": "ok",
     "last_skipped": 0,
     "last_skipped_sample": [],
+    "last_changed": 0,
+    "last_changed_sample": [],
     "last_pruning_held": false,
     "last_baseline_files": 0,
     "last_files": 1204
@@ -392,6 +404,7 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `last_result` | string | `ok`, `failed: <message>`, or `interrupted: started <time> and never finished` (a run that began and was closed, killed or crashed before it recorded a result; `last_run` is then when it began) |
 | `running` | object | Present only while a run is under way, or after one died: `{since, pid, start_time, stamp, token}`, written just before copying and removed when the run records its outcome. A marker whose process is gone is shown as "Interrupted" and recorded as `interrupted` in `last_result` and the run log. Do not edit it by hand |
 | `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
+| `last_changed`, `last_changed_sample` | int, list | Files the last run kept although they were still changing while they were copied (marked `"changed": true` in the checksum list), and up to five of their paths from the source root; 0 and empty after a clean or a failed run |
 | `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed run leaves all three unchanged |
 | `last_finished_utc` | string | When the last successful run finished, in UTC (`2026-10-25T01:45:12Z`), the same value as the end of its checksum list; absent until a job has a successful run made by a version that records it, and a failed run leaves it unchanged |
 | `last_precheck` | object | The last pre-check's summary: `{time, ok, aborted, fs, scanned, problems, blocking, counts, sample}` (counts by kind, up to five paths from the source root). Absent until a job is first checked |
@@ -400,8 +413,8 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 The file is replaced atomically on every save, and the previous good copy is kept as
 `backup_jobs.json.bak`. A damaged file is reported as damaged, never read as "no jobs"; the
 Backup screen offers to restore the `.bak`, and the headless `--run-backup-job` path exits 3.
-A jobs file written by an older version (without the last five fields) reads as "nothing
-skipped, nothing held".
+A jobs file written by an older version (without the skipped, changed and hold fields) reads
+as "nothing skipped, nothing changed, nothing held".
 
 </details>
 
@@ -447,6 +460,7 @@ utility-tool/
     ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder
     ├── test_backup_utils.py
     ├── test_activity.py
+    ├── test_changed_during_copy.py
     ├── test_clock_change.py
     ├── test_edit_keeps_run_state.py
     ├── test_empty_job_list.py

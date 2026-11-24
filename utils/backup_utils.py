@@ -35,7 +35,7 @@ from datetime import datetime  # noqa: F401  -- tests subclass `backup_utils.dat
 from utils.jobs_store import (  # noqa: F401
     _backup_path, DEFAULT_RETENTION, DEFAULT_VERIFY, get_job, _has_usable_backup,
     job_baseline_files, job_hold_released, job_last_files, job_pruning_held, job_skipped,
-    job_skipped_sample, job_verify_mode, job_running, new_running_marker, running_owner_gone,
+    job_skipped_sample, job_changed, job_changed_sample, job_verify_mode, job_running, new_running_marker, running_owner_gone,
     set_running, JOBS_FILE, _jobs_file_lock, JOBS_FILENAME, JobsFileCorrupt,
     load_jobs, _locks_dir, new_job, quarantine_jobs_file, QuarantineRefused, _read_valid, record_precheck, record_run, remove_job,
     restore_jobs_from_backup, _save_job, save_job, save_job_settings, save_jobs, SCHEDULES,

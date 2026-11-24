@@ -608,7 +608,7 @@ def _backup(job: Dict,
     _mark_running(job, stamp, began)
     if on_phase is not None:
         on_phase("copying")
-    stats: Dict[str, int] = {}
+    stats: Dict = {}
     try:
         # The manifest lives on the target, so failing to create or write it
         # is a target write failure like any other (a full drive refuses a
@@ -620,22 +620,29 @@ def _backup(job: Dict,
                 out.write(json.dumps({"type": "header", "version": MANIFEST_VERSION,
                                       "stamp": stamp, "source": source}) + "\n")
 
-            def record(rel: str, size: int, mtime: float, sha: str) -> None:
+            def record(rel: str, size: int, mtime: float, sha: str,
+                       changed: bool = False) -> None:
                 """Stream one file's manifest line straight to disk.
 
                 Raises TargetWriteFailed, not OSError: copy_tree would count
                 an OSError as one skipped file and carry on, leaving a copied
-                file the manifest omits.
+                file the manifest omits. `changed` (card RnuRsA2V) adds
+                `"changed": true` to the line of a file that was still being
+                written on its second copy too; the key is absent otherwise,
+                and every reader ignores keys it does not know.
                 """
+                line = {"type": "file", "path": rel, "size": size,
+                        "mtime": mtime, "sha256": sha}
+                if changed:
+                    line["changed"] = True
                 with _writing(manifest_tmp):
-                    out.write(json.dumps({"type": "file", "path": rel, "size": size,
-                                          "mtime": mtime, "sha256": sha}) + "\n")
+                    out.write(json.dumps(line) + "\n")
                     out.flush()
 
             files, copied_bytes, errors = copy_tree(
                 source, partial, on_progress=on_progress,
                 should_abort=should_abort, on_copied=record, stats=stats,
-                retry_skipped=True)
+                retry_skipped=True, recopy_changed=True)
     except BackupAborted:
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": "Backup cancelled"}
@@ -763,6 +770,20 @@ def _backup(job: Dict,
     if errors:
         message += (f". {not_copied} file(s) could not be read and were "
                     "skipped, so they are not in this backup")
+    # Card RnuRsA2V: a file that changed under the read is copied once more.
+    # One that settled is an ordinary file; one that changed again is kept and
+    # named, because its copy may mix old and new parts of the file. Either
+    # way verification passed against the bytes that were read.
+    recopied = stats.get("recopied", 0)
+    changed = stats.get("changed", 0)
+    changed_sample = list(stats.get("changed_names", []))[:jobs_store.SKIPPED_SAMPLE_MAX]
+    if recopied:
+        message += (f". {recopied} file(s) changed while they were being copied "
+                    "and were copied again")
+    if changed:
+        message += (f". {changed} file(s) were still changing while they were "
+                    "copied, even on a second try, so each may mix old and new "
+                    "parts (changed during backup)")
     if held:
         message += ". " + pruning_held_sentence(files, baseline)
     if pruned:
@@ -771,6 +792,8 @@ def _backup(job: Dict,
     return {"ok": True, "message": message, "version": stamp, "files": files,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
             "not_copied": not_copied, "retried": retried,
+            "recopied": recopied, "changed": changed,
+            "changed_sample": changed_sample,
             "pruning_held": held, "baseline_files": baseline,
             "baseline_stamp": baseline_stamp if held else None,
             "verified": mode != "off", "verify_mode": mode, "manifest": manifest,

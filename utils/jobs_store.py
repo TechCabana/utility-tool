@@ -89,6 +89,8 @@ def new_job(name: str, source: str, target: str, schedule: str = "daily",
         "last_result": "",
         "last_skipped": 0,
         "last_skipped_sample": [],
+        "last_changed": 0,
+        "last_changed_sample": [],
         "last_pruning_held": False,
         "last_baseline_files": 0,
         "last_files": 0,
@@ -109,6 +111,22 @@ def job_skipped(job: Dict) -> int:
 def job_skipped_sample(job: Dict) -> List[str]:
     """The (at most `SKIPPED_SAMPLE_MAX`) names stored with `last_skipped`."""
     sample = job.get("last_skipped_sample")
+    if not isinstance(sample, list):
+        return []
+    return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
+
+
+def job_changed(job: Dict) -> int:
+    """How many files `job`'s last run kept although they changed while being
+    copied (card RnuRsA2V); 0 when the field is missing (an older jobs file) or
+    is not a positive whole number."""
+    value = job.get("last_changed")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def job_changed_sample(job: Dict) -> List[str]:
+    """The (at most `SKIPPED_SAMPLE_MAX`) relative paths stored with `last_changed`."""
+    sample = job.get("last_changed_sample")
     if not isinstance(sample, list):
         return []
     return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
@@ -664,6 +682,17 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
             str(error).split(": ", 1)[0].rsplit("/", 1)[-1]
             for error in errors[:SKIPPED_SAMPLE_MAX]
         ] if skipped else []
+        # Card RnuRsA2V: files kept although they were still changing while
+        # copied. Same shape as the skipped pair, and a sibling of it: the job
+        # reads "ok" either way (existing readers keep working) and the screen
+        # builds "OK, N changed during backup" from this count. Relative paths
+        # (from the source root, forward slashes), never an absolute one, and
+        # only the successful run's: a failed run kept nothing.
+        changed = _count(result.get("changed")) if result.get("ok") else 0
+        job["last_changed"] = changed
+        job["last_changed_sample"] = [
+            name for name in (result.get("changed_sample") or [])
+            if isinstance(name, str)][:SKIPPED_SAMPLE_MAX] if changed else []
         # Card 51: a run that kept its baseline aside says so on the job. Only a
         # successful run recomputes the three fields: a failed run (often the
         # very low-space failure a hold can lead to) says nothing about the

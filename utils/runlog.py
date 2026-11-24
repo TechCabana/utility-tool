@@ -12,10 +12,17 @@ the one app-level log, `logs/app.jsonl`. Every line carries exactly `LINE_KEYS`:
 
     v, start, end, trigger, job, name, outcome, files, bytes, skipped,
     skipped_paths, skipped_more, pruned, version, verify_mode, cause, message,
-    pruning_held, offenders, baseline_files, baseline_stamp, retried
+    pruning_held, offenders, baseline_files, baseline_stamp, retried, recopied,
+    changed
 
 `retried` (card b5CfTkL8) counts the files that could not be read at first and
 were copied by the one retry after the walk; they are in `files`, not `skipped`.
+
+`recopied` and `changed` (card RnuRsA2V) are counts only, never names: files
+that changed while they were being copied and settled on the second copy, and
+files that were still changing on it and are kept flagged "changed during
+backup". Both are in `files`. `outcome` "ok_changed" is an ok run with
+`changed` > 0 and nothing skipped and nothing held (those outcomes win).
 
 `offenders` (card 104) lists, from the source root, the files a run that failed
 as "path_too_long" or "file_too_large" found the drive cannot hold (at most
@@ -67,12 +74,13 @@ SKIPPED_PATHS_MAX = 50
 # stay well under a megabyte" true whatever an exception's text turns out to be.
 MESSAGE_MAX = 2000
 APP_LOG_NAME = "app"
-OUTCOMES = ("ok", "ok_skipped", "ok_pruning_held", "failed", "cancelled", "busy",
-            "hold_released", "interrupted")
+OUTCOMES = ("ok", "ok_skipped", "ok_changed", "ok_pruning_held", "failed", "cancelled",
+            "busy", "hold_released", "interrupted")
 LINE_KEYS = ("v", "start", "end", "trigger", "job", "name", "outcome", "files",
              "bytes", "skipped", "skipped_paths", "skipped_more", "pruned",
              "version", "verify_mode", "cause", "message", "pruning_held",
-             "offenders", "baseline_files", "baseline_stamp", "retried")
+             "offenders", "baseline_files", "baseline_stamp", "retried", "recopied",
+             "changed")
 LOCK_TIMEOUT = 2.0
 
 
@@ -108,7 +116,7 @@ def _text(value) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
 
-def _outcome(result: Dict, skipped: int) -> str:
+def _outcome(result: Dict, skipped: int, changed: int = 0) -> str:
     """Map a `run_job` result onto one of `OUTCOMES`."""
     if result.get("busy"):
         return "busy"
@@ -119,7 +127,9 @@ def _outcome(result: Dict, skipped: int) -> str:
     if result.get("ok"):
         if result.get("pruning_held") is True:
             return "ok_pruning_held"
-        return "ok_skipped" if skipped else "ok"
+        if skipped:
+            return "ok_skipped"
+        return "ok_changed" if changed else "ok"
     if str(result.get("message", "")).startswith("Backup cancelled"):
         return "cancelled"
     return "failed"
@@ -138,6 +148,8 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
     # left out, as in `last_skipped_sample`.
     paths = [str(error).split(": ", 1)[0]
              for error in errors[:SKIPPED_PATHS_MAX]] if skipped else []
+    # Same rule as `last_changed`: only a finished run kept anything.
+    changed = _count(result.get("changed")) if result.get("ok") else 0
     pruned = result.get("pruned")
     mode = _text(result.get("verify_mode"))
     if mode is None and job:
@@ -149,7 +161,7 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
         "trigger": trigger,
         "job": _text(job.get("id")),
         "name": _text(job.get("name")),
-        "outcome": _outcome(result, skipped),
+        "outcome": _outcome(result, skipped, changed),
         "files": _count(result.get("files")),
         "bytes": _count(result.get("bytes")),
         "skipped": skipped,
@@ -173,6 +185,8 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
                            and jobs_store._STAMP_RE.fullmatch(result["baseline_stamp"])
                            else None),
         "retried": _count(result.get("retried")),
+        "recopied": _count(result.get("recopied")),
+        "changed": changed,
     }
 
 

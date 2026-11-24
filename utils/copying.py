@@ -268,29 +268,72 @@ def _open_for_write(dst: str):
         return open(dst, "wb")
 
 
-def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
+class CopyResult(tuple):
+    """What `_hash_copy` returns: the `(bytes read, source mtime, sha256 hex)`
+    tuple it always was, plus `.changed` (card RnuRsA2V).
+
+    A tuple subclass rather than a fourth element so every caller and test
+    that unpacks three values keeps working; only the code that cares reads
+    the attribute, with `getattr(result, "changed", False)` so a plain tuple
+    (a test's stand-in for `_hash_copy`) simply reads as "not changed".
+    """
+
+    def __new__(cls, size: int, mtime: float, sha: str, changed: bool = False):
+        """The three values, and whether the source changed under the read."""
+        self = super().__new__(cls, (size, mtime, sha))
+        self.changed = changed
+        return self
+
+
+def _signature(info: os.stat_result) -> Tuple[int, int]:
+    """`(size, mtime_ns)`: what "the file is the same" means. Nanoseconds, not
+    the float `st_mtime`, which cannot tell two NTFS timestamps 100 ns apart."""
+    return info.st_size, info.st_mtime_ns
+
+
+def _after_read(src: str) -> None:
+    """Called once the last chunk is read and the source handle is closed,
+    just before the post-copy look at the source. Does nothing; it exists so a
+    test can change the file at exactly the moment the check is for."""
+
+
+def _hash_copy(src: str, dst: str) -> CopyResult:
     """Copy `src` to `dst`, hashing the bytes as they pass through.
 
-    Returns `(bytes read, source mtime, sha256 hex)`. Metadata is then copied
-    with `copystat`, as `copy2` does, so the mtime the changes-since
-    comparison relies on is preserved. If anything fails once `dst` exists,
-    the half-written file is deleted before the error propagates, so it can
-    never sit in a version looking like a real copy.
+    Returns `(bytes read, source mtime, sha256 hex)` (a `CopyResult`). Metadata
+    is then copied with `copystat`, as `copy2` does, so the mtime the
+    changes-since comparison relies on is preserved. If anything fails once
+    `dst` exists, the half-written file is deleted before the error
+    propagates, so it can never sit in a version looking like a real copy.
 
     Errors are classified where they happen: failing to open or read `src`
     raises the OSError (the caller skips that file); failing to create,
     write, close or stamp `dst` raises TargetWriteFailed (the caller fails
     the whole copy). Both are plain paths; the OS calls use `long_path`.
+
+    **Changed while copied (card RnuRsA2V).** The bytes hashed here are what
+    the check later re-reads, so verification proves the copy matches what was
+    read, never that what was read was ONE state of the file. So the source's
+    `(size, mtime_ns)` is taken from the open handle before the first read and
+    compared with two later looks: the same handle once the last chunk is in
+    (the file as the reader saw it end) and the PATH after the copy (a file
+    replaced by rename is a different file; a handle can report stale values
+    on some filesystems). Either differing sets `.changed`. Two `fstat`/`stat`
+    calls per file. A source that cannot be looked at afterwards is an OSError
+    like any read failure: that file is skipped, as the first pass would.
     """
     digest = hashlib.sha256()
     size = 0
     read_error = None
+    changed = False
     lsrc = long_path(src)
-    with open(lsrc, "rb") as fsrc:
-        mtime = os.fstat(fsrc.fileno()).st_mtime
-        with _writing(dst):
-            ldst = long_path(dst)  # past Windows' limit: a target failure
-        try:
+    ldst = None  # set once the destination path is built; the cleanup below needs it
+    try:
+        with open(lsrc, "rb") as fsrc:
+            before = os.fstat(fsrc.fileno())
+            mtime = before.st_mtime
+            with _writing(dst):
+                ldst = long_path(dst)  # past Windows' limit: a target failure
             with _writing(dst):
                 with _open_for_write(ldst) as fdst:
                     while True:
@@ -306,20 +349,31 @@ def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
                         size += len(chunk)
             if read_error is not None:
                 raise read_error
-            try:
-                shutil.copystat(lsrc, ldst)
-            except OSError as exc:
-                if exc.filename == lsrc:
-                    raise  # stat of the source failed: a skip, not the target's
-                raise TargetWriteFailed(dst, exc) from exc
-            _copy_windows_attributes(lsrc, ldst)
-        except BaseException:
+            after_handle = os.fstat(fsrc.fileno())
+        # The source handle is closed from here, so a program (or a test) can
+        # replace the file now without being refused for the open handle.
+        _after_read(src)
+        try:
+            shutil.copystat(lsrc, ldst)
+        except OSError as exc:
+            if exc.filename == lsrc:
+                raise  # stat of the source failed: a skip, not the target's
+            raise TargetWriteFailed(dst, exc) from exc
+        _copy_windows_attributes(lsrc, ldst)
+        # Last, so the window the check covers runs to the end of the copy.
+        after_path = os.stat(lsrc)
+        changed = (_signature(before) != _signature(after_handle)
+                   or _signature(before) != _signature(after_path))
+    except BaseException:
+        # Only a destination that was opened for writing can be half-written;
+        # a failure to open the source or build the path leaves nothing of ours.
+        if ldst is not None:
             try:
                 os.remove(ldst)
             except OSError:
                 pass
-            raise
-    return size, mtime, digest.hexdigest()
+        raise
+    return CopyResult(size, mtime, digest.hexdigest(), changed)
 
 
 # One short pause before the retry pass, and only when a file was skipped.
@@ -342,7 +396,8 @@ def copy_tree(source: str, destination: str,
               should_abort: Optional[Callable[[], bool]] = None,
               on_copied: Optional[Callable[[str, int, float, str], None]] = None,
               stats: Optional[Dict[str, int]] = None,
-              retry_skipped: bool = False
+              retry_skipped: bool = False,
+              recopy_changed: bool = False
               ) -> Tuple[int, int, List[str]]:
     """Copy `source` into `destination`, reporting `(done, total)` per file.
 
@@ -390,12 +445,32 @@ def copy_tree(source: str, destination: str,
     source or a cancellation ends the copy exactly as it would have on the
     first pass: only a source-read failure is ever skipped. `stats["retried"]`
     counts the files recovered.
+
+    With `recopy_changed` (a backup; not a restore, whose source is a stored
+    version that nothing is writing), a file whose size or mtime differs after
+    the copy from before it (`_hash_copy`'s `.changed`) was being written while
+    it was read, so the copy may mix two states. It is copied once more, into
+    the same destination, through the same `copy_one`. If that second copy is
+    stable the file is an ordinary copied file (`stats["recopied"]` counts it);
+    if it changed again the second copy is kept and the file is flagged: it
+    reaches `on_copied` with `changed=True` (only then: a callback that takes
+    four arguments never sees the keyword), and `stats["changed"]` and
+    `stats["changed_names"]` count and name it. **One extra attempt per file,
+    in total**: the unreadable-file retry above already is that attempt, so a
+    file recovered by it is flagged on a first look at a change instead of
+    being copied a third time, and a file whose re-copy then could not be read
+    is skipped without the retry pass trying it again. The count, the manifest
+    line, the progress step and the byte total are made once per file, after
+    its last copy, never per attempt.
     """
     total = tree_totals(source)[0]
-    state = {"done": 0, "bytes": 0}
+    state = {"done": 0, "bytes": 0, "recopied": 0}
     errors: List[str] = []
     # (source file, its destination, its index in `errors`) per skipped file.
     skipped_files: List[Tuple[str, str, int]] = []
+    changed_names: List[str] = []
+    # Source files whose one extra attempt (a re-copy) is already used.
+    spent: set = set()
 
     def check_source_alive() -> None:
         """Stop the copy if the source root has gone away."""
@@ -403,21 +478,51 @@ def copy_tree(source: str, destination: str,
             raise SourceUnavailable(source, state["done"], total,
                                     "source_unavailable")
 
-    def copy_one(src: str, dst: str) -> None:
-        """Abort check, copy, count, report one file."""
+    def copy_one(src: str, dst: str, second_look: bool = True) -> None:
+        """Abort check, copy (and re-copy once if it changed), count, report
+        one file. `second_look=False` is the retry pass: that file already
+        had its extra attempt."""
         if should_abort is not None and should_abort():
             raise BackupAborted()
-        size, mtime, sha = _hash_copy(src, dst)
+        result = _hash_copy(src, dst)
+        flagged = False
+        if recopy_changed and getattr(result, "changed", False):
+            if second_look:
+                spent.add(src)
+                if should_abort is not None and should_abort():
+                    raise BackupAborted()
+                try:
+                    result = _hash_copy(src, dst)  # overwrites the first copy
+                except BaseException:
+                    # The first copy is on disk with no manifest line and no
+                    # count; a re-copy that fails must not leave it behind as a
+                    # stray file in the version (`_hash_copy` only cleans up
+                    # after a destination IT opened).
+                    try:
+                        os.remove(long_path(dst))
+                    except OSError:
+                        pass
+                    raise
+                flagged = bool(getattr(result, "changed", False))
+                state["recopied"] += not flagged
+            else:
+                flagged = True
+        size, mtime, sha = result
+        rel = relative_to(src, source).replace("\\", "/")
         if on_copied is not None:
             try:
-                on_copied(relative_to(src, source).replace("\\", "/"),
-                          size, mtime, sha)
+                if flagged:
+                    on_copied(rel, size, mtime, sha, changed=True)
+                else:
+                    on_copied(rel, size, mtime, sha)
             except BaseException:
                 try:
                     os.remove(long_path(dst))
                 except OSError:
                     pass
                 raise
+        if flagged:
+            changed_names.append(rel)
         state["bytes"] += size
         state["done"] += 1
         if on_progress is not None:
@@ -475,8 +580,10 @@ def copy_tree(source: str, destination: str,
     if retry_skipped and skipped_files:
         _retry_pause()
         for src, dst, index in skipped_files:
+            if src in spent:
+                continue  # its extra attempt was the re-copy that failed to read
             try:
-                copy_one(src, dst)
+                copy_one(src, dst, second_look=False)
             except OSError as exc:
                 errors[index] = skip(src, dst, exc)
             else:
@@ -488,6 +595,9 @@ def copy_tree(source: str, destination: str,
     if stats is not None:
         stats["expected"], stats["not_copied"] = total, missing
         stats["retried"] = retried
+        stats["recopied"] = state["recopied"]
+        stats["changed"] = len(changed_names)
+        stats["changed_names"] = changed_names
     # A copy holding NOTHING is never a backup, whatever the floor says: a
     # two-file source with both files locked is under SHORTFALL_MIN_FILES,
     # and promoting its empty copy as "verified" pruned the last real one.
