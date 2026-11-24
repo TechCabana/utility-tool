@@ -162,7 +162,8 @@ def test_off_skips_the_reread_but_writes_hashes_and_an_unverified_manifest(tmp_p
     assert not glob.glob(os.path.join(backup_utils.job_root(job), "*.partial"))
     lines = manifest_lines(backup_utils.manifest_path(job, stamp))
     assert lines[-1] == {"type": "end", "files": FILES, "bytes": result["bytes"],
-                         "verify": "off", "verified": False}
+                         "verify": "off", "verified": False,
+                         "finished_utc": result["finished_utc"]}
     entries = {e["path"]: e for e in lines[1:-1]}
     assert len(entries) == FILES
     for rel, entry in entries.items():

@@ -39,7 +39,7 @@ from utils.jobs_store import (  # noqa: F401
     set_running, JOBS_FILE, _jobs_file_lock, JOBS_FILENAME, JobsFileCorrupt,
     load_jobs, _locks_dir, new_job, quarantine_jobs_file, QuarantineRefused, _read_valid, record_precheck, record_run, remove_job,
     restore_jobs_from_backup, _save_job, save_job, save_job_settings, save_jobs, SCHEDULES,
-    SETTINGS_KEYS, VERIFY_MODES,
+    SETTINGS_KEYS, VERIFY_MODES, FINISHED_UTC_FORMAT, valid_finished_utc,
     _write_atomic,
 )
 from utils.versions import (  # noqa: F401
@@ -50,6 +50,7 @@ from utils.versions import (  # noqa: F401
     restore_version, _rmtree,
     SANITY_DROP_FRACTION, sanity_baseline, sanity_drop_baseline, _STAMP, SWEEP_MAX_AGE_DAYS, sweep_stale, verified_versions, verify_mode, version_datetime, VERSION_FORMAT,
     version_names, version_path, _VERSION_RE, version_when,
+    ordered_versions, utc_stamp, version_order_key,
 )
 from utils.copying import (  # noqa: F401
     BackupAborted, CHUNK, copy_tree, _copy_windows_attributes, _ERRNO_CAUSES,

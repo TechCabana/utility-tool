@@ -4,7 +4,7 @@
 # later. Pruning by name alone then deleted the backup the run had just made
 # and kept the older one. Real run_job calls; the one fake is the runner's
 # clock (`utils.runner.datetime`, the owning module, not the facade).
-from datetime import datetime as real_datetime
+from datetime import datetime as real_datetime, timezone
 
 import pytest
 
@@ -12,6 +12,9 @@ from utils import backup_utils, jobs_store, runner, versions
 
 FIRST_PASS = real_datetime(2026, 10, 25, 1, 30)    # 01:30 BST
 SECOND_PASS = real_datetime(2026, 10, 25, 1, 15)   # 01:15 GMT, 45 minutes LATER
+# The same two moments in UTC (card ved3wVOQ orders versions by it): 00:30Z, 01:15Z.
+UTC_OF = {FIRST_PASS: real_datetime(2026, 10, 25, 0, 30, tzinfo=timezone.utc),
+          SECOND_PASS: real_datetime(2026, 10, 25, 1, 15, tzinfo=timezone.utc)}
 
 
 @pytest.fixture(autouse=True)
@@ -21,7 +24,7 @@ def isolated_jobs_file(tmp_path, monkeypatch):
 
 @pytest.fixture
 def clock(monkeypatch):
-    """A settable wall clock for the stamp claim."""
+    """A settable wall clock for the stamp claim, and the matching UTC clock."""
     now = {"value": FIRST_PASS}
 
     class Wall(real_datetime):
@@ -30,6 +33,7 @@ def clock(monkeypatch):
             return now["value"]
 
     monkeypatch.setattr(runner, "datetime", Wall)
+    monkeypatch.setattr(runner, "_utc_now", lambda: UTC_OF[now["value"]])
     return now
 
 
@@ -75,10 +79,12 @@ def test_a_larger_retention_keeps_both_and_prunes_nothing(tmp_path, clock):
     assert sorted(versions.version_names(job)) == sorted([first["version"], second["version"]])
 
 
-def test_prune_without_newest_is_the_plain_name_order(tmp_path, clock):
-    # The old call shape is unchanged: no `newest`, order by name.
+def test_prune_without_newest_orders_by_the_recorded_time_not_the_name(tmp_path, clock):
+    # The old call shape is unchanged (no `newest`), but card ved3wVOQ orders
+    # by the recorded finish time: the second run finished later (01:15Z after
+    # 00:30Z) and survives, although its name sorts first.
     job, (first, second) = run_twice_across_the_change(tmp_path, clock, retention=5)
     job["retention"] = 1
 
-    assert versions.prune_versions(job) == [second["version"]]
-    assert versions.version_names(job) == [first["version"]]
+    assert versions.prune_versions(job) == [first["version"]]
+    assert versions.version_names(job) == [second["version"]]

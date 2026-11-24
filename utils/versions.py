@@ -11,12 +11,13 @@ import re
 import shutil
 import stat
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from utils.copying import BackupAborted, SourceUnavailable, TargetWriteFailed, copy_tree
 from utils.fs_utils import _is_link_like, long_path, plain_error
-from utils.jobs_store import DEFAULT_RETENTION, VERIFY_MODES, job_hold_released
+from utils.jobs_store import (DEFAULT_RETENTION, FINISHED_UTC_FORMAT, VERIFY_MODES,
+                              job_hold_released, valid_finished_utc)
 
 
 # A version directory is named for the moment the backup started. Matched by
@@ -40,7 +41,12 @@ def job_root(job: Dict) -> str:
 
 
 def version_names(job: Dict) -> List[str]:
-    """Existing version stamps for `job`, oldest first.
+    """Existing version stamps for `job`, sorted BY NAME.
+
+    This is the raw listing, not the chronological order: names are local
+    clock time, so across an autumn clock change name order can disagree with
+    the order the backups were made in. Anything that means "older/newer"
+    uses `ordered_versions`.
 
     Only names matching the timestamp format count. A `.partial` directory
     left by an interrupted run, or anything else in the target folder, is
@@ -56,8 +62,9 @@ def version_names(job: Dict) -> List[str]:
 
 
 def latest_version(job: Dict) -> Optional[str]:
-    """The newest version stamp of `job` (verified or not), or None."""
-    names = version_names(job)
+    """The newest version stamp of `job` (verified or not), or None. Newest
+    in `ordered_versions` order -- by recorded UTC finish time, not by name."""
+    names = ordered_versions(job)
     return names[-1] if names else None
 
 
@@ -86,9 +93,12 @@ def version_datetime(name: str) -> Optional[datetime]:
 #
 # Line 1 is a header, then one line per copied file, then -- only once the
 # job's verification mode has passed -- an end trailer
-# `{"type": "end", "files", "bytes", "verify": mode, "verified": bool}`.
+# `{"type": "end", "files", "bytes", "verify": mode, "verified": bool,
+# "finished_utc": "2026-10-25T01:45:12Z"}`.
 # "verified" is true for "full" and "quick" and false for "off". A trailer
-# written before modes existed has no "verify" key and reads as "full".
+# written before modes existed has no "verify" key and reads as "full". A
+# trailer written before card ved3wVOQ has no "finished_utc" and orders by
+# name (see "Ordering" below); readers ignore keys they do not know.
 # A version is verified iff its folder exists and its manifest ends in a
 # verified trailer. Legacy versions (made before manifests) have none and are
 # simply unverified, as is an "off" version.
@@ -132,20 +142,28 @@ def read_manifest_summary(job: Dict, stamp: str) -> Optional[Dict]:
     manifests all come back None -- "not verified", never an exception -- and
     so does a trailer whose mode is unknown or disagrees with its "verified"
     flag, since only a run of this code writes one and it never writes that.
+
+    "finished_utc" is present only when it is a well-formed UTC time; a junk
+    value is dropped (the version then orders by name), never trusted and
+    never an exception.
     """
     line = _last_line(manifest_path(job, stamp))
     if not line:
         return None
     try:
         trailer = json.loads(line.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):    # RecursionError: a 4 KB run of "["
         return None
     if not isinstance(trailer, dict) or trailer.get("type") != "end":
         return None
     mode = trailer.get("verify", "full")
     if mode not in VERIFY_MODES or trailer.get("verified") is not (mode != "off"):
         return None
-    return dict(trailer, verify=mode)
+    summary = dict(trailer, verify=mode)
+    finished = valid_finished_utc(summary.pop("finished_utc", None))
+    if finished:
+        summary["finished_utc"] = finished
+    return summary
 
 
 def verify_mode(job: Dict, stamp: str) -> Optional[str]:
@@ -163,9 +181,80 @@ def is_verified(job: Dict, stamp: str) -> bool:
             and summary is not None and summary["verified"] is True)
 
 
+# ---------------------------------------------------------------------------
+# Ordering (card ved3wVOQ)
+# ---------------------------------------------------------------------------
+# Version NAMES are local clock time and never change. In the hour the clocks
+# go back, a run made later can carry an EARLIER name, so "older/newer" is not
+# decided by name. It is decided by `finished_utc`, the UTC time recorded in
+# the manifest trailer when the run finalised it. Runs of one job never
+# overlap (the per-job lock), so finish order is run order.
+#
+# The rule, in one place (`_order_key`):
+#   * a version that carries a valid `finished_utc` orders by it;
+#   * a version without one (made before this change, or a damaged/missing
+#     trailer or a junk value) cannot be compared by UTC, so these order by
+#     NAME among themselves, and ALL of them come BEFORE every version that
+#     carries a UTC time -- a version with the field was necessarily made by a
+#     build newer than any version without it;
+#   * ties (same UTC second, or both without) break by name.
+# Known limit: a version whose trailer later becomes damaged loses its UTC
+# time and so sorts among the oldest; it is unverified at that point anyway.
+
+def utc_stamp(moment: datetime) -> str:
+    """`moment` as the `finished_utc` text. A naive `moment` is taken to be
+    UTC already; an aware one is converted to UTC."""
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc)
+    return moment.strftime(FINISHED_UTC_FORMAT)
+
+
+def _order_key(stamp: str, summary: Optional[Dict]) -> Tuple[int, str, str]:
+    """Sort key of version `stamp` whose trailer summary is `summary`.
+
+    `(1, finished_utc, stamp)` with a UTC time, `(0, "", stamp)` without.
+    UTC strings are fixed-width, so string order is time order.
+    """
+    finished = (summary or {}).get("finished_utc")
+    return (1, finished, stamp) if finished else (0, "", stamp)
+
+
+def _ordered(job: Dict) -> List[Tuple[str, Optional[Dict]]]:
+    """`(stamp, trailer summary or None)` for every version, oldest first.
+
+    Reads each manifest's last line once (a few hundred bytes) and returns the
+    summaries so a caller that needs "is it verified" or the file count does
+    not read them again. Never raises: an unreadable manifest is a None
+    summary and the version orders by name.
+    """
+    entries = [(name, read_manifest_summary(job, name)) for name in version_names(job)]
+    entries.sort(key=lambda entry: _order_key(*entry))
+    return entries
+
+
+def ordered_versions(job: Dict) -> List[str]:
+    """Version stamps of `job`, oldest first by recorded UTC finish time, with
+    the fallback rule above. THE chronological order: latest_version, restore,
+    prune, the sanity baseline and changes-since all use it."""
+    return [name for name, _ in _ordered(job)]
+
+
+def version_order_key(job: Dict, stamp: str) -> Tuple[int, str, str]:
+    """Where `stamp` sits in the order, for comparing a stamp that is not part
+    of a listing (the hold release's `since`) with the listed versions. A
+    version no longer on disk has no trailer to read, so it keys by name like
+    a version made before this change."""
+    return _order_key(stamp, read_manifest_summary(job, stamp))
+
+
+def _summary_verified(summary: Optional[Dict]) -> bool:
+    """True when a trailer summary says verified ("full" or "quick")."""
+    return summary is not None and summary["verified"] is True
+
+
 def verified_versions(job: Dict) -> List[str]:
-    """The verified subset of `version_names(job)`, oldest first."""
-    return [name for name in version_names(job) if is_verified(job, name)]
+    """The verified subset of `ordered_versions(job)`, oldest first."""
+    return [name for name, summary in _ordered(job) if _summary_verified(summary)]
 
 
 def version_when(stamp: Optional[str]) -> Optional[str]:
@@ -195,15 +284,16 @@ def restore_candidates(job: Dict) -> Dict:
     No versions: preferred and latest are None. Reads each manifest's tail
     only, so it is cheap enough to call when a button is pressed.
     """
-    names = version_names(job)
+    entries = _ordered(job)                      # oldest first, by recorded UTC time
+    names = [name for name, _ in entries]
     if not names:
         return {"preferred": None, "latest": None, "fallback": False,
                 "newer_unverified": []}
-    verified = [name for name in names if is_verified(job, name)]
+    verified = [name for name, summary in entries if _summary_verified(summary)]
     preferred = verified[-1] if verified else names[-1]
     return {"preferred": preferred, "latest": names[-1],
             "fallback": not verified,
-            "newer_unverified": [name for name in names if name > preferred]}
+            "newer_unverified": names[names.index(preferred) + 1:]}
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +318,8 @@ def sanity_baseline(job: Dict, exclude: Optional[str] = None) -> Tuple[int, Opti
     the copy was checked, so a job with verification "off" is guarded too.
     Legacy versions (no manifest), damaged or truncated trailers and a junk
     `files` value do not count. `exclude` is the stamp of the run being judged.
+    "Older" and "newest" are in `ordered_versions` order (recorded UTC finish
+    time), not name order.
 
     **The owner's release (card QnFM2GMZ).** When the job carries a valid
     `hold_released` acknowledgement (`jobs_store.job_hold_released`), versions
@@ -242,12 +334,14 @@ def sanity_baseline(job: Dict, exclude: Optional[str] = None) -> Tuple[int, Opti
     retention prunes it; it simply stops being the baseline.
     """
     release = job_hold_released(job)
-    since = release["since"] if release else ""
+    # `since` is a stamp; compare in the order the versions are listed in, by
+    # its own key (its recorded UTC time if it is still on disk).
+    since_key = version_order_key(job, release["since"]) if release else None
     best, stamp = 0, None
-    for name in version_names(job):             # oldest first, so >= keeps the newest tie
-        if name == exclude or name < since:     # stamps sort chronologically
+    for name, summary in _ordered(job):         # oldest first, so >= keeps the newest tie
+        if name == exclude or (since_key and _order_key(name, summary) < since_key):
             continue
-        files = (read_manifest_summary(job, name) or {}).get("files")
+        files = (summary or {}).get("files")
         if isinstance(files, int) and not isinstance(files, bool) and files > 0 and files >= best:
             best, stamp = files, name
     return best, stamp
@@ -321,19 +415,25 @@ def prune_versions(job: Dict, protect: Iterable[str] = (),
     `retention` ordinary versions plus the protected ones. An empty `protect`
     is the plain retention prune.
 
+    Oldest and newest are in `ordered_versions` order (recorded UTC finish
+    time; a version without one orders by name, before all that have one).
+
     `newest` is the version the calling run has just made: it is treated as
-    the newest whatever its name says. Names are local clock time, so in the
-    hour the clocks go back a later run can carry an EARLIER name; ordered by
-    name alone, a retention-1 job deleted the backup it had just made and
-    kept the older one.
+    the newest whatever its recorded time or name says. Names are local clock
+    time, so in the hour the clocks go back a later run can carry an EARLIER
+    name; ordered by name alone, a retention-1 job deleted the backup it had
+    just made and kept the older one (PR #17). The UTC order now gets that
+    right by itself; this stays as the belt to its braces, for a clock set
+    back by hand (UTC then goes backwards too) or an unreadable trailer.
     """
     keep = max(1, int(job.get("retention", DEFAULT_RETENTION)))
-    names = version_names(job)
+    entries = _ordered(job)
+    names = [name for name, _ in entries]
     if newest in names:
         names.remove(newest)
         names.append(newest)
-    protected = next((name for name in reversed(names)
-                      if is_verified(job, name)), None)
+    verified = {name for name, summary in entries if _summary_verified(summary)}
+    protected = next((name for name in reversed(names) if name in verified), None)
     protect = set(protect)
     candidates = [name for name in names if name not in protect]
     removed = []
@@ -416,6 +516,9 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
     `<stamp>` entry exists are never touched. Links and junctions are never
     followed or removed. Age comes from the stamp in the name (strictly older
     than `now - max_age_days`), not from file times, so it is deterministic.
+    That is deliberately still the NAME, not `ordered_versions`' UTC order
+    (card ved3wVOQ): a leftover has no finished trailer, and an autumn clock
+    change moves a name by one hour against a seven-day cutoff.
 
     The newest `.partial` is always kept, with its manifests, so one failed
     attempt stays inspectable; it is reported as `kept_for_inspection` when it

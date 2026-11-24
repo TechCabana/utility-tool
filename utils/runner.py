@@ -12,7 +12,7 @@ name, so a test that patches that module's attribute reaches this code too:
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, Optional
 
 from utils import jobs_store, locks, precheck, runlog, verify
@@ -25,7 +25,7 @@ from utils.verify import _quick_verify
 from utils.versions import (MANIFEST_VERSION, VERSION_FORMAT, _discard, is_sanity_drop,
                             is_verified, job_root, latest_version, manifest_path,
                             prune_versions, pruning_held_sentence, restore_candidates,
-                            sanity_baseline, version_path,
+                            sanity_baseline, utc_stamp, version_path,
                             version_when)
 
 
@@ -42,6 +42,18 @@ MTIME_TOLERANCE = 2.0
 
 # How many one-second stamps `_claim_stamp` tries before giving up.
 CLAIM_ATTEMPTS = 3
+
+# The real `datetime`, captured before any test replaces `runner.datetime` to
+# fake the LOCAL clock (version names), so the UTC clock below is a separate
+# thing that can be faked separately -- the autumn clock change needs both.
+_REAL_DATETIME = datetime
+
+
+def _utc_now() -> datetime:
+    """The current time in UTC (timezone-aware). The run's `finished_utc`
+    comes from here; tests patch THIS to set UTC independently of the local
+    clock that names versions (`datetime.now()` in `_claim_stamp`)."""
+    return _REAL_DATETIME.now(timezone.utc)
 
 
 def _claim_stamp(root: str, job: Dict) -> Optional[str]:
@@ -103,8 +115,9 @@ def run_job(job: Dict,
        sample (`_quick_verify`); "off" skips this step. Any mismatch fails
        the run: nothing is promoted, nothing is pruned, and the `.partial`
        folder and `.tmp` manifest are KEPT so the failure can be inspected.
-    3. Append the end trailer (recording the mode, and `verified` false for
-       "off"), fsync, rename the manifest into place, and only then rename
+    3. Append the end trailer (recording the mode, `verified` false for "off",
+       and `finished_utc`, the UTC finish time versions are ordered by),
+       fsync, rename the manifest into place, and only then rename
        `.partial` to `<stamp>` -- so a version folder never exists without
        its finished manifest. An "off" version is promoted like any other.
     4. Prune, which never removes the newest verified version, nor the
@@ -696,11 +709,16 @@ def _backup(job: Dict,
                 "verified": False, "verify_mode": mode, "partial": partial,
                 "manifest": manifest_tmp, "files": files, "errors": errors}
 
+    # Card ved3wVOQ: the UTC moment the run finalises the manifest. It is what
+    # orders this version against the others (`versions.ordered_versions`),
+    # because the version NAME is local time and repeats in an autumn hour.
+    finished_utc = utc_stamp(_utc_now())
     try:
         with open(long_path(manifest_tmp), "a", encoding="utf-8", newline="\n") as out:
             out.write(json.dumps({"type": "end", "files": files,
                                   "bytes": copied_bytes, "verify": mode,
-                                  "verified": mode != "off"}) + "\n")
+                                  "verified": mode != "off",
+                                  "finished_utc": finished_utc}) + "\n")
             out.flush()
             os.fsync(out.fileno())
         os.replace(long_path(manifest_tmp), long_path(manifest))
@@ -756,7 +774,7 @@ def _backup(job: Dict,
             "pruning_held": held, "baseline_files": baseline,
             "baseline_stamp": baseline_stamp if held else None,
             "verified": mode != "off", "verify_mode": mode, "manifest": manifest,
-            "target_volume": target_volume(target)}
+            "finished_utc": finished_utc, "target_volume": target_volume(target)}
 
 
 # ---------------------------------------------------------------------------

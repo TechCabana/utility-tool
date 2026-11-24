@@ -123,6 +123,27 @@ def _count(value) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
+# The UTC time a backup finished, as recorded in its manifest trailer
+# (`finished_utc`) and on the job (`last_finished_utc`): fixed-width ISO-8601
+# with a literal "Z", e.g. 2026-10-25T01:45:12Z. Fixed width is what lets two
+# of them be compared as plain strings (card ved3wVOQ).
+FINISHED_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_FINISHED_UTC_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+
+def valid_finished_utc(value) -> Optional[str]:
+    """`value` if it is a well-formed `FINISHED_UTC_FORMAT` string naming a
+    real moment, else None. Junk (wrong type, wrong shape, month 13, a local
+    time with an offset, padding) is never trusted for ordering."""
+    if not isinstance(value, str) or not _FINISHED_UTC_RE.fullmatch(value):
+        return None
+    try:
+        datetime.strptime(value, FINISHED_UTC_FORMAT)
+    except ValueError:
+        return None
+    return value
+
+
 def job_pruning_held(job: Dict) -> bool:
     """True when `job`'s last run held pruning (the source sanity guard, card 51).
 
@@ -654,5 +675,12 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
             job["last_pruning_held"] = held
             job["last_baseline_files"] = _count(result.get("baseline_files")) if held else 0
             job["last_files"] = _count(result.get("files"))
+            # Card ved3wVOQ: when the backup finished, in UTC (the same value
+            # as its manifest trailer). Only a valid one is written, so a
+            # missing or junk value leaves any earlier one alone. It is not in
+            # SETTINGS_KEYS, so a job-form save can never roll it back.
+            finished = valid_finished_utc(result.get("finished_utc"))
+            if finished:
+                job["last_finished_utc"] = finished
         _save_job(job)
     return job

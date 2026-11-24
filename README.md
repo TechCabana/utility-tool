@@ -198,13 +198,17 @@ are the extra data Windows can attach to a file, such as the "downloaded from th
 (`Zone.Identifier`), so a restored file does not carry that mark. Symbolic links and junctions
 are skipped, not followed.
 
-**Version names use local time.** A version is named for the computer's clock when its backup
-started, for example `20261025-013000`. When the clocks go back in autumn, one hour happens
-twice. If a job ran once in each pass of that hour, and the second run's clock time is the
-earlier one, Safekeep sorts the two the wrong way round and treats the older as the newer:
-Restore picks the older one by default, and a later run's clean-up removes the newer of the two
-first. A run never deletes the backup it has just made, whatever its name. It needs two backups
-of one job inside that single hour, so it is rare. It is a known limit, accepted for now.
+**Version names use local time; their order does not.** A version is named for the computer's
+clock when its backup started, for example `20261025-013000`. When the clocks go back in
+autumn, one hour happens twice, so a backup made later can carry an earlier name than one made
+before it. Safekeep therefore does not order backups by name. Each backup's checksum list ends
+with the UTC time the backup finished, and Restore's default choice, the clean-up that keeps
+only the last few versions, the newest-verified-copy rule, the file-count comparison that holds
+back a clean-up and the "changes since" figure all use that time. The names and folders are
+unchanged. A backup made before this change has no recorded time, so those are ordered by name
+and counted as older than any backup that has one; the old mix-up can therefore still happen
+for two of those made inside the same repeated hour, and for a backup whose checksum list has
+since been damaged. A run never deletes the backup it has just made, whatever its name.
 
 **What the check proves.** While it copies, Safekeep records a SHA-256 checksum of each file,
 taken from the bytes it actually read from the source. Before a new version is kept, the job's
@@ -388,6 +392,7 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `running` | object | Present only while a run is under way, or after one died: `{since, pid, start_time, stamp, token}`, written just before copying and removed when the run records its outcome. A marker whose process is gone is shown as "Interrupted" and recorded as `interrupted` in `last_result` and the run log. Do not edit it by hand |
 | `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
 | `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed run leaves all three unchanged |
+| `last_finished_utc` | string | When the last successful run finished, in UTC (`2026-10-25T01:45:12Z`), the same value as the end of its checksum list; absent until a job has a successful run made by a version that records it, and a failed run leaves it unchanged |
 | `last_precheck` | object | The last pre-check's summary: `{time, ok, aborted, fs, scanned, problems, blocking, counts, sample}` (counts by kind, up to five paths from the source root). Absent until a job is first checked |
 | `hold_released` | object | Present after the owner released a pruning hold: `{stamp, files, level, since, time}`, the version let go and its file count, the source's file count then, and the newest version at that moment. Versions older than `since` no longer count as the larger backup to compare with |
 
@@ -465,6 +470,7 @@ utility-tool/
     ├── test_sweep.py
     ├── test_target_failures.py
     ├── test_tokens.py
+    ├── test_utc_order.py
     ├── test_verify.py
     └── test_verify_modes.py
 ```
