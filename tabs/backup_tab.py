@@ -484,8 +484,9 @@ HELD_AFTER_FAILURE = "Older backups are being kept because the source shrank."
 INTERRUPTED_DETAIL = (
     "This backup started but stopped before it finished, so no result was "
     "recorded. Usual causes: the computer was unplugged, shut down or put to "
-    "sleep while it ran, or the program crashed. The next run starts cleanly; "
-    "any half-finished copy it left behind is removed by the normal clean-up.")
+    "sleep while it ran, the app was closed, or the program crashed. The next "
+    "run starts cleanly; any half-finished copy it left behind is removed by "
+    "the normal clean-up.")
 
 # The button on a held job's card that says the shrink was on purpose (card
 # QnFM2GMZ), and what its confirmation adds to the two counts it names.
