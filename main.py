@@ -414,6 +414,14 @@ def run_backup_job_cli(job_id):
         print(f"[WARN] {result['changed']} file(s) changed while they were being "
               f"copied: {', '.join(names)}" + (f" and {more} more" if more > 0 else ""),
               file=sys.stderr)
+    if result.get("ok") and result.get("links_skipped"):
+        # Card tiha5I8F: shortcuts (symlinks, junctions) are never followed, so
+        # their contents are not in the backup. Same contract: stderr, exit 0.
+        names = result.get("links_sample") or []
+        more = result["links_skipped"] - len(names)
+        print(f"[WARN] {result['links_skipped']} shortcut(s) were not followed: "
+              f"{', '.join(names)}" + (f" and {more} more" if more > 0 else ""),
+              file=sys.stderr)
     if result.get("ok") and result.get("pruning_held"):
         # The source lost a large share of its files: pruning was held. Same
         # contract as a skip -- loud on stderr, exit code unchanged.

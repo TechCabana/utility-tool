@@ -575,6 +575,30 @@ def _with_stored_release(job: Dict) -> Dict:
     return dict(job, hold_released=release) if release else job
 
 
+def links_sentence(folders: int, files: int, names, total: int) -> str:
+    """The plain-words sentence for shortcuts a run did not follow, "" for none.
+
+    "2 shortcut folders point somewhere else and were not followed: Photos,
+    Archive. Add those locations as their own backup." `names` are the relative
+    paths to show (already capped); `total` is every link, so a longer list ends
+    "and N more". Folders and files are counted apart ("1 shortcut file and 2
+    shortcut folders"), singular verbs and "that location" for exactly one.
+    """
+    if total <= 0:
+        return ""
+    parts = []
+    if folders:
+        parts.append(f"{folders} shortcut folder{'s' if folders != 1 else ''}")
+    if files:
+        parts.append(f"{files} shortcut file{'s' if files != 1 else ''}")
+    one = total == 1
+    shown = ", ".join(names) + (f" and {total - len(names)} more" if total > len(names) else "")
+    return (f"{' and '.join(parts)} {'points' if one else 'point'} somewhere else and "
+            f"{'was' if one else 'were'} not followed: {shown}. "
+            f"Add {'that location' if one else 'those locations'} as "
+            f"{'its' if one else 'their'} own backup.")
+
+
 def _backup(job: Dict,
             on_progress: Optional[Callable[[int, int], None]],
             should_abort: Optional[Callable[[], bool]],
@@ -789,11 +813,22 @@ def _backup(job: Dict,
     if pruned:
         # A held run prunes too now, after a sentence that ends in its own ".".
         message += ("" if message.endswith(".") else ".") + f" Removed {len(pruned)} old version(s)"
+    # Card tiha5I8F: shortcuts (symlinks, junctions) are never followed, so what
+    # they point at is not in this backup. Said last, in plain words, with the
+    # sentence also returned on its own so the run log can leave the names out.
+    links = stats.get("links", 0)
+    links_folders = stats.get("links_folders", 0)
+    links_sample = list(stats.get("link_names", []))[:jobs_store.SKIPPED_SAMPLE_MAX]
+    sentence = links_sentence(links_folders, links - links_folders, links_sample, links)
+    if sentence:
+        message += ("" if message.endswith(".") else ".") + " " + sentence
     return {"ok": True, "message": message, "version": stamp, "files": files,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
             "not_copied": not_copied, "retried": retried,
             "recopied": recopied, "changed": changed,
             "changed_sample": changed_sample,
+            "links_skipped": links, "links_folders": links_folders,
+            "links_sample": links_sample, "links_sentence": sentence,
             "pruning_held": held, "baseline_files": baseline,
             "baseline_stamp": baseline_stamp if held else None,
             "verified": mode != "off", "verify_mode": mode, "manifest": manifest,

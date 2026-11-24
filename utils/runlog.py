@@ -13,7 +13,7 @@ the one app-level log, `logs/app.jsonl`. Every line carries exactly `LINE_KEYS`:
     v, start, end, trigger, job, name, outcome, files, bytes, skipped,
     skipped_paths, skipped_more, pruned, version, verify_mode, cause, message,
     pruning_held, offenders, baseline_files, baseline_stamp, retried, recopied,
-    changed
+    changed, links
 
 `retried` (card b5CfTkL8) counts the files that could not be read at first and
 were copied by the one retry after the walk; they are in `files`, not `skipped`.
@@ -23,6 +23,12 @@ that changed while they were being copied and settled on the second copy, and
 files that were still changing on it and are kept flagged "changed during
 backup". Both are in `files`. `outcome` "ok_changed" is an ok run with
 `changed` > 0 and nothing skipped and nothing held (those outcomes win).
+
+`links` (card tiha5I8F) is a count only: the symlinks and junctions the run did
+not follow, so what they point at is not in the version. Their names are in the
+result and on the job, never in the log, and the run's message is logged
+without the sentence that names them. `outcome` "ok_links" is an ok run with
+`links` > 0 and nothing skipped, changed or held (those outcomes win).
 
 `offenders` (card 104) lists, from the source root, the files a run that failed
 as "path_too_long" or "file_too_large" found the drive cannot hold (at most
@@ -74,13 +80,13 @@ SKIPPED_PATHS_MAX = 50
 # stay well under a megabyte" true whatever an exception's text turns out to be.
 MESSAGE_MAX = 2000
 APP_LOG_NAME = "app"
-OUTCOMES = ("ok", "ok_skipped", "ok_changed", "ok_pruning_held", "failed", "cancelled",
-            "busy", "hold_released", "interrupted")
+OUTCOMES = ("ok", "ok_skipped", "ok_changed", "ok_links", "ok_pruning_held", "failed",
+            "cancelled", "busy", "hold_released", "interrupted")
 LINE_KEYS = ("v", "start", "end", "trigger", "job", "name", "outcome", "files",
              "bytes", "skipped", "skipped_paths", "skipped_more", "pruned",
              "version", "verify_mode", "cause", "message", "pruning_held",
              "offenders", "baseline_files", "baseline_stamp", "retried", "recopied",
-             "changed")
+             "changed", "links")
 LOCK_TIMEOUT = 2.0
 
 
@@ -116,7 +122,7 @@ def _text(value) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
 
-def _outcome(result: Dict, skipped: int, changed: int = 0) -> str:
+def _outcome(result: Dict, skipped: int, changed: int = 0, links: int = 0) -> str:
     """Map a `run_job` result onto one of `OUTCOMES`."""
     if result.get("busy"):
         return "busy"
@@ -129,7 +135,9 @@ def _outcome(result: Dict, skipped: int, changed: int = 0) -> str:
             return "ok_pruning_held"
         if skipped:
             return "ok_skipped"
-        return "ok_changed" if changed else "ok"
+        if changed:
+            return "ok_changed"
+        return "ok_links" if links else "ok"
     if str(result.get("message", "")).startswith("Backup cancelled"):
         return "cancelled"
     return "failed"
@@ -150,6 +158,14 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
              for error in errors[:SKIPPED_PATHS_MAX]] if skipped else []
     # Same rule as `last_changed`: only a finished run kept anything.
     changed = _count(result.get("changed")) if result.get("ok") else 0
+    links = _count(result.get("links_skipped")) if result.get("ok") else 0
+    # The names of unfollowed links stay out of the log (counts only): the run's
+    # message carries them in one sentence, so that sentence is cut from the copy
+    # that is logged.
+    message = str(result.get("message", ""))
+    sentence = result.get("links_sentence")
+    if links and isinstance(sentence, str) and sentence:
+        message = message.replace(" " + sentence, "")
     pruned = result.get("pruned")
     mode = _text(result.get("verify_mode"))
     if mode is None and job:
@@ -161,7 +177,7 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
         "trigger": trigger,
         "job": _text(job.get("id")),
         "name": _text(job.get("name")),
-        "outcome": _outcome(result, skipped, changed),
+        "outcome": _outcome(result, skipped, changed, links),
         "files": _count(result.get("files")),
         "bytes": _count(result.get("bytes")),
         "skipped": skipped,
@@ -171,7 +187,7 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
         "version": _text(result.get("version")),
         "verify_mode": mode,
         "cause": _text(result.get("cause")),
-        "message": str(result.get("message", ""))[:MESSAGE_MAX],
+        "message": message[:MESSAGE_MAX],
         "pruning_held": result.get("pruning_held") is True,
         # Paths only, from the source root; anything that is not a string is
         # dropped rather than logged.
@@ -187,6 +203,7 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
         "retried": _count(result.get("retried")),
         "recopied": _count(result.get("recopied")),
         "changed": changed,
+        "links": links,
     }
 
 

@@ -196,7 +196,14 @@ Windows the hidden, system, archive and read-only marks are kept too, so a hidde
 hidden after a restore. Two things are left out. Alternate data streams are not backed up: these
 are the extra data Windows can attach to a file, such as the "downloaded from the internet" mark
 (`Zone.Identifier`), so a restored file does not carry that mark. Symbolic links and junctions
-are skipped, not followed.
+(shortcuts to a folder or file somewhere else) are not followed, so what they point to is not in
+the backup, and they are named instead of dropped without a word: the job reads "OK, N
+shortcuts not followed" (with the skipped and changed counts first when there are any), its
+Status tooltip lists up to five of them, a run's message says, for example, "2 shortcut
+folders point somewhere else and were not followed: Archive, Photos. Add those locations as
+their own backup", and the headless run prints a `[WARN]` line to stderr (exit code
+unchanged). Windows' own profile junctions (`My Documents`, `Application Data` and the like,
+which point back into the same profile) are not counted.
 
 **Version names use local time; their order does not.** A version is named for the computer's
 clock when its backup started, for example `20261025-013000`. When the clocks go back in

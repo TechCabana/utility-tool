@@ -91,6 +91,8 @@ def new_job(name: str, source: str, target: str, schedule: str = "daily",
         "last_skipped_sample": [],
         "last_changed": 0,
         "last_changed_sample": [],
+        "last_links": 0,
+        "last_links_sample": [],
         "last_pruning_held": False,
         "last_baseline_files": 0,
         "last_files": 0,
@@ -127,6 +129,22 @@ def job_changed(job: Dict) -> int:
 def job_changed_sample(job: Dict) -> List[str]:
     """The (at most `SKIPPED_SAMPLE_MAX`) relative paths stored with `last_changed`."""
     sample = job.get("last_changed_sample")
+    if not isinstance(sample, list):
+        return []
+    return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
+
+
+def job_links(job: Dict) -> int:
+    """How many shortcuts (symlinks, junctions) `job`'s last run did not follow
+    (card tiha5I8F); 0 when the field is missing (an older jobs file) or is not a
+    positive whole number."""
+    value = job.get("last_links")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def job_links_sample(job: Dict) -> List[str]:
+    """The (at most `SKIPPED_SAMPLE_MAX`) relative paths stored with `last_links`."""
+    sample = job.get("last_links_sample")
     if not isinstance(sample, list):
         return []
     return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
@@ -693,6 +711,15 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
         job["last_changed_sample"] = [
             name for name in (result.get("changed_sample") or [])
             if isinstance(name, str)][:SKIPPED_SAMPLE_MAX] if changed else []
+        # Card tiha5I8F: shortcuts the run did not follow. Same shape again (the
+        # job reads "ok", the screen builds "OK, N shortcuts not followed"):
+        # relative paths only, never the target a link points at, and only a
+        # finished run's, since a failed run made no statement about the tree.
+        links = _count(result.get("links_skipped")) if result.get("ok") else 0
+        job["last_links"] = links
+        job["last_links_sample"] = [
+            name for name in (result.get("links_sample") or [])
+            if isinstance(name, str)][:SKIPPED_SAMPLE_MAX] if links else []
         # Card 51: a run that kept its baseline aside says so on the job. Only a
         # successful run recomputes the three fields: a failed run (often the
         # very low-space failure a hold can lead to) says nothing about the

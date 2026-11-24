@@ -176,6 +176,66 @@ def _is_link_like(entry: os.DirEntry) -> bool:
     return bool(tag & _NAME_SURROGATE)
 
 
+# Folder links Windows itself puts in a user profile for programs written
+# before Vista ("My Documents" -> Documents, "Application Data" -> AppData\Roaming,
+# ...). They point back into the same profile, so they hold nothing a backup of
+# that profile is missing, and they deny listing by design. Lowercase: Windows
+# names are case-insensitive.
+LEGACY_PROFILE_LINKS = frozenset({
+    "my documents", "application data", "local settings", "cookies", "nethood",
+    "printhood", "recent", "sendto", "start menu", "templates", "my music",
+    "my pictures", "my videos", "history", "temporary internet files",
+})
+
+
+def profile_root(path: str):
+    """The user-profile folder `path` is inside (or is): the nearest ancestor
+    whose parent is called `Users`, as `C:\\Users\\alice`; None if there is none.
+
+    Lexical only (never touches the filesystem), so it works on a path that is
+    not there, and tests can stand a fake profile up in a temp folder.
+    """
+    current = os.path.normpath(path)
+    while True:
+        parent, name = os.path.split(current)
+        if not name or parent == current:
+            return None
+        if os.path.basename(parent).lower() == "users":
+            return current
+        current = parent
+
+
+def is_legacy_profile_link(entry: os.DirEntry, path: str) -> bool:
+    """True for one of Windows' own compatibility junctions in a user profile,
+    which the "shortcuts not followed" report must not ask the user to act on.
+
+    ALL of: Windows; a junction (not a symlink) to a folder; named in
+    `LEGACY_PROFILE_LINKS`; inside a user profile (`profile_root`); and its
+    target resolves inside that same profile. A junction with one of these
+    names that points anywhere else (another drive, another user) is somebody's
+    real shortcut and is still reported.
+
+    Not decided by listing the junction: these are access-denied by design, and
+    listing would FOLLOW the link, which the copy deliberately never does. The
+    target is read with `os.path.realpath` (reads the link, lists nothing). If
+    that cannot resolve it returns the link's own path, which is inside the
+    profile, so the name and place decide -- the legacy set is the evidence.
+    `path` is the entry's plain path.
+    """
+    if os.name != "nt" or entry.name.lower() not in LEGACY_PROFILE_LINKS:
+        return False
+    try:
+        if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+            return False
+    except OSError:
+        return False
+    profile = profile_root(os.path.dirname(path))
+    if profile is None:
+        return False
+    inside = os.path.normcase(os.path.realpath(profile)) + os.sep
+    return (os.path.normcase(os.path.realpath(path)) + os.sep).startswith(inside)
+
+
 def human_size(num_bytes: int) -> str:
     """Format a byte count as a short human-readable string, e.g. "4.2 GB".
 

@@ -15,7 +15,8 @@ import stat
 import time
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from utils.fs_utils import _is_link_like, long_path, plain_error, relative_to
+from utils.fs_utils import (_is_link_like, is_legacy_profile_link, long_path,
+                            plain_error, relative_to)
 
 
 class BackupAborted(Exception):
@@ -415,8 +416,12 @@ def copy_tree(source: str, destination: str,
     into one list, so a target failure could not be told from a skip.
     Symlinks and junctions are skipped (`_is_link_like`, the one link
     predicate: copying a junction that points at an ancestor of the source
-    would recurse until the disk fills). Existing destination folders are
-    reused, as copytree's `dirs_exist_ok=True` did.
+    would recurse until the disk fills), but not silently (card tiha5I8F):
+    `stats["links"]` counts them, `stats["links_folders"]` says how many point
+    at a folder, and `stats["link_names"]` names them all (relative paths,
+    sorted). Windows' own access-denied profile junctions (`My Documents`...)
+    are left out of all three, see `fs_utils.is_legacy_profile_link`. Existing
+    destination folders are reused, as copytree's `dirs_exist_ok=True` did.
 
     Every file is copied by `_hash_copy`. With `on_copied`,
     `on_copied(relative path, size, mtime, sha256)` is called once it has
@@ -469,6 +474,8 @@ def copy_tree(source: str, destination: str,
     # (source file, its destination, its index in `errors`) per skipped file.
     skipped_files: List[Tuple[str, str, int]] = []
     changed_names: List[str] = []
+    # Links left unfollowed (card tiha5I8F): relative path -> "folder" | "file".
+    links: Dict[str, str] = {}
     # Source files whose one extra attempt (a re-copy) is already used.
     spent: set = set()
 
@@ -547,6 +554,24 @@ def copy_tree(source: str, destination: str,
         rel = relative_to(src, source).replace("\\", "/")
         return f"{rel}: {plain_error(exc)}"
 
+    def note_link(entry: os.DirEntry, src: str) -> None:
+        """Record a symlink/junction the walk is declining to follow (card
+        tiha5I8F), unless it is one of Windows' own legacy profile junctions.
+
+        Called from the one walk the copy already makes, so a link is seen once
+        (a dict keyed on its relative path, so even a repeat could not count it
+        twice) and a link inside a folder that is never visited is never seen.
+        Looks at the link itself and, for kind, stats its target (`is_dir`);
+        nothing is listed or opened, so nothing is followed.
+        """
+        if is_legacy_profile_link(entry, src):
+            return
+        try:
+            kind = "folder" if entry.is_dir() else "file"
+        except OSError:
+            kind = "file"  # a dead link: nothing to say it points at a folder
+        links[relative_to(src, source).replace("\\", "/")] = kind
+
     def copy_dir(src_dir: str, dst_dir: str) -> None:
         """Copy one folder, depth first. OSError if `src_dir` is unreadable."""
         with os.scandir(long_path(src_dir)) as listing:
@@ -560,6 +585,7 @@ def copy_tree(source: str, destination: str,
             is_file = False
             try:
                 if _is_link_like(entry):
+                    note_link(entry, src)
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     copy_dir(src, dst)
@@ -598,6 +624,11 @@ def copy_tree(source: str, destination: str,
         stats["recopied"] = state["recopied"]
         stats["changed"] = len(changed_names)
         stats["changed_names"] = changed_names
+        # Sorted by name (case-folded, then exact) so the capped sample every
+        # surface shows is the same on every run, whatever order the OS listed.
+        stats["links"] = len(links)
+        stats["links_folders"] = sum(kind == "folder" for kind in links.values())
+        stats["link_names"] = sorted(links, key=lambda name: (name.casefold(), name))
     # A copy holding NOTHING is never a backup, whatever the floor says: a
     # two-file source with both files locked is under SHORTFALL_MIN_FILES,
     # and promoting its empty copy as "verified" pruned the last real one.

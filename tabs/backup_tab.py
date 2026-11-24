@@ -696,10 +696,15 @@ class JobRow(QtWidgets.QWidget):
             # plain OK, however green that would look.
             skipped = backup_utils.job_skipped(job)
             changed = backup_utils.job_changed(job)
+            links = backup_utils.job_links(job)
             held = backup_utils.job_pruning_held(job)
-            if skipped or changed or held:
+            if skipped or changed or links or held:
+                # One short clause per note, in the order of how much each
+                # matters; the tooltip is where the detail lives.
                 parts = (([f"{skipped} skipped"] if skipped else [])
                          + ([f"{changed} changed during backup"] if changed else [])
+                         + ([f"{links} shortcut{'s' if links != 1 else ''} not followed"]
+                            if links else [])
                          + (["pruning held"] if held else []))
                 return "OK, " + ", ".join(parts), "StatusWarn"
             return "OK", "StatusOk"
@@ -723,6 +728,8 @@ class JobRow(QtWidgets.QWidget):
             parts.append(JobRow._skipped_detail(job))
         if backup_utils.job_changed(job):
             parts.append(JobRow._changed_detail(job))
+        if backup_utils.job_links(job):
+            parts.append(JobRow._links_detail(job))
         if backup_utils.job_pruning_held(job):
             parts.append(backup_utils.pruning_held_sentence(
                 backup_utils.job_last_files(job), backup_utils.job_baseline_files(job)))
@@ -753,6 +760,20 @@ class JobRow(QtWidgets.QWidget):
             text += "\n" + "\n".join(names)
             if changed > len(names):
                 text += f"\nand {changed - len(names)} more"
+        return text
+
+    @staticmethod
+    def _links_detail(job: dict) -> str:
+        """What "OK, N shortcuts not followed" means, and up to five names."""
+        links = backup_utils.job_links(job)
+        names = backup_utils.job_links_sample(job)
+        text = ("These are shortcuts to somewhere else. Safekeep does not follow "
+                "shortcuts, so what they point to is not in this backup. Add those "
+                "locations as their own backup.")
+        if names:
+            text += "\n" + "\n".join(names)
+            if links > len(names):
+                text += f"\nand {links - len(names)} more"
         return text
 
     def _last_run(self, job: dict) -> str:
@@ -1763,6 +1784,7 @@ class BackupTab(QtWidgets.QWidget):
         warn = bool(result.get("ok") and (result.get("errors")
                                           or result.get("not_copied")
                                           or result.get("changed")
+                                          or result.get("links_skipped")
                                           or result.get("pruning_held")))
         self._say(message, ok=result.get("ok", False), warn=warn)
         if result.get("ok"):

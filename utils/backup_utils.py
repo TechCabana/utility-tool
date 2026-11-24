@@ -35,7 +35,7 @@ from datetime import datetime  # noqa: F401  -- tests subclass `backup_utils.dat
 from utils.jobs_store import (  # noqa: F401
     _backup_path, DEFAULT_RETENTION, DEFAULT_VERIFY, get_job, _has_usable_backup,
     job_baseline_files, job_hold_released, job_last_files, job_pruning_held, job_skipped,
-    job_skipped_sample, job_changed, job_changed_sample, job_verify_mode, job_running, new_running_marker, running_owner_gone,
+    job_skipped_sample, job_changed, job_changed_sample, job_links, job_links_sample, job_verify_mode, job_running, new_running_marker, running_owner_gone,
     set_running, JOBS_FILE, _jobs_file_lock, JOBS_FILENAME, JobsFileCorrupt,
     load_jobs, _locks_dir, new_job, quarantine_jobs_file, QuarantineRefused, _read_valid, record_precheck, record_run, remove_job,
     restore_jobs_from_backup, _save_job, save_job, save_job_settings, save_jobs, SCHEDULES,
@@ -71,7 +71,7 @@ from utils.preflight import (  # noqa: F401
 )
 from utils.runner import (  # noqa: F401
     _backup, _busy_message, changes_since, CLAIM_ATTEMPTS, _claim_stamp,
-    _job_lock_path, MTIME_TOLERANCE, release_hold, RELEASE_BUSY, RELEASE_NOTHING, _run_job,
+    _job_lock_path, links_sentence, MTIME_TOLERANCE, release_hold, RELEASE_BUSY, RELEASE_NOTHING, _run_job,
     run_job, _with_stored_release, _with_sweep,
     INTERRUPTED_PREFIX, interrupted_result, job_interrupted, settle_all_interrupted,
     settle_interrupted,
