@@ -389,7 +389,8 @@ def test_a_protected_version_whose_marking_partly_failed_still_restores_correctl
 def test_a_protected_version_with_a_damaged_manifest_keeps_the_stored_modes(tmp_path):
     """A manifest that cannot be trusted says nothing about `ro`: the copy's
     attributes are left as the copy made them, and the restore says it could
-    not check (existing behaviour)."""
+    not check (existing behaviour). Review gate: it also SAYS the files stayed
+    read-only, so a user is not left with uneditable files and no reason."""
     job, _ = make_job(tmp_path)
     stamp = run_ok(job)["version"]
     manifest = backup_utils.manifest_path(job, stamp)
@@ -400,6 +401,30 @@ def test_a_protected_version_with_a_damaged_manifest_keeps_the_stored_modes(tmp_
     out = restore(job, stamp, tmp_path)
     assert out["ok"] and out["unchecked_reason"] == "manifest damaged"
     assert is_read_only(restored(out, "a.txt"))
+    assert out["read_only_kept"] == len(FILES)
+    assert (f"{len(FILES)} files stayed read-only as they are stored in the backup"
+            in out["message"]), out["message"]
+
+
+def test_a_missing_manifest_says_how_many_restored_files_stayed_read_only(tmp_path):
+    """Same for a protected version whose manifest is gone: nothing can say which
+    files were read-only in the source, and the restore says so."""
+    job, _ = make_job(tmp_path)
+    stamp = run_ok(job)["version"]
+    clear_ro(backup_utils.manifest_path(job, stamp))
+    os.remove(_x(backup_utils.manifest_path(job, stamp)))
+    out = restore(job, stamp, tmp_path)
+    assert out["ok"] and out["read_only_kept"] == len(FILES), out["message"]
+    assert "clear the read-only mark to edit" in out["message"]
+
+
+def test_a_trusted_restore_says_nothing_about_read_only_files(tmp_path):
+    """Control: a good protected version restores its files writable (one source
+    read-only file stays so, by its `ro` line) and adds no such sentence."""
+    job, _ = make_job(tmp_path, read_only=["a.txt"])
+    out = restore(job, run_ok(job)["version"], tmp_path)
+    assert out["ok"] and out["verified"] and "read_only_kept" not in out
+    assert "stayed read-only" not in out["message"]
 
 
 def test_a_second_restore_over_a_read_only_restored_file_overwrites_it(tmp_path):

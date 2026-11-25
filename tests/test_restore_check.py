@@ -125,8 +125,13 @@ def test_a_version_without_a_manifest_restores_and_says_it_could_not_be_checked(
     assert result["unchecked_reason"] == "no manifest"
     assert result["verified"] is False and result["checked"] == 0
     assert result["mismatched"] == [] and result["missing_from_version"] == []
+    # The files of a finished version are read-only (card fEC32w6P) and nothing
+    # says which were read-only in the source, so that is said last.
     assert result["message"].endswith(
-        "This backup has no checksum list, so the files could not be checked")
+        "This backup has no checksum list, so the files could not be checked"
+        ". 5 files stayed read-only as they are stored in the backup, since its "
+        "checksum list cannot say which were read-only originally (clear the "
+        "read-only mark to edit)")
     assert CHECKED_EACH not in result["message"]
     assert open(os.path.join(result["path"], "a.txt"), "rb").read() == b"alpha"
 

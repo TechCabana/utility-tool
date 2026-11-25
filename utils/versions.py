@@ -911,10 +911,20 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
                 # which is the safe side; the restore itself is unaffected.
                 check["unrestored_modes"] = check.get("unrestored_modes", 0) + 1
 
+    def count_read_only(_rel: str, _size: int, _mtime: float, _sha: str,
+                        ro: bool = False, **_flags) -> None:
+        """No trusted manifest: count the restored files that kept the stored
+        copy's read-only mark (`ro=True` from `copy_tree`), so the message can
+        say why they cannot be edited. Since card fEC32w6P a protected
+        version's every file is read-only, and only its manifest says which
+        were read-only in the source. Never raises."""
+        if ro:
+            check["read_only_kept"] = check.get("read_only_kept", 0) + 1
+
     try:
         files, restored_bytes, errors = copy_tree(
             source, folder, on_progress=on_progress, should_abort=should_abort,
-            on_copied=compare if expected is not None else None, stats=stats)
+            on_copied=compare if expected is not None else count_read_only, stats=stats)
     except BackupAborted:
         # Only the files restored before the stop were compared; nothing here
         # claims the rest were. Never `verified`.
@@ -973,5 +983,9 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     if check.get("unrestored_modes"):
         message += (f". {_files(check['unrestored_modes'])} could not be made "
                     "writable and stayed read-only (clear the read-only mark to edit)")
+    if check.get("read_only_kept"):
+        message += (f". {_files(check['read_only_kept'])} stayed read-only as they are "
+                    "stored in the backup, since its checksum list cannot say which were "
+                    "read-only originally (clear the read-only mark to edit)")
     return dict(check, ok=True, message=message, path=folder, files=files,
                 bytes=restored_bytes, errors=errors)
