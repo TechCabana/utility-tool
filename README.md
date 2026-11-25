@@ -260,12 +260,15 @@ Safekeep read. It does not mean:
 - **You can restore it.** Nothing yet restores a sample to prove a backup can be brought back;
   a test restore is planned, not built.
 
-**An interrupted run is not resumed.** If the power goes, the app is closed or the program is
-killed part-way through a run, Safekeep does not pick the copy up where it stopped. The
-half-finished copy is never treated as a version, the job's Status reads "Interrupted:
-started ... and never finished", and the next run starts again from the beginning. A backup
-drive that is unplugged mid-run is a failed run instead, reported with its cause, and the next
-run likewise starts over.
+**An interrupted run is not resumed.** If the power goes or the program is killed part-way
+through a run, Safekeep does not pick the copy up where it stopped. The half-finished copy is
+never treated as a version, the job's Status reads "Interrupted: started ... and never
+finished", and the next run starts again from the beginning. A backup drive that is unplugged
+mid-run is a failed run instead, reported with its cause, and the next run likewise starts
+over. Closing the app while a backup runs cancels it: the half-finished copy is removed and the
+job reads "Failed" (its result is "Backup cancelled"), not "Interrupted". A close that comes
+after the copy was checked and kept, while older versions are being removed, waits for that
+step to finish and records the backup as made.
 
 ---
 
@@ -414,7 +417,7 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `retention` | int | Versions to keep; older ones are deleted after a run |
 | `target_volume` | string | The target drive's volume id, recorded on save or first run; a run onto a different drive is refused |
 | `verify` | string | `full` (default: re-read every copied file), `quick` (all sizes, a sample of hashes) or `off`; a missing or unknown value runs as `full` |
-| `last_result` | string | `ok`, `failed: <message>`, or `interrupted: started <time> and never finished` (a run that began and was closed, killed or crashed before it recorded a result; `last_run` is then when it began) |
+| `last_result` | string | `ok`, `failed: <message>`, or `interrupted: started <time> and never finished` (a run that began and was killed or crashed before it recorded a result; `last_run` is then when it began) |
 | `running` | object | Present only while a run is under way, or after one died: `{since, pid, start_time, stamp, token}`, written just before copying and removed when the run records its outcome. A marker whose process is gone is shown as "Interrupted" and recorded as `interrupted` in `last_result` and the run log. Do not edit it by hand |
 | `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
 | `last_changed`, `last_changed_sample` | int, list | Files the last run kept although they were still changing while they were copied (marked `"changed": true` in the checksum list), and up to five of their paths from the source root; 0 and empty after a clean or a failed run |

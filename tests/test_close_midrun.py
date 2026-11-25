@@ -5,13 +5,17 @@
 #
 # Finding (reproduced below with the REAL app, `main.main()`, in a child process
 # that exits through the real Qt event loop): closing the window, or quitting the
-# application, does NOT wait for the run and does NOT record its outcome. The tab's
-# `shutdown` (QApplication.aboutToQuit) aborts and joins the worker thread, so the
-# copy stops (or, once past the last abort check, finishes) and a half-copy is
-# discarded -- but the worker's `finished` signal is queued to the UI thread, whose
-# event loop has already ended, so `_finish_run` -> `record_run` never runs and the
-# start marker stays. On the next start the dead owner makes the job read
-# "Interrupted". That is why the tooltip and the README list "the app was closed".
+# application, does not wait for the run. The tab's `shutdown`
+# (QApplication.aboutToQuit) aborts and joins the worker thread, so the copy stops
+# (or, once past the last abort check, finishes) and a half-copy is discarded.
+# The worker's `finished` signal is queued to the UI thread, whose event loop has
+# already ended, so it is never delivered. Until the review gate's fix, that meant
+# `_finish_run` -> `record_run` never ran, the start marker stayed and the job read
+# "Interrupted" on the next start -- even after a run that had finished and
+# verified. `shutdown` now records the result the joined worker returned, so a
+# close mid-run reads as the cancelled run it was, a close during the final prune
+# reads as the good backup it made, and "the app was closed" is NOT a cause the
+# Interrupted tooltip or the README list.
 #
 # Isolation: every child gets APPDATA = a temp root (asserted by the child before
 # anything runs), a QSettings forced to an ini file inside that root (the real one
@@ -140,35 +144,36 @@ def version_folders(job):
     ("quit", "copy"),       # QApplication.quit() (a quit action, a session end)
     ("window", "verify"),   # the X button, while the copy is being checked
 ])
-def test_closing_the_app_mid_run_leaves_the_run_marker_so_the_job_reads_interrupted(
+def test_closing_the_app_mid_run_records_the_run_as_cancelled_not_interrupted(
         app_root, tmp_path, qt_app, close, phase):
     job = make_job(tmp_path)
     report = run_app(app_root, tmp_path, job, close, phase)
 
-    # On close: the worker was still running; shutdown stopped and joined it, and the
-    # engine returned "cancelled" -- but nothing recorded it (no record_run, and the
-    # tab's finish handler, which would have taken `_backup_done`, never ran).
+    # On close: the worker was still running; shutdown stopped and joined it, the
+    # engine returned "cancelled", and shutdown recorded that result itself (the
+    # queued `finished` signal is never delivered once the event loop has ended).
     assert events(report, f"closing_via_{close}(worker_thread_running=True)")
     assert events(report, "run_job_returned(ok=False, message='Backup cancelled')")
-    assert not events(report, "record_run")
-    assert report["finish_handler_never_ran"] is True and report["worker_thread_after"] is None
+    assert events(report, "record_run(ok=False)")
+    assert report["finish_handler_never_ran"] is False and report["worker_thread_after"] is None
 
-    # What the dead process left: the marker, the OLD result standing, no half-copy,
+    # What the process left: no marker, the cancelled run recorded, no half-copy,
     # no version, and no lock that could block the next run.
     after = stored(job)
-    assert after["last_result"] == "ok" and after["running"]["pid"] == report["pid"]
-    assert runner.job_interrupted(after) == {
-        "since": after["running"]["since"], "stamp": after["running"]["stamp"], "settled": False}
+    assert "running" not in after and after["last_result"] == "failed: Backup cancelled"
+    assert runner.job_interrupted(after) is None
     assert version_folders(job) == ([], [])
     assert os.listdir(jobs_store._locks_dir()) == []
+    # The run log agrees with the job: one line, "cancelled", and no later
+    # "interrupted" line for the same run.
+    assert [line["outcome"] for line in runlog.read_runs(job["id"])] == ["cancelled"]
 
-    # The restart: the job reads Interrupted, in the failure style, and the tooltip
-    # names this very cause -- the claim the tooltip and README make.
+    # The restart: the job reads Failed (the cancelled run), never Interrupted.
     label, settled = reopen(job)
-    assert label.objectName() == "StatusError"
-    assert label.text() == f"Interrupted: started {short_when(after['running']['since'])} and never finished"
-    assert "the app was closed" in label.toolTip()
-    assert settled["last_result"].startswith("interrupted") and "running" not in settled
+    assert (label.objectName(), label.text()) == ("StatusError", "Failed")
+    assert "never finished" not in label.toolTip()
+    assert settled["last_result"] == "failed: Backup cancelled" and "running" not in settled
+    assert [line["outcome"] for line in runlog.read_runs(job["id"])] == ["cancelled"]
 
     # ...and a new manual run starts at once (the dead owner's lock is already gone).
     result = backup_utils.run_job(stored(job))
@@ -190,24 +195,27 @@ def test_closing_after_the_outcome_was_recorded_leaves_no_marker(app_root, tmp_p
     assert (label.objectName(), label.text()) == ("StatusOk", "OK") and label.toolTip() == ""
 
 
-def test_closing_just_after_the_copy_is_promoted_still_reads_interrupted_though_the_backup_is_good(
+def test_closing_just_after_the_copy_is_promoted_records_the_good_backup(
         app_root, tmp_path, qt_app):
-    """KNOWN DEFECT, recorded as it is today (reported for its own card): pruning,
-    after promotion, is the one step with no abort check, so `shutdown` waits for the
-    run to FINISH -- a complete, verified version is on the target -- and the result
-    is then thrown away like any other, so the job still reads Interrupted. If closing
-    is ever made to record the outcome, this test is the one to update."""
+    """Pruning, after promotion, is the one step with no abort check, so `shutdown`
+    waits for the run to FINISH -- a complete, verified version is on the target.
+    Before the review gate's fix its result was thrown away and the job read
+    Interrupted although the backup was good; now `shutdown` records it."""
     job = make_job(tmp_path)
     report = run_app(app_root, tmp_path, job, "window", "prune")
     assert events(report, "run_job_returned(ok=True")
-    assert not events(report, "record_run")
+    assert events(report, "record_run(ok=True)")
     versions, leftovers = version_folders(job)
     assert len(versions) == 1 and leftovers == []
     manifest = Path(job["target"]).rglob(f"{versions[0]}.manifest.jsonl")
     trailer = json.loads(next(manifest).read_text(encoding="utf-8").splitlines()[-1])
     assert trailer["type"] == "end" and trailer["verified"] is True
+    after = stored(job)
+    assert "running" not in after and after["last_result"] == "ok"
+    assert after["last_finished_utc"] == trailer["finished_utc"]
     label, _ = reopen(job)
-    assert label.objectName() == "StatusError" and label.text().startswith("Interrupted")
+    assert (label.objectName(), label.text()) == ("StatusOk", "OK")
+    assert [line["outcome"] for line in runlog.read_runs(job["id"])] == ["ok"]
 
 
 # --- positive controls for the instrument ----------------------------------------
@@ -237,22 +245,56 @@ def test_the_reader_tells_an_orphaned_marker_from_a_live_one(app_root, tmp_path,
     dead = make_job(tmp_path / "other")
     plant(dead, dead_pid())
     label, _ = reopen(dead)
-    assert label.objectName() == "StatusError" and "the app was closed" in label.toolTip()
+    assert label.objectName() == "StatusError" and "never finished" in label.text()
+    assert "crashed" in label.toolTip()
 
-    # Only the Interrupted state lists the cause: an ordinary failed run (here the
-    # very message a cancelled run records) does not.
+    # Only the Interrupted state lists causes: an ordinary failed run (here the
+    # very message a run cancelled by closing the app records) does not.
     failed = make_job(tmp_path / "third")
     backup_utils.record_run(failed["id"], {"ok": False, "message": "Backup cancelled"})
     assert stored(failed)["last_result"].startswith("failed")
     label, _ = reopen(failed)
-    assert label.text() == "Failed" and "the app was closed" not in label.toolTip()
+    assert label.text() == "Failed" and "crashed" not in label.toolTip()
 
 
-def test_the_tooltip_and_the_readme_list_closing_the_app_as_a_cause():
+def test_the_tooltip_and_the_readme_do_not_list_closing_the_app_as_a_cause():
+    """Closing the app records the run (cancelled, or the finished result), so it
+    is not a cause of Interrupted; the README says what closing does instead."""
     from tabs.backup_tab import INTERRUPTED_DETAIL
-    assert "the app was closed" in INTERRUPTED_DETAIL
+    assert "closed" not in INTERRUPTED_DETAIL
     assert "unplugged" in INTERRUPTED_DETAIL and "crashed" in INTERRUPTED_DETAIL
     readme = " ".join((REPO / "README.md").read_text(encoding="utf-8").split())
-    paragraph = readme[readme.index("**An interrupted run is not resumed.**"):]
-    assert "the app is closed" in paragraph[:300]
-    assert "was closed, killed or crashed" in readme
+    paragraph = readme[readme.index("**An interrupted run is not resumed.**"):][:900]
+    assert "the app is closed" not in paragraph
+    assert "Closing the app while a backup runs cancels it" in paragraph
+    assert "was closed, killed or crashed" not in readme
+    assert "killed or crashed before it recorded a result" in readme
+
+
+# --- shutdown hands over only a backup run's result -------------------------------
+
+@pytest.mark.parametrize("record_on_close", [True, False])
+def test_shutdown_records_a_joined_backup_run_and_nothing_else(app_root, qt_app, record_on_close):
+    """In-process, no event loop: the worker's queued `finished` is never delivered,
+    exactly as after `app.exec()` returns. A backup run (`record_on_close=True`) has
+    its result handed to its handler by `shutdown`; a restore or a measurement
+    (False) is not, so closing never opens a restore's result dialog."""
+    import threading
+    from tabs import backup_tab
+    tab = backup_tab.BackupTab()
+    started, seen = threading.Event(), []
+
+    def work(_progress, should_abort, _phase):
+        """Runs until shutdown aborts it, like a copy in flight."""
+        started.set()
+        while not should_abort():
+            threading.Event().wait(0.01)
+        return {"ok": False, "message": "Backup cancelled"}
+
+    tab._start_backup("working", work, seen.append, record_on_close=record_on_close)
+    assert started.wait(10)
+    tab.shutdown()
+    assert tab.backup_thread is None and tab._backup_done is None
+    assert seen == ([{"ok": False, "message": "Backup cancelled"}] if record_on_close else [])
+    tab.shutdown()                                   # a second call finds nothing to do
+    assert len(seen) == (1 if record_on_close else 0)

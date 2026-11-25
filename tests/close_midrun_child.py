@@ -172,8 +172,9 @@ def check():
 rc = main.main()
 tab = holder["tab"]
 note(f"app_exec_returned({rc})")
-# After the loop ended: the worker thread is gone, and if `on_backup_finished` had
-# ever run for the run in flight it would have taken the handler (`_backup_done`).
+# After the loop ended: the worker thread is gone, and whoever handed the run's
+# result over (`on_backup_finished`, or `shutdown` for a run joined at close) took
+# the handler (`_backup_done`); it is still set only if nobody did.
 report["worker_thread_after"] = None if tab.backup_thread is None else "still set"
 report["finish_handler_never_ran"] = tab._backup_done is not None
 report["pid"] = os.getpid()
