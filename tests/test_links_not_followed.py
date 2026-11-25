@@ -24,6 +24,7 @@ EXTENDED = "\\\\?\\"
 
 REAL = ["real.txt", "docs/a.txt", "docs/b.txt"]
 SECRET = "secret-inside-the-link-target.txt"
+HIDDEN, SYSTEM = 0x2, 0x4          # the marks Windows puts on its own legacy junctions
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +64,14 @@ class Linker:
         import _winapi
         _winapi.CreateJunction(str(target), str(link))
         self._register(str(link), target, True)
+
+    def windows_junction(self, link, target):
+        """A junction marked hidden + system, the way Windows makes its own legacy
+        profile junctions (`My Documents`, `Application Data`...). The marks go on
+        the link itself; the target is not touched."""
+        import ctypes
+        self.junction(link, target)
+        assert ctypes.windll.kernel32.SetFileAttributesW(str(link), HIDDEN | SYSTEM), link
 
     def symlink(self, link, target, folder):
         """A symlink; skips the test when this account may not make one."""
@@ -711,9 +720,9 @@ def copy_stats(source, out):
 @windows_only
 def test_windows_own_legacy_junctions_in_a_profile_are_not_counted(tmp_path, linker):
     profile = make_profile(tmp_path)
-    linker.junction(profile / "Application Data", profile / "AppData" / "Roaming")
-    linker.junction(profile / "Documents" / "My Music", profile / "Music")
-    linker.junction(profile / "My Documents", profile / "Documents")
+    linker.windows_junction(profile / "Application Data", profile / "AppData" / "Roaming")
+    linker.windows_junction(profile / "Documents" / "My Music", profile / "Music")
+    linker.windows_junction(profile / "My Documents", profile / "Documents")
     stats = copy_stats(profile, tmp_path / "out")
 
     assert stats["links"] == 0 and stats["link_names"] == [] and stats["links_folders"] == 0
@@ -726,7 +735,7 @@ def test_windows_own_legacy_junctions_in_a_profile_are_not_counted(tmp_path, lin
 def test_a_real_shortcut_in_the_same_profile_is_counted(tmp_path, linker):
     profile = make_profile(tmp_path)
     make_elsewhere(tmp_path / "elsewhere")
-    linker.junction(profile / "Application Data", profile / "AppData" / "Roaming")   # legacy: hidden
+    linker.windows_junction(profile / "Application Data", profile / "AppData" / "Roaming")   # legacy: hidden
     linker.junction(profile / "Documents" / "Photos", tmp_path / "elsewhere")        # real: named
     stats = copy_stats(profile, tmp_path / "out")
 
@@ -734,10 +743,27 @@ def test_a_real_shortcut_in_the_same_profile_is_counted(tmp_path, linker):
 
 
 @windows_only
+def test_a_users_own_junction_with_a_legacy_name_inside_the_profile_is_counted(tmp_path, linker):
+    """Review gate: `Documents/Templates` made by the user (mklink /J, no hidden or
+    system mark) pointing at another folder of the SAME profile, outside the
+    source. Its contents are in no version, so it must be named; only the
+    junctions Windows itself made (hidden + system) are left out."""
+    profile = make_profile(tmp_path)
+    (profile / "Projects").mkdir()
+    (profile / "Projects" / "code.py").write_bytes(b"code" * 40)
+    linker.junction(profile / "Documents" / "Templates", profile / "Projects")
+    linker.windows_junction(profile / "Documents" / "My Music", profile / "Music")   # control
+    stats = copy_stats(profile / "Documents", tmp_path / "out")
+
+    assert stats["links"] == 1 and stats["link_names"] == ["Templates"]
+    assert not (tmp_path / "out" / "Templates").exists()
+
+
+@windows_only
 def test_a_legacy_name_pointing_outside_the_profile_is_somebodys_real_shortcut(tmp_path, linker):
     profile = make_profile(tmp_path)
     make_elsewhere(tmp_path / "elsewhere")
-    linker.junction(profile / "Templates", tmp_path / "elsewhere")
+    linker.windows_junction(profile / "Templates", tmp_path / "elsewhere")
     stats = copy_stats(profile, tmp_path / "out")
 
     assert stats["links"] == 1 and stats["link_names"] == ["Templates"]
@@ -747,7 +773,7 @@ def test_a_legacy_name_pointing_outside_the_profile_is_somebodys_real_shortcut(t
 def test_the_same_name_outside_any_profile_is_counted(tmp_path, linker, monkeypatch):
     source = make_source(tmp_path / "plain")
     make_elsewhere(tmp_path / "elsewhere")
-    linker.junction(source / "Application Data", tmp_path / "elsewhere")
+    linker.windows_junction(source / "Application Data", tmp_path / "elsewhere")
     # pytest's own temp folder sits inside the real profile of whoever runs this,
     # so say explicitly that this tree is not in one.
     monkeypatch.setattr(fs_utils, "profile_root", lambda path: None)
@@ -757,14 +783,14 @@ def test_the_same_name_outside_any_profile_is_counted(tmp_path, linker, monkeypa
     monkeypatch.undo()                                            # control: in a profile (the real one), same target inside it
     inside = make_source(tmp_path / "plain2")
     (inside / "Roaming").mkdir()
-    linker.junction(inside / "Application Data", inside / "Roaming")
+    linker.windows_junction(inside / "Application Data", inside / "Roaming")
     assert copy_stats(inside, tmp_path / "out2")["links"] == 0
 
 
 @windows_only
 def test_the_legacy_rule_never_lists_the_junction_it_decides_about(tmp_path, linker, monkeypatch):
     profile = make_profile(tmp_path)
-    linker.junction(profile / "Application Data", profile / "AppData" / "Roaming")
+    linker.windows_junction(profile / "Application Data", profile / "AppData" / "Roaming")
     real_scandir, listed = os.scandir, []
 
     def deny_link(path="."):
@@ -783,14 +809,27 @@ def test_the_legacy_rule_never_lists_the_junction_it_decides_about(tmp_path, lin
 class FakeEntry:
     """Just enough of a DirEntry for `is_legacy_profile_link`."""
 
-    def __init__(self, name="Application Data", symlink=False, folder=True):
+    def __init__(self, name="Application Data", symlink=False, folder=True,
+                 attributes=HIDDEN | SYSTEM):
         self.name, self._symlink, self._folder = name, symlink, folder
+        self._attributes = attributes
 
     def is_symlink(self):
         return self._symlink
 
     def is_dir(self, follow_symlinks=True):
         return self._folder
+
+    def stat(self, follow_symlinks=True):
+        """The link's own attributes (Windows marks its legacy junctions H + S)."""
+        return _Attrs(self._attributes)
+
+
+class _Attrs:
+    """Just `st_file_attributes`, as `DirEntry.stat(follow_symlinks=False)` gives."""
+
+    def __init__(self, attributes):
+        self.st_file_attributes = attributes
 
 
 @windows_only
@@ -800,6 +839,9 @@ class FakeEntry:
     (FakeEntry(symlink=True), False),                     # a symlink is somebody's own choice
     (FakeEntry(folder=False), False),                     # a file link is never one of these
     (FakeEntry(name="Photos"), False),                    # not in the legacy set
+    (FakeEntry(attributes=0), False),                     # not marked by Windows: somebody's own
+    (FakeEntry(attributes=HIDDEN), False),                # both marks, not one
+    (FakeEntry(attributes=SYSTEM), False),
 ])
 def test_the_legacy_rule_needs_a_junction_to_a_folder_with_a_legacy_name(tmp_path, entry, expected):
     profile = tmp_path / "Users" / "alice"

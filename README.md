@@ -203,7 +203,8 @@ Status tooltip lists up to five of them, a run's message says, for example, "2 s
 folders point somewhere else and were not followed: Archive, Photos. Add those locations as
 their own backup", and the headless run prints a `[WARN]` line to stderr (exit code
 unchanged). Windows' own profile junctions (`My Documents`, `Application Data` and the like,
-which point back into the same profile) are not counted.
+which Windows marks hidden and system and which point back into the same profile) are not
+counted; a junction you made yourself is counted even when it has one of those names.
 
 **Stored files are marked read-only.** Once a backup is finished its files and its checksum
 list are marked read-only (on macOS and Linux the write permission is dropped), so an accidental

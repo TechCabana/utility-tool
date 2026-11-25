@@ -274,6 +274,10 @@ LEGACY_PROFILE_LINKS = frozenset({
     "printhood", "recent", "sendto", "start menu", "templates", "my music",
     "my pictures", "my videos", "history", "temporary internet files",
 })
+# FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM: Windows sets both on each of the
+# junctions above (checked on a Windows 11 profile: all read 0x2416); a junction
+# a user makes with `mklink /J` has neither.
+_HIDDEN_SYSTEM = 0x2 | 0x4
 
 
 def profile_root(path: str):
@@ -297,11 +301,14 @@ def is_legacy_profile_link(entry: os.DirEntry, path: str) -> bool:
     """True for one of Windows' own compatibility junctions in a user profile,
     which the "shortcuts not followed" report must not ask the user to act on.
 
-    ALL of: Windows; a junction (not a symlink) to a folder; named in
-    `LEGACY_PROFILE_LINKS`; inside a user profile (`profile_root`); and its
-    target resolves inside that same profile. A junction with one of these
-    names that points anywhere else (another drive, another user) is somebody's
-    real shortcut and is still reported.
+    ALL of: Windows; a junction (not a symlink) to a folder; marked hidden AND
+    system on the link itself, as Windows marks every one of these and `mklink`
+    marks none; named in `LEGACY_PROFILE_LINKS`; inside a user profile
+    (`profile_root`); and its target resolves inside that same profile. A
+    junction with one of these names that the user made (no marks: a
+    `Documents\\Templates` pointing at another folder of the same profile, whose
+    contents are then in no version) or that points anywhere else (another
+    drive, another user) is somebody's real shortcut and is still reported.
 
     Not decided by listing the junction: these are access-denied by design, and
     listing would FOLLOW the link, which the copy deliberately never does. The
@@ -315,7 +322,10 @@ def is_legacy_profile_link(entry: os.DirEntry, path: str) -> bool:
     try:
         if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
             return False
+        marks = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
     except OSError:
+        return False
+    if marks & _HIDDEN_SYSTEM != _HIDDEN_SYSTEM:
         return False
     profile = profile_root(os.path.dirname(path))
     if profile is None:
