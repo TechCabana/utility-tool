@@ -325,7 +325,12 @@ flowchart LR
 4. A run first checks it can succeed (pre-flight: source present and non-empty, target not
    inside the source, enough free space, the same target drive as before), then copies the
    source into `<target>/<job id>/<timestamp>.partial/`, hashing every file into a
-   `<timestamp>.manifest.jsonl` beside it. By default every copied file is re-read and checked
+   `<timestamp>.manifest.jsonl` beside it (one line per file with its path, size, modified time
+   and SHA-256, plus `"changed": true` for a file still changing on its second copy and
+   `"ro": true` when the source file was read-only; the last line records the file and byte
+   counts, the check mode and result, `finished_utc`, the UTC time versions are ordered by, and
+   `"protected": true`, meaning the version's files were marked read-only and restore takes each
+   file's read-only state from `ro`). By default every copied file is re-read and checked
    against the manifest before the folder is renamed to `<timestamp>/`; a mismatch fails the
    run and prunes nothing. Each job can instead use a quick check (every file's size, plus the
    hashes of a sample of at most 500 files) or no check at all; a version made with the check
@@ -403,6 +408,8 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
     "last_skipped_sample": [],
     "last_changed": 0,
     "last_changed_sample": [],
+    "last_links": 0,
+    "last_links_sample": [],
     "last_pruning_held": false,
     "last_baseline_files": 0,
     "last_files": 1204
@@ -422,6 +429,7 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `running` | object | Present only while a run is under way, or after one died: `{since, pid, start_time, stamp, token}`, written just before copying and removed when the run records its outcome. A marker whose process is gone is shown as "Interrupted" and recorded as `interrupted` in `last_result` and the run log. Do not edit it by hand |
 | `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
 | `last_changed`, `last_changed_sample` | int, list | Files the last run kept although they were still changing while they were copied (marked `"changed": true` in the checksum list), and up to five of their paths from the source root; 0 and empty after a clean or a failed run |
+| `last_links`, `last_links_sample` | int, list | Shortcuts (symbolic links and junctions) the last run did not follow, so what they point to is not in its version, and up to five of their paths from the source root (never the place they point to); 0 and empty after a run with none, or a failed run |
 | `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed run leaves all three unchanged |
 | `last_finished_utc` | string | When the last successful run finished, in UTC (`2026-10-25T01:45:12Z`), the same value as the end of its checksum list; absent until a job has a successful run made by a version that records it, and a failed run leaves it unchanged |
 | `last_precheck` | object | The last pre-check's summary: `{time, ok, aborted, fs, scanned, problems, blocking, counts, sample}` (counts by kind, up to five paths from the source root). Absent until a job is first checked |
@@ -480,11 +488,14 @@ utility-tool/
     ├── test_activity.py
     ├── test_changed_during_copy.py
     ├── test_clock_change.py
+    ├── test_close_midrun.py
+    ├── close_midrun_child.py   not a test: the real app, closed mid-run, as a child process of test_close_midrun.py
     ├── test_edit_keeps_run_state.py
     ├── test_empty_job_list.py
     ├── test_fs_utils.py
     ├── test_interrupted_run.py
     ├── test_jobs_file.py
+    ├── test_links_not_followed.py
     ├── test_lock_start_time.py
     ├── test_locks.py
     ├── test_long_paths.py
