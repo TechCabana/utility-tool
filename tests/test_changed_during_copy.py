@@ -233,7 +233,7 @@ def test_a_file_that_changes_on_the_retry_too_is_named_as_changed_during_the_bac
     assert entry["sha256"] == sha_of(stored_bytes(job, result, VICTIM))   # the bytes that were read
     assert [e for e in manifest_files(result).values() if "changed" in e] == [entry]
     # Not a plain ok anywhere it is stored: the job carries the flag and its names ...
-    assert stored["last_result"] == "ok"                      # readers of last_result keep working
+    assert stored["last_result"] == "ok_changed"              # the real outcome word (card C5HuzNVK)
     assert stored["last_changed"] == 1 and stored["last_changed_sample"] == [VICTIM]
     # ... and the run log says ok_changed, with counts and no path.
     line = run_log(job)[-1]
@@ -448,7 +448,7 @@ def test_skipped_and_changed_in_one_run_are_both_stored_logged_and_said(job, mon
     assert result["ok"] and result["not_copied"] == 1 and result["changed"] == 1
     assert "could not be read and were skipped" in result["message"]
     assert "changed during backup" in result["message"]
-    assert stored["last_result"] == "ok"
+    assert stored["last_result"] == "ok_skipped"              # skipped outranks changed (card C5HuzNVK)
     assert stored["last_skipped"] == 1 and stored["last_changed"] == 1
     assert stored["last_skipped_sample"] == ["a01.txt"] and stored["last_changed_sample"] == [VICTIM]
     line = run_log(job)[-1]

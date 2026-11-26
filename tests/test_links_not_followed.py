@@ -183,7 +183,7 @@ def test_a_junction_is_named_as_not_followed_and_its_contents_stay_out_of_the_ve
         backup_utils.version_path(job, result["version"]), "Photos"))
     # A link is not a file: the file count the sanity rules use is unchanged.
     assert result["files"] == len(REAL) and result["errors"] == [] and result["not_copied"] == 0
-    assert stored["last_result"] == "ok"
+    assert stored["last_result"] == "ok_links"                    # the real outcome word (card C5HuzNVK)
     assert stored["last_links"] == 1 and stored["last_links_sample"] == ["Photos"]
 
 
@@ -674,7 +674,7 @@ def test_skipped_changed_and_shortcuts_in_one_run_are_all_stored_logged_and_said
 
     assert result["ok"] and result["not_copied"] == 1 and result["changed"] == 1
     assert result["links_skipped"] == 1                          # once, though the retry pass ran
-    assert stored["last_result"] == "ok"
+    assert stored["last_result"] == "ok_skipped"                 # the highest-ranked word (card C5HuzNVK)
     assert (stored["last_skipped"], stored["last_changed"], stored["last_links"]) == (1, 1, 1)
     line = run_log(job)[-1]
     assert (line["outcome"], line["skipped"], line["changed"], line["links"]) == ("ok_skipped", 1, 1, 1)

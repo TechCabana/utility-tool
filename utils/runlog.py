@@ -122,25 +122,11 @@ def _text(value) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
 
-def _outcome(result: Dict, skipped: int, changed: int = 0, links: int = 0) -> str:
-    """Map a `run_job` result onto one of `OUTCOMES`."""
-    if result.get("busy"):
-        return "busy"
-    if result.get("interrupted") is True:
-        return "interrupted"
-    if result.get("hold_released") is True:
-        return "hold_released"
-    if result.get("ok"):
-        if result.get("pruning_held") is True:
-            return "ok_pruning_held"
-        if skipped:
-            return "ok_skipped"
-        if changed:
-            return "ok_changed"
-        return "ok_links" if links else "ok"
-    if str(result.get("message", "")).startswith("Backup cancelled"):
-        return "cancelled"
-    return "failed"
+def _outcome(result: Dict) -> str:
+    """Map a `run_job` result onto one of `OUTCOMES`. The ranking lives in
+    `jobs_store.outcome_word`, shared with the word `record_run` stores in
+    `last_result`, so the two can never disagree."""
+    return jobs_store.outcome_word(result)
 
 
 def build_line(job: Optional[Dict], result: Dict, trigger: str,
@@ -148,17 +134,13 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
     """The log line for one run, from an explicit whitelist of result fields."""
     job = job if isinstance(job, dict) else {}
     errors = result.get("errors") or []
-    # Same count record_run stores as `last_skipped` (card 50): a failed run
+    # The same counts record_run stores (card 50 and after): a failed run
     # skipped nothing, it did not finish.
-    skipped = (max(len(errors), _count(result.get("not_copied")))
-               if result.get("ok") else 0)
+    skipped, changed, links = jobs_store.run_counts(result)
     # The part before the first ": " is the path; the OS error text after it is
     # left out, as in `last_skipped_sample`.
     paths = [str(error).split(": ", 1)[0]
              for error in errors[:SKIPPED_PATHS_MAX]] if skipped else []
-    # Same rule as `last_changed`: only a finished run kept anything.
-    changed = _count(result.get("changed")) if result.get("ok") else 0
-    links = _count(result.get("links_skipped")) if result.get("ok") else 0
     # The names of unfollowed links stay out of the log (counts only): the run's
     # message carries them in one sentence, so that sentence is cut from the copy
     # that is logged.
@@ -177,7 +159,7 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
         "trigger": trigger,
         "job": _text(job.get("id")),
         "name": _text(job.get("name")),
-        "outcome": _outcome(result, skipped, changed, links),
+        "outcome": _outcome(result),
         "files": _count(result.get("files")),
         "bytes": _count(result.get("bytes")),
         "skipped": skipped,

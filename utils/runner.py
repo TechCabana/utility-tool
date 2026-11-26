@@ -456,6 +456,16 @@ def _release_locked(job_id: str) -> Dict:
                 "since": newest, "time": datetime.now().isoformat(timespec="seconds")}
         job["last_pruning_held"] = False
         job["last_baseline_files"] = 0
+        if jobs_store.job_result(job) == "ok_pruning_held":
+            # The stored word named the very hold just let go; leave it standing
+            # and a reader of the jobs file would still be told "held" while the
+            # flags say otherwise. Re-rank what the siblings still carry with the
+            # one ranking function the run used (a hold is the only thing that
+            # outranks them, and it is gone).
+            job["last_result"] = jobs_store.ok_word({
+                "ok": True, "not_copied": jobs_store.job_skipped(job),
+                "changed": jobs_store.job_changed(job),
+                "links_skipped": jobs_store.job_links(job)})
         jobs_store._save_job(job)
     return {"ok": True, "released": True,
             "message": _released_message(baseline, job.get("retention")),

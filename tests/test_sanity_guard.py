@@ -280,7 +280,7 @@ def test_a_held_run_stores_the_fields_and_a_normal_run_clears_them(make_job):
     set_files(source, 6)
     _, stored = run(job)
 
-    assert stored["last_result"] == "ok"                  # existing readers keep working
+    assert stored["last_result"] == "ok_pruning_held"     # the real word; startswith("ok") readers still succeed
     assert stored["last_pruning_held"] is True
     assert stored["last_baseline_files"] == 10 and stored["last_files"] == 6
     assert backup_utils.job_pruning_held(stored) is True

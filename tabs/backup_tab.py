@@ -682,7 +682,7 @@ class JobRow(QtWidgets.QWidget):
 
     def _status(self, job: dict):
         """The Status column: what the last run did, or that none has run."""
-        result = job.get("last_result", "")
+        result = backup_utils.job_result(job)
         # Card PQPfznG1: a run that began and never finished is a failure, said
         # with its start time. Checked before "Never run" because a FIRST run
         # that died has a start marker and no last_run. `job_interrupted` is
@@ -695,9 +695,12 @@ class JobRow(QtWidgets.QWidget):
                     "StatusError")
         if not job.get("last_run"):
             return "Never run", "Hint"
-        if result.startswith("ok"):
+        if backup_utils.result_is_ok(result):
             # Silence is never success: a run that left files behind is not
-            # plain OK, however green that would look.
+            # plain OK, however green that would look. The counts come from the
+            # sibling fields, never from the stored word (`ok_skipped` ...): the
+            # word is the headline, the siblings are the detail, and a job saved
+            # by an older build (plain `ok` beside a count) reads the same.
             skipped = backup_utils.job_skipped(job)
             changed = backup_utils.job_changed(job)
             links = backup_utils.job_links(job)
@@ -721,10 +724,10 @@ class JobRow(QtWidgets.QWidget):
         the line saying older backups are still kept aside ("" if not). An
         interrupted run says why that happens and that nothing is wrong now."""
         if (backup_utils.job_interrupted(job)
-                or job.get("last_result", "").startswith(backup_utils.INTERRUPTED_PREFIX)):
+                or backup_utils.job_result(job).startswith(backup_utils.INTERRUPTED_PREFIX)):
             return INTERRUPTED_DETAIL + (
                 "\n\n" + HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else "")
-        if not job.get("last_result", "").startswith("ok"):
+        if not backup_utils.result_is_ok(job.get("last_result")):
             # Failure stays the status; a hold an earlier run set survives it.
             return HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else ""
         parts = []

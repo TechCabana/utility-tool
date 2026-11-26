@@ -59,7 +59,7 @@ def test_a_run_with_one_unreadable_file_is_ok_and_records_one_skipped(job, monke
     result, stored = run_and_record(job)
 
     assert result["ok"]
-    assert stored["last_result"] == "ok"            # existing readers keep working
+    assert stored["last_result"] == "ok_skipped"    # the real word; startswith("ok") readers still succeed
     assert stored["last_skipped"] == 1
     assert stored["last_skipped_sample"] == ["file3.txt"]
     assert backup_utils.job_skipped(stored) == 1
