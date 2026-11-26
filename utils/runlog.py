@@ -42,8 +42,9 @@ the count the source had and `trigger` "manual" (the Backup screen) or "cli".
 
 A test restore (card 0Bv7mvB3, `utils/restore_test.py`) is logged as ONE line of
 its own, never inside a backup run's line, carrying `LINE_KEYS` plus
-`RESTORE_LINE_KEYS` (a backup run's line is byte-for-byte what it was before this
-card): `outcome` `restore_test_passed`,
+`RESTORE_LINE_KEYS` (a backup run's line keeps exactly the keys it had before
+this card; only its `message` gains the test's one sentence when the test passed
+or found a problem): `outcome` `restore_test_passed`,
 `restore_test_failed` or `restore_test_skipped` (it could not be tested: no
 manifest, damaged manifest, not verified), `trigger` "auto" (the one after a
 job's first successful backup) or "manual" (on demand), `version` the version

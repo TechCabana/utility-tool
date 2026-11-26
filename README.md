@@ -268,7 +268,7 @@ about 5% of the files (at least 5, at most 50) plus the largest file; the automa
 out any file over 1 GiB and stops at 2 GiB in total, so a first backup is not doubled in time,
 and a test you start yourself always includes the largest. The result is stored on the job
 (`last_restore_test`) and logged as its own line; if it finds a problem the backup still reads
-OK, its message gains one sentence naming the files, and a headless run prints a `[WARN]` line
+OK, its message gains one sentence naming the files (shown as a warning on the Backup screen), and a headless run prints a `[WARN]` line
 to stderr. Run one yourself with `main.py --test-restore <id>`, which tests the newest verified
 version and exits 0 passed, 5 a sampled file did not match, 6 cannot be tested (no verified
 backup, no checksum list or a damaged one; never reported as a pass), 2 no such job, 3 jobs
@@ -506,8 +506,8 @@ utility-tool/
 │   ├── locks.py            cross-process lock files: one run per job, one writer of the jobs file
 │   └── migrate.py          one-time copy of data, tasks and settings from the UtilityTool name
 └── tests/                 pytest suite over utils/ and styles/ (Qt-free layer only, see Testing)
-    ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder; clears read-only marks under the temp folder when the session ends
-    ├── helpers.py          clears or reads the read-only mark on files inside finished versions
+    ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder (APPDATA on Windows, HOME and XDG_CONFIG_HOME elsewhere, asserted at session start); switches the automatic test restore off except in test_restore_test.py; clears read-only marks under the temp folder when the session ends
+    ├── helpers.py          clears or reads the read-only mark on files inside finished versions; the app-data folder a headless child process uses
     ├── test_backup_utils.py
     ├── test_activity.py
     ├── test_cancelled_outcome.py
@@ -539,6 +539,7 @@ utility-tool/
     ├── test_sanity_guard.py
     ├── test_skipped_status.py
     ├── test_source_vanishes.py
+    ├── test_stored_outcome_word.py
     ├── test_sweep.py
     ├── test_target_failures.py
     ├── test_tokens.py
@@ -568,8 +569,8 @@ pytest tests/
 
 Covers mainly the Qt-free layer (`utils/backup_utils.py` and the modules it re-exports, `utils/precheck.py`, `utils/restore_test.py`, `utils/runlog.py`, `utils/locks.py`, `utils/activity.py`,
 `utils/fs_utils.py`, `utils/migrate.py` and the design tokens in `styles/tokens.py`), using real `tmp_path` files;
-the scheduler, free space and volume identity are injected rather than touched. Over 700 tests,
-all passing; the run takes about four minutes, since several tests wait a second for a distinct version stamp and some start real processes. A few tests drive parts of the Backup screen offscreen (its pre-check, release and interrupted-run paths), but most of the Qt-driven `tabs/` layer (including the Backup screen's
+the scheduler, free space and volume identity are injected rather than touched. Every test
+passes; a full run takes several minutes (about six on a Windows desktop), since several tests wait a second for a distinct version stamp and some start real processes. A few tests drive parts of the Backup screen offscreen (its pre-check, release and interrupted-run paths), but most of the Qt-driven `tabs/` layer (including the Backup screen's
 worker thread and UI) has no automated coverage and stays manually
 verified, per the [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps
 above.
