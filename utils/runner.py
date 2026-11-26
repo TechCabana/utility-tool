@@ -807,7 +807,7 @@ def _backup(job: Dict,
             _discard(partial, manifest_tmp)
             return _cancelled_result()
         except OSError as exc:
-            problem =f"its manifest could not be read back ({plain_error(exc)})"
+            problem = f"its manifest could not be read back ({plain_error(exc)})"
         else:
             if bad:
                 more = ", ..." if bad > len(named) else ""
