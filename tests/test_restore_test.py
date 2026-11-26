@@ -976,6 +976,59 @@ def test_the_backup_screen_shows_a_failed_test_restore_as_a_warning_not_plain_ok
     assert tab.backup_status.objectName() == "Hint"
 
 
+@windows_only
+def test_a_cancelled_then_completed_first_backup_with_notes_keeps_its_word_and_the_test_follows(
+        tmp_path, tbase, monkeypatch):
+    """Review gate, cards 59 x 111 x 112 x 54 x 57 x 58 x 60 in one job. A first
+    backup is stopped (no test), then completed with a skipped file, a junction
+    and a read-only source file: the stored word is the run's own (`ok_skipped`,
+    not anything the test says), the run's log line comes before the test's, the
+    test passes on what WAS backed up, and two restores land in two folders."""
+    import _winapi
+    import stat as stat_mod
+    from tabs.backup_tab import JobRow
+    from test_skipped_status import lock_files
+    job = auto_job(tmp_path, files={"a.txt": b"alpha", "locked.txt": b"never read",
+                                    "ro.txt": b"read only", "nested/b.txt": b"bravo"})
+    os.chmod(Path(job["source"]) / "ro.txt", stat_mod.S_IREAD)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep-out.txt").write_bytes(b"not in the version")
+    link = Path(job["source"]) / "Photos"
+    _winapi.CreateJunction(str(elsewhere), str(link))
+    try:
+        stopped = backup_utils.run_job(job, should_abort=lambda: True)
+        assert backup_utils.record_run(job["id"], stopped)["last_result"] == "cancelled"
+        assert "last_restore_test" not in backup_utils.get_job(job["id"]) and tbase.made == []
+
+        lock_files(monkeypatch, {"locked.txt"})
+        done = backup_utils.run_job(job)
+    finally:
+        os.rmdir(link)                                       # the link itself, never its target
+    assert (elsewhere / "keep-out.txt").read_bytes() == b"not in the version"
+
+    assert done["ok"] and done["not_copied"] == 1 and done["links_skipped"] == 1
+    assert done["restore_test"]["status"] == "passed"
+    stored_job = backup_utils.record_run(job["id"], done)
+    assert stored_job["last_result"] == "ok_skipped"
+    assert stored_job["last_restore_test"]["status"] == "passed"
+    assert JobRow._status(None, stored_job) == ("OK, 1 skipped, 1 shortcut not followed", "StatusWarn")
+    outcomes = [line["outcome"] for line in reversed(runlog.read_runs(job["id"]))]
+    assert outcomes == ["cancelled", "ok_skipped", "restore_test_passed"]
+    assert_clean(tbase)
+
+    out = tmp_path / "out"
+    first = backup_utils.restore_version(job, done["version"], str(out))
+    second = backup_utils.restore_version(job, done["version"], str(out))
+    assert first["verified"] and second["verified"] and second["path"] == first["path"] + "-2"
+    for result in (first, second):
+        root = Path(result["path"])
+        assert sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()) == [
+            "a.txt", "nested/b.txt", "ro.txt"]
+        assert is_read_only(str(root / "ro.txt")) and not is_read_only(str(root / "a.txt"))
+        clear_ro_tree(str(root))
+
+
 def test_a_stored_cannot_test_is_retried_after_the_next_backup(tmp_path, tbase):
     job = auto_job(tmp_path)
     backup_utils.record_restore_test(job["id"], {"status": "cannot_test", "reason": "no manifest"})
