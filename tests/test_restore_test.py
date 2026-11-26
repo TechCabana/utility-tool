@@ -943,6 +943,39 @@ def test_a_failed_test_is_reported_but_the_backup_stays_ok_and_is_retried_until_
             if l["outcome"].startswith("restore_test")] == ["restore_test_failed", "restore_test_passed"]
 
 
+def test_the_backup_screen_shows_a_failed_test_restore_as_a_warning_not_plain_ok(
+        tmp_path, tbase, monkeypatch):
+    """Review gate: the result line after a run whose automatic test restore FOUND A
+    PROBLEM was shown in the calm `Hint` style, the same as a clean backup. The
+    real engine result goes through the real tab's `_finish_run`."""
+    pytest.importorskip("PySide6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6 import QtWidgets
+    from tabs import backup_tab
+    from utils import scheduler
+    monkeypatch.setattr(scheduler, "_run", lambda args: (True, ""))
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    job = auto_job(tmp_path)
+    healthy_copy = copying._hash_copy
+    hits = write_side_fault(monkeypatch, name="b.txt")
+    bad = backup_utils.run_job(job)
+    assert hits and bad["ok"] is True and bad["restore_test"]["status"] == "failed"
+
+    tab = backup_tab.BackupTab()
+    tab._finish_run(job, bad)
+    assert "Test restore FOUND A PROBLEM" in tab.backup_status.text()
+    assert tab.backup_status.objectName() == "StatusWarn"
+    assert tab._backup_notice_warn is True               # and after the remeasure too
+
+    # Control: the same tab, a clean run whose test passed, is the calm style.
+    monkeypatch.setattr(copying, "_hash_copy", healthy_copy)
+    clean = auto_job(tmp_path / "clean")
+    good = backup_utils.run_job(clean)
+    assert good["restore_test"]["status"] == "passed"
+    tab._finish_run(clean, good)
+    assert tab.backup_status.objectName() == "Hint"
+
+
 def test_a_stored_cannot_test_is_retried_after_the_next_backup(tmp_path, tbase):
     job = auto_job(tmp_path)
     backup_utils.record_restore_test(job["id"], {"status": "cannot_test", "reason": "no manifest"})

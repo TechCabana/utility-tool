@@ -1840,12 +1840,18 @@ class BackupTab(QtWidgets.QWidget):
             # either, since a stopped run changed nothing on the target.
             self._say(f"{message.rstrip('.')}. Your earlier backups were not changed.")
             return
-        # A run that left files behind reads as a warning, not as plain news.
+        # A run that left files behind reads as a warning, not as plain news. So
+        # does a good backup whose automatic test restore found a sampled file
+        # that did not come back intact (card 0Bv7mvB3): the message says so, and
+        # it must not be shown in the calm success style.
+        test = result.get("restore_test")
         warn = bool(result.get("ok") and (result.get("errors")
                                           or result.get("not_copied")
                                           or result.get("changed")
                                           or result.get("links_skipped")
-                                          or result.get("pruning_held")))
+                                          or result.get("pruning_held")
+                                          or (isinstance(test, dict)
+                                              and test.get("status") == "failed")))
         self._say(message, ok=result.get("ok", False), warn=warn)
         if result.get("ok"):
             self._backup_notice = message
