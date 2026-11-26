@@ -238,6 +238,36 @@ def test_closing_just_after_the_copy_is_promoted_records_the_good_backup(
     assert [line["outcome"] for line in runlog.read_runs(job["id"])] == ["ok"]
 
 
+def test_closing_during_the_automatic_test_restore_records_the_good_backup_not_cancelled(
+        app_root, tmp_path, qt_app, monkeypatch):
+    """Review gate, cards 0Bv7mvB3 x bricnEaC. A first good backup is followed by an
+    automatic test restore. Closing the app during that test stops the TEST, never
+    the backup: the run is recorded as the good backup it was (not Cancelled), no
+    test result is stored or logged, and the test's temporary folder is gone."""
+    child_temp = tmp_path / "child-temp"
+    child_temp.mkdir()
+    for name in ("TEMP", "TMP", "TMPDIR"):              # the child's tempfile root
+        monkeypatch.setenv(name, str(child_temp))
+    job = make_job(tmp_path)
+    assert "last_restore_test" not in stored(job)          # so the test is due
+    report = run_app(app_root, tmp_path, job, "window", "restore_test")
+
+    assert events(report, "phase_started")                 # the close landed inside the test
+    returned = events(report, "run_job_returned(")
+    assert len(returned) == 1 and returned[0].startswith("run_job_returned(ok=True")
+    assert "Test restore" not in returned[0]
+    assert events(report, "record_run(ok=True)")
+    versions, leftovers = version_folders(job)
+    assert len(versions) == 1 and leftovers == []
+    after = stored(job)
+    assert "running" not in after and after["last_result"] == "ok"
+    assert "last_restore_test" not in after                # a cancelled test is not stored
+    assert [line["outcome"] for line in runlog.read_runs(job["id"])] == ["ok"]
+    assert list(child_temp.iterdir()) == []                # the test's folder was removed
+    label, _ = reopen(job)
+    assert (label.objectName(), label.text()) == ("StatusOk", "OK")
+
+
 # --- positive controls for the instrument ----------------------------------------
 
 def dead_pid():
