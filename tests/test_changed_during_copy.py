@@ -474,7 +474,11 @@ def test_the_stored_sample_is_capped_at_five_relative_paths(tmp_path, monkeypatc
     for name in stored["last_changed_sample"]:
         assert not os.path.isabs(name) and ":" not in name and "\\" not in name
         assert name in TOP or name.startswith("sub/")
-    assert str(tmp_path) not in open(jobs_store.JOBS_FILE, encoding="utf-8").read()
+    # The sample field holds names only. (Not the whole jobs file: it also stores the
+    # job's own source and target, which sit under tmp_path -- and on Windows the file
+    # escapes every backslash, so a raw `str(tmp_path) in file text` never matched.)
+    assert not any(str(tmp_path) in name
+                   for name in stored["last_changed_sample"] + result["changed_sample"])
 
 
 def test_a_failed_run_stores_no_changed_files(job, monkeypatch):

@@ -10,11 +10,13 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime as real_datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from helpers import app_data_dir
 from utils import backup_utils, copying, jobs_store, locks, runlog, runner
 from utils.fs_utils import plain_path
 
@@ -399,16 +401,21 @@ def test_the_log_lock_is_released_and_the_logs_folder_holds_only_logs(make_job, 
     assert leftovers == []
 
 
-@pytest.mark.skipif(os.name != "nt", reason="app_dir() follows %APPDATA% on Windows only")
 def test_the_unpatched_app_data_folder_is_not_the_real_one():
-    """Review gate: tests/conftest.py points %APPDATA% at a throwaway folder for
-    the whole session, so a test that forgets a redirect cannot write the real
-    jobs file, locks or logs. `app_dir()` is what all three are built from
-    (`app_dir_for` is the same path without creating it)."""
+    """Review gate: tests/conftest.py points %APPDATA% (Windows) or HOME (macOS,
+    Linux) at a throwaway folder for the whole session, so a test that forgets a
+    redirect cannot write the real jobs file, locks or logs. `app_dir()` is what
+    all three are built from (`app_dir_for` is the same path without creating it)."""
     from utils import fs_utils
-    real_roaming = os.path.normcase(os.path.expanduser("~\\AppData\\Roaming"))
     here = os.path.normcase(fs_utils.app_dir_for(fs_utils.APP_NAME))
-    assert not here.startswith(real_roaming), here
+    if os.name == "nt":
+        real_roaming = os.path.normcase(os.path.expanduser("~\\AppData\\Roaming"))
+        assert not here.startswith(real_roaming), here
+    else:
+        # HOME is the throwaway folder here, so the real home cannot be named;
+        # what can be said is that the folder sits where conftest.py made it.
+        scratch = os.path.normcase(os.path.realpath(tempfile.gettempdir()))
+        assert os.path.realpath(here).startswith(scratch) and "safekeep-tests-" in here, here
 
 
 def test_a_job_id_cannot_point_the_log_outside_its_folder():
@@ -446,15 +453,15 @@ def run_cli(appdata, *args):
 
 
 def app_log(appdata):
-    """The parsed lines of `<appdata>/Safekeep/logs/app.jsonl`."""
-    path = Path(appdata) / "Safekeep" / "logs" / "app.jsonl"
+    """The parsed lines of `<app data folder>/logs/app.jsonl`."""
+    path = app_data_dir(appdata) / "logs" / "app.jsonl"
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def test_headless_unknown_job_logs_to_the_app_log_and_still_exits_2(tmp_path):
     appdata = tmp_path / "appdata"
-    (appdata / "Safekeep").mkdir(parents=True)
-    (appdata / "Safekeep" / "backup_jobs.json").write_text("[]", encoding="utf-8")
+    app_data_dir(appdata).mkdir(parents=True)
+    (app_data_dir(appdata) / "backup_jobs.json").write_text("[]", encoding="utf-8")
 
     proc = run_cli(appdata, "--run-backup-job", "does-not-exist")
 
@@ -469,8 +476,8 @@ def test_headless_unknown_job_logs_to_the_app_log_and_still_exits_2(tmp_path):
 
 def test_headless_damaged_jobs_file_logs_to_the_app_log_and_still_exits_3(tmp_path):
     appdata = tmp_path / "appdata"
-    (appdata / "Safekeep").mkdir(parents=True)
-    jobs = appdata / "Safekeep" / "backup_jobs.json"
+    app_data_dir(appdata).mkdir(parents=True)
+    jobs = app_data_dir(appdata) / "backup_jobs.json"
     jobs.write_text('[{"id": "abc"', encoding="utf-8")
     before = jobs.read_bytes()
 
@@ -488,14 +495,14 @@ def test_headless_damaged_jobs_file_logs_to_the_app_log_and_still_exits_3(tmp_pa
 def test_a_headless_real_run_logs_trigger_scheduled(tmp_path, make_job):
     job, _ = make_job()
     appdata = tmp_path / "appdata"
-    (appdata / "Safekeep").mkdir(parents=True)
-    (appdata / "Safekeep" / "backup_jobs.json").write_text(
+    app_data_dir(appdata).mkdir(parents=True)
+    (app_data_dir(appdata) / "backup_jobs.json").write_text(
         json.dumps([job]), encoding="utf-8")
 
     proc = run_cli(appdata, "--run-backup-job", job["id"])
 
     assert proc.returncode == 0, proc.stderr
-    path = appdata / "Safekeep" / "logs" / (job["id"] + ".jsonl")
+    path = app_data_dir(appdata) / "logs" / (job["id"] + ".jsonl")
     lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     # A saved job's first successful backup is followed by its test restore (card
     # 0Bv7mvB3), which logs a line of its own after the run's; this test is
@@ -503,4 +510,4 @@ def test_a_headless_real_run_logs_trigger_scheduled(tmp_path, make_job):
     (entry,) = [line for line in lines if not line["outcome"].startswith("restore_test")]
     assert entry["trigger"] == "scheduled" and entry["outcome"] == "ok"
     assert entry["job"] == job["id"] and entry["files"] == 11
-    assert not (appdata / "Safekeep" / "logs" / "app.jsonl").exists()
+    assert not (app_data_dir(appdata) / "logs" / "app.jsonl").exists()

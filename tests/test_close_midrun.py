@@ -31,19 +31,22 @@ from pathlib import Path
 
 import pytest
 
+from helpers import app_data_dir
 from utils import backup_utils, jobs_store, locks, runlog, runner
 from utils.fs_utils import short_when
 
 REPO = Path(__file__).resolve().parent.parent
 CHILD = REPO / "tests" / "close_midrun_child.py"
 SINCE = "2026-11-14T02:00:00"
+# A normal child run takes a few seconds; a hung one must fail fast, not after minutes.
+CHILD_TIMEOUT = 60
 
 
 @pytest.fixture
 def app_root(tmp_path, monkeypatch):
     """A fresh app-data root shared with the child process (its APPDATA)."""
     root = tmp_path / "appdata"
-    data = root / "Safekeep"
+    data = app_data_dir(root)
     (data / "locks").mkdir(parents=True)
     monkeypatch.setattr(jobs_store, "JOBS_FILE", str(data / "backup_jobs.json"))
     monkeypatch.setattr(jobs_store, "_locks_dir", lambda: str(data / "locks"))
@@ -99,12 +102,13 @@ def run_app(app_root, tmp_path, job, close, phase):
     proc = subprocess.Popen([sys.executable, str(CHILD), json.dumps(spec)], env=env,
                             cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
-        output, _ = proc.communicate(timeout=120)
+        output, _ = proc.communicate(timeout=CHILD_TIMEOUT)
     except subprocess.TimeoutExpired:
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True) \
             if os.name == "nt" else os.kill(proc.pid, 9)
-        proc.communicate()
-        pytest.fail("the app child did not exit by itself")
+        output, _ = proc.communicate()
+        pytest.fail(f"the app child did not exit by itself in {CHILD_TIMEOUT} s; its output:\n"
+                    + output.decode("utf-8", "replace")[-3000:])
     assert proc.returncode == 0, output.decode("utf-8", "replace")[-2000:]
     report = json.loads(report_file.read_text(encoding="utf-8"))
     assert not locks.pid_alive(report["pid"])          # a real process exit, not a flag

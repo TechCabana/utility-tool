@@ -96,7 +96,11 @@ class Linker:
         """Remove every link itself; return the targets that changed."""
         for link, is_dir in reversed(self.made):
             try:
-                (os.rmdir if is_dir else os.unlink)(link)
+                # A Windows folder link (junction or folder symlink) goes with rmdir; a
+                # POSIX symlink -- to a folder too -- is a file entry that only unlink
+                # removes (rmdir raises NotADirectoryError and left the link behind).
+                # Both act on the link itself, never on what it points at.
+                (os.rmdir if is_dir and os.name == "nt" else os.unlink)(link)
             except OSError:
                 pass
         return [t for t, before in self.guard.items() if _snapshot(t) != before]

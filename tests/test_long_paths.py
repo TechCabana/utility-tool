@@ -39,8 +39,11 @@ def isolated_jobs_file(tmp_path, monkeypatch):
 
 
 def _x(path) -> str:
-    """`path` in extended-length form, built independently of utils."""
-    return "\\\\?\\" + os.path.abspath(str(path))
+    """`path` in extended-length form, built independently of utils. The `\\\\?\\`
+    prefix is a Windows-only form: anywhere else it would name a relative folder
+    called `\\\\?\\`, so there the absolute path is returned unchanged."""
+    full = os.path.abspath(str(path))
+    return "\\\\?\\" + full if os.name == "nt" else full
 
 
 def _write(path, data: bytes) -> None:

@@ -5,9 +5,29 @@
 # are written without calling utils, so they mean the same thing whatever the
 # code under test does.
 import os
+import pathlib
 import stat
+import sys
 
 _EXT = "\\\\?\\"
+
+
+def app_data_dir(root) -> pathlib.Path:
+    """The Safekeep app-data folder a child process will use when it is launched
+    with `APPDATA=<root>` and `HOME=<root>` (every headless-subprocess test does).
+
+    Mirrors `utils.fs_utils.app_dir_for` without calling it: `<root>/Safekeep`
+    where APPDATA rules (Windows), `<root>/Library/Application Support/Safekeep`
+    on macOS and `<root>/.config/Safekeep` elsewhere, both derived from HOME.
+    A test that put the jobs file in `<root>/Safekeep` on every OS made the child
+    look in a folder it never reads (exit 2 for a job that was there).
+    """
+    base = pathlib.Path(root)
+    if sys.platform == "darwin":
+        return base / "Library" / "Application Support" / "Safekeep"
+    if os.name == "nt":
+        return base / "Safekeep"
+    return base / ".config" / "Safekeep"
 
 
 def _long(path) -> str:

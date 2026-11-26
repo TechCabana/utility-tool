@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from helpers import app_data_dir
 from utils import backup_utils, copying, jobs_store, locks, preflight, runner
 from utils.fs_utils import plain_path
 
@@ -323,7 +324,7 @@ def test_cli_reports_a_result_it_could_not_record_instead_of_a_traceback(tmp_pat
     JobsFileCorrupt, so the scheduled task died with a traceback and never
     printed the run's own outcome."""
     appdata = tmp_path / "appdata"
-    data = appdata / "Safekeep"
+    data = app_data_dir(appdata)
     data.mkdir(parents=True)
     job = backup_utils.new_job("j", str(tmp_path / "nosuch-src"), str(tmp_path / "dst"),
                                schedule="manual")

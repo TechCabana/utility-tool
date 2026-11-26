@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import clear_ro
+from helpers import app_data_dir, clear_ro
 from utils import backup_utils, copying, jobs_store, runner, versions
 
 REPO = Path(__file__).resolve().parent.parent
@@ -399,9 +399,9 @@ def test_the_jobs_table_status_for_each_combination():
 def test_the_headless_run_warns_on_stderr_and_still_exits_zero(tmp_path, make_job):
     job, source = make_job(retention=3)
     appdata = tmp_path / "appdata"
-    (appdata / "Safekeep").mkdir(parents=True)
-    # The CLI reads <APPDATA>\Safekeep\backup_jobs.json; seed it, then run twice.
-    jobs_file = appdata / "Safekeep" / "backup_jobs.json"
+    app_data_dir(appdata).mkdir(parents=True)
+    # The CLI reads backup_jobs.json from its app-data folder; seed it, then run twice.
+    jobs_file = app_data_dir(appdata) / "backup_jobs.json"
     jobs_file.write_text(Path(jobs_store.JOBS_FILE).read_text(encoding="utf-8"), encoding="utf-8")
     env = dict(os.environ, APPDATA=str(appdata), HOME=str(appdata),
                USERPROFILE=str(appdata), QT_QPA_PLATFORM="offscreen")

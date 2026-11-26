@@ -31,7 +31,7 @@ import pytest
 
 from utils import backup_utils, copying, jobs_store, locks, restore_test, runlog, runner, verify
 from utils.fs_utils import long_path
-from helpers import clear_ro, clear_ro_tree, is_read_only
+from helpers import app_data_dir, clear_ro, clear_ro_tree, is_read_only
 from test_long_paths import _deep_file, _write, _x, windows_only
 from test_restore_check import flip_byte, make_backup, manifest_lines, stored, write_manifest
 
@@ -1148,7 +1148,7 @@ def test_the_real_cli_passes_then_exits_5_for_a_corrupted_stored_file(tmp_path):
     """End to end: `python main.py --test-restore <id>` in its own process, with
     APPDATA and the temp folder pointed at fresh folders."""
     appdata = tmp_path / "appdata"
-    data = appdata / "Safekeep"
+    data = app_data_dir(appdata)
     data.mkdir(parents=True)
     child_temp = tmp_path / "childtemp"
     child_temp.mkdir()
