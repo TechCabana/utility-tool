@@ -47,6 +47,18 @@ _ERRNO_CAUSES = {errno.ENOSPC: "no_space", errno.ENAMETOOLONG: "path_too_long",
                  errno.EFBIG: "file_too_large", errno.ENOENT: "target_unavailable",
                  getattr(errno, "ESTALE", -1): "target_unavailable",
                  errno.EACCES: "no_permission", errno.EPERM: "no_permission"}
+# How Windows answers a path it cannot hold at its ~32,767-character limit,
+# even in the extended-length form: which code depends on the build and the
+# call. Measured: ERROR_PATH_NOT_FOUND / ENOENT on Windows 11 (dev machine),
+# ERROR_INVALID_NAME (123, errno EINVAL) on the GitHub windows-latest runner.
+# Read as "too long" ONLY at a path of LONG_PATH_ERROR_FROM characters or more;
+# at a shorter path each keeps its own cause (a vanished drive stays
+# target_unavailable, a bad character stays target_write_failed). The winerror
+# decides when there is one, so a drive that went away (21, 53, 64, 67) is not
+# relabelled even at a deep path.
+LONG_PATH_ERRORS = {"winerror": frozenset({3, 123, 206}),
+                    "errno": frozenset({errno.ENOENT, errno.EINVAL, errno.ENAMETOOLONG})}
+LONG_PATH_ERROR_FROM = 32_000
 
 
 class TargetWriteFailed(Exception):
@@ -66,16 +78,18 @@ class TargetWriteFailed(Exception):
     def __init__(self, path: str, error: OSError):
         """Classify `error`, raised while writing destination `path`."""
         self.path, self.error = path, error
-        cause = (_WINERROR_CAUSES.get(getattr(error, "winerror", None))
+        winerror = getattr(error, "winerror", None)
+        cause = (_WINERROR_CAUSES.get(winerror)
                  or _ERRNO_CAUSES.get(error.errno) or "target_write_failed")
-        # ponytail: Windows reports a path it cannot hold as a plain ENOENT
-        # near 32,767 characters even in the extended-length form every engine
-        # call now uses (measured: a folder from ~32,762, a file at 32,767), so
-        # length decides there. Not at MAX_PATH any more: a 300-character path
-        # is writable, so ENOENT on one means the drive went away, and calling
-        # it "too long" listed innocent files as offenders. Mislabels a drive
-        # that vanished at a >=32,000 path; the run still fails either way.
-        if cause == "target_unavailable" and os.name == "nt" and len(path) >= 32_000:
+        # ponytail: near 32,767 characters Windows names no length error (see
+        # LONG_PATH_ERRORS), so length decides there. Not at MAX_PATH any more:
+        # a 300-character path is writable, so ENOENT on one means the drive
+        # went away, and calling it "too long" listed innocent files as
+        # offenders. Mislabels a drive that vanished with ERROR_PATH_NOT_FOUND
+        # at a >=32,000 path; the run still fails either way.
+        if os.name == "nt" and len(path) >= LONG_PATH_ERROR_FROM and (
+                winerror in LONG_PATH_ERRORS["winerror"] if winerror is not None
+                else error.errno in LONG_PATH_ERRORS["errno"]):
             cause = "path_too_long"
         self.cause = cause
         super().__init__(self.reason("backup drive"))
