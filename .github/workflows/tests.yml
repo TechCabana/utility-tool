@@ -23,19 +23,23 @@ on:
 permissions:
   contents: read
 
-# One run per ref. A newer push to a pull request cancels the older run; a push
-# to main is never cancelled, so every commit on main keeps its own result.
+# A newer push to a pull request cancels that pull request's older run. Every
+# other run (a push to main, a manual run) gets a group of its own (its run id):
+# GitHub cancels a PENDING run when a newer one joins the same group even with
+# cancel-in-progress off, so a shared "main" group would drop the middle commit
+# of three quick pushes and that commit would have no result.
 concurrency:
-  group: tests-${{ github.ref }}
+  group: tests-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pytest:
     name: pytest (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    # The suite takes about four minutes locally (several tests wait a second
-    # for a distinct version stamp and some start real processes); 30 leaves
-    # room for slower hosted runners without letting a hang run for six hours.
+    # The suite takes about six minutes on a Windows desktop and about three in a
+    # Linux container (several tests wait a second for a distinct version stamp
+    # and some start real processes); 30 leaves room for slower hosted runners
+    # without letting a hang run for six hours.
     timeout-minutes: 30
     strategy:
       fail-fast: false
