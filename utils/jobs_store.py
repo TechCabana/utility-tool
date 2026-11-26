@@ -739,8 +739,9 @@ def save_job(job: Dict) -> None:
 
 
 # What the job form edits. Everything else on a stored job is written by runs,
-# pre-checks and releases (`record_run`, `record_precheck`, `set_running`,
-# `runner.release_hold`) and must not be rolled back by an edit.
+# pre-checks, test restores and releases (`record_run`, `record_precheck`,
+# `record_restore_test`, `set_running`, `runner.release_hold`) and must not be
+# rolled back by an edit.
 SETTINGS_KEYS = ("name", "source", "target", "schedule", "at", "retention",
                  "target_volume", "verify")
 
@@ -782,6 +783,86 @@ def record_precheck(job_id: str, summary: Dict) -> Optional[Dict]:
         if job is None:
             return None
         job["last_precheck"] = summary
+        _save_job(job)
+    return job
+
+
+# ---------------------------------------------------------------------------
+# The test-restore result (card 0Bv7mvB3)
+# ---------------------------------------------------------------------------
+#
+# `last_restore_test` = {time, version, status, sampled, checked, failed,
+# failed_sample, reason}: what the newest test restore of this job found. It is
+# written ONLY by `record_restore_test` (a fresh read under the jobs-file lock,
+# one field set), and is in neither `SETTINGS_KEYS` nor touched by `record_run`,
+# so neither a job-form save nor the run's own record can roll it back. A
+# "busy" or "cancelled" test says nothing about the version, so it is never
+# stored; the stored statuses are exactly `RESTORE_TEST_STATUSES`.
+
+RESTORE_TEST_STATUSES = ("passed", "failed", "cannot_test")
+_RESTORE_TEXT_MAX = 260
+
+
+def clean_restore_test(value) -> Optional[Dict]:
+    """`value` as a well-formed `last_restore_test`, or None when it is junk.
+
+    The one reader AND the one writer's filter, so what is stored can always be
+    read back and a hand-edited value cannot reach a caller. None for anything
+    that is not a dict or whose status is not one of `RESTORE_TEST_STATUSES`;
+    otherwise every field is coerced: counts to non-negative whole numbers,
+    `failed_sample` to at most `SKIPPED_SAMPLE_MAX` strings, texts capped, an
+    unparseable `time` or a `version` that is not a stamp to "". Never raises.
+    """
+    if not isinstance(value, dict) or value.get("status") not in RESTORE_TEST_STATUSES:
+        return None
+
+    def text(raw) -> str:
+        """A string capped at `_RESTORE_TEXT_MAX`, "" for anything else."""
+        return raw[:_RESTORE_TEXT_MAX] if isinstance(raw, str) else ""
+
+    moment, stamp = value.get("time"), value.get("version")
+    try:
+        datetime.fromisoformat(moment)
+    except (TypeError, ValueError):
+        moment = ""
+    sample = value.get("failed_sample")
+    return {
+        "time": text(moment),
+        "version": stamp if isinstance(stamp, str) and _STAMP_RE.fullmatch(stamp) else "",
+        "status": value["status"],
+        "sampled": _count(value.get("sampled")),
+        "checked": _count(value.get("checked")),
+        "failed": _count(value.get("failed")),
+        "failed_sample": [text(name) for name in sample
+                          if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
+        if isinstance(sample, list) else [],
+        "reason": text(value.get("reason")),
+    }
+
+
+def job_restore_test(job: Dict) -> Optional[Dict]:
+    """`job`'s stored test-restore result (`clean_restore_test`), or None when
+    it has none or the value is junk -- junk reads as absent, never raises."""
+    return clean_restore_test(job.get("last_restore_test"))
+
+
+def record_restore_test(job_id: str, summary: Dict) -> Optional[Dict]:
+    """Store `summary` as the job's `last_restore_test` and return the job.
+
+    Same re-read-under-the-lock as `record_precheck`: only this one field is
+    set, so a run or a release recorded meanwhile survives. None when there is
+    no such job or `summary` is not storable (junk, or a status such as "busy"
+    that is never stored); nothing is written then. Raises JobsFileCorrupt or
+    OSError like `save_job`.
+    """
+    cleaned = clean_restore_test(summary)
+    if cleaned is None:
+        return None
+    with _jobs_file_lock():
+        job = get_job(job_id)
+        if job is None:
+            return None
+        job["last_restore_test"] = cleaned
         _save_job(job)
     return job
 

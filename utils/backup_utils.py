@@ -38,6 +38,7 @@ from utils.jobs_store import (  # noqa: F401
     job_skipped_sample, job_changed, job_changed_sample, job_links, job_links_sample, job_verify_mode, job_running, new_running_marker, running_owner_gone,
     set_running, JOBS_FILE, _jobs_file_lock, JOBS_FILENAME, JobsFileCorrupt,
     load_jobs, _locks_dir, new_job, quarantine_jobs_file, QuarantineRefused, _read_valid, record_precheck, record_run, remove_job,
+    clean_restore_test, job_restore_test, record_restore_test, RESTORE_TEST_STATUSES,
     restore_jobs_from_backup, _save_job, save_job, save_job_settings, save_jobs, SCHEDULES,
     SETTINGS_KEYS, VERIFY_MODES, FINISHED_UTC_FORMAT, valid_finished_utc,
     _write_atomic, CANCELLED_WORD, job_result, ok_word, outcome_word, result_is_cancelled,

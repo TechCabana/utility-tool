@@ -427,6 +427,15 @@ def run_backup_job_cli(job_id):
         # contract as a skip -- loud on stderr, exit code unchanged.
         print("[WARN] " + backup_utils.pruning_held_sentence(
             result["files"], result["baseline_files"]), file=sys.stderr)
+    test = result.get("restore_test") or {}
+    if result.get("ok") and test.get("status") == "failed":
+        # Card 0Bv7mvB3: the automatic test restore after this backup found a
+        # sampled file that did not restore intact. The backup itself succeeded,
+        # so the exit code stays 0; the problem is loud on stderr.
+        names = test.get("failed_sample") or []
+        more = test.get("failed", 0) - len(names)
+        print(f"[WARN] Test restore found a problem: {', '.join(names)}"
+              + (f" and {more} more" if more > 0 else ""), file=sys.stderr)
     return 0 if result.get("ok") else 1
 
 
@@ -532,6 +541,67 @@ def precheck_job_cli(job_id):
     return 5
 
 
+# `--test-restore`'s exit codes beyond the shared 2 (no such job), 3 (jobs file
+# damaged) and 4 (job is running): 5 reads like `--precheck-job`'s "problems
+# found" and 6 is new. 1 is not used (a failed backup is `--run-backup-job`'s).
+TEST_RESTORE_PROBLEMS = 5
+TEST_RESTORE_CANNOT = 6
+
+
+def test_restore_cli(job_id):
+    """Test-restore a sample of one job's newest verified version with no GUI
+    (`main.py --test-restore <job id>`), print the result and return an exit code.
+
+    Restores a random sample (the largest file always included) into a
+    temporary folder, reads it back from disk and compares size and SHA-256 with
+    the manifest (`utils/restore_test.py`); nothing is written to the source or
+    the target, and the temporary folder is removed. One plain result line, then
+    up to five failing names with what differed. The result is stored on the
+    job as `last_restore_test` and logged as one line (trigger "manual").
+
+    Exit codes: 0 passed, 2 no such job, 3 the jobs file is damaged (nothing
+    was tested), 4 the job is running (nothing was tested; try again), 5
+    problems found (a sampled file did not match), 6 cannot be tested (no
+    verified backup, no manifest, a damaged manifest...). A result that could
+    not be recorded keeps its code and prints a warning.
+    """
+    from utils import backup_utils, restore_test
+    _safe_console()
+    migrate.migrate_data()  # as --run-backup-job: the jobs file may be pre-rename
+    try:
+        job = backup_utils.get_job(job_id)
+    except backup_utils.JobsFileCorrupt as exc:
+        hint = f" Open {APP_NAME} to restore it." if exc.has_backup else ""
+        print(f"[ERROR] {exc}{hint}", file=sys.stderr)
+        return 3
+    if job is None:
+        print(f"[ERROR] No backup job with id '{job_id}'")
+        return 2
+    result = restore_test.restore_test(job, trigger="manual")
+    if result.get("store_error"):
+        print(f"[WARN] The test restore result could not be recorded: "
+              f"{result['store_error']}", file=sys.stderr)
+    if result["cleanup_failed"]:
+        print(f"[WARN] The temporary folder could not be removed: {result['leftover']}",
+              file=sys.stderr)
+    status = result["status"]
+    if status == "busy":
+        print(f"[SKIPPED] {result['message']}", file=sys.stderr)
+        return 4
+    if status == "passed":
+        print("[OK] " + result["message"])
+        return 0
+    if status == "failed":
+        print("[PROBLEMS] " + result["message"])
+        for name in result["failed_sample"]:
+            print(f"  {name}: {result['failed_why'].get(name, 'did not match')}")
+        if result["failed"] > len(result["failed_sample"]):
+            print(f"  ... and {result['failed'] - len(result['failed_sample'])} more")
+        return TEST_RESTORE_PROBLEMS
+    print("[CANNOT TEST] " + result["message"])
+    return TEST_RESTORE_CANNOT
+
+
 def release_hold_cli(job_id):
     """Tell a job its pruning hold is expected (`main.py --release-hold <job id>`),
     print what happened and return a process exit code. No GUI.
@@ -579,7 +649,11 @@ HEADLESS_USAGE = (
     "                                           2 no such job, 3 jobs file damaged)\n"
     "       main.py --release-hold <job id>     (exit 0 released or nothing to release,\n"
     "                                           1 could not save, 2 no such job,\n"
-    "                                           3 jobs file damaged, 4 job is running)")
+    "                                           3 jobs file damaged, 4 job is running)\n"
+    "       main.py --test-restore <job id>     (exit 0 passed, 2 no such job, 3 jobs file\n"
+    "                                           damaged, 4 job is running, 5 problems found:\n"
+    "                                           a sampled file did not match, 6 cannot be\n"
+    "                                           tested)")
 
 
 def main() -> int:
@@ -637,8 +711,10 @@ if __name__ == "__main__":
         sys.exit(precheck_job_cli(sys.argv[2]))
     if len(sys.argv) >= 3 and sys.argv[1] == "--release-hold":
         sys.exit(release_hold_cli(sys.argv[2]))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--test-restore":
+        sys.exit(test_restore_cli(sys.argv[2]))
     if any(flag in sys.argv for flag in ("--run-backup-job", "--precheck-job",
-                                         "--release-hold")):
+                                         "--release-hold", "--test-restore")):
         print(HEADLESS_USAGE)
         sys.exit(2)
     sys.exit(main())

@@ -258,8 +258,23 @@ Safekeep read. It does not mean:
   later, so bit rot on the backup drive goes unnoticed until you restore; a scheduled deeper
   check is not built yet. A restore does compare each file it copies against the record and
   names any that do not match.
-- **You can restore it.** Nothing yet restores a sample to prove a backup can be brought back;
-  a test restore is planned, not built.
+- **You can restore all of it.** A test restore (below) tries a sample, not every file.
+
+**What a test restore proves.** After a job's first successful backup (and again after each
+later one until a test has passed once; a job with Verification Off is not tested), Safekeep
+restores a random sample into a temporary folder, reads every restored file back from disk,
+compares its size and checksum with the checksum list and deletes the folder. The sample is
+about 5% of the files (at least 5, at most 50) plus the largest file; the automatic run leaves
+out any file over 1 GiB and stops at 2 GiB in total, so a first backup is not doubled in time,
+and a test you start yourself always includes the largest. The result is stored on the job
+(`last_restore_test`) and logged as its own line; if it finds a problem the backup still reads
+OK, its message gains one sentence naming the files, and a headless run prints a `[WARN]` line
+to stderr. Run one yourself with `main.py --test-restore <id>`, which tests the newest verified
+version and exits 0 passed, 5 a sampled file did not match, 6 cannot be tested (no verified
+backup, no checksum list or a damaged one; never reported as a pass), 2 no such job, 3 jobs
+file damaged, 4 job is running. A pass proves that those files come back and match the recorded
+checksums when read back. It does not prove the files outside the sample, that the source was
+complete, or that the backup drive is free of later bit rot. There is no button for it yet.
 
 **An interrupted run is not resumed.** If the power goes or the program is killed part-way
 through a run, Safekeep does not pick the copy up where it stopped. The half-finished copy is
@@ -359,7 +374,9 @@ flowchart LR
    larger backup" on the job, or `main.py --release-hold <id>`); a failed run does not clear
    it, and a low-space failure says it is in force.
    Every run appends one line to `logs/<job id>.jsonl` in the
-   app-data folder (the newest 200 are kept). Only one run of a job happens at a time (a lock file in the app-data folder); a
+   app-data folder (the newest 200 are kept); a test restore appends one line of its own
+   (outcome `restore_test_passed`, `restore_test_failed` or `restore_test_skipped`, with counts
+   and up to five relative names, never a path). Only one run of a job happens at a time (a lock file in the app-data folder); a
    second one, such as the scheduled task firing during a manual run, is refused and the
    headless path exits 4. Abandoned leftovers of failed runs older than 7 days are removed at
    the start of the next run, except the most recent one, which is kept for inspection.
@@ -370,6 +387,7 @@ flowchart LR
    | `main.py --run-backup-job <id>` | 0 ok, 1 failed, 2 no such job, 3 jobs file damaged, 4 already running |
    | `main.py --precheck-job <id>` | 0 nothing to fix, 5 any problem found (even files that would only be skipped), 2 no such job, 3 jobs file damaged |
    | `main.py --release-hold <id>` | 0 released or nothing to release, 1 could not be saved, 2 no such job, 3 jobs file damaged, 4 job is running |
+   | `main.py --test-restore <id>` | 0 passed, 5 a sampled file did not match, 6 cannot be tested, 2 no such job, 3 jobs file damaged, 4 job is running |
 
    A job's first unattended run, if it was never checked, is pre-checked once it holds the
    job's lock; the check only warns and never stops the run.
@@ -435,6 +453,7 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed or cancelled run leaves all three unchanged |
 | `last_finished_utc` | string | When the last successful run finished, in UTC (`2026-10-25T01:45:12Z`), the same value as the end of its checksum list; absent until a job has a successful run made by a version that records it, and a failed or cancelled run leaves it unchanged |
 | `last_precheck` | object | The last pre-check's summary: `{time, ok, aborted, fs, scanned, problems, blocking, counts, sample}` (counts by kind, up to five paths from the source root). Absent until a job is first checked |
+| `last_restore_test` | object | The newest test restore's result: `{time, version, status, sampled, checked, failed, failed_sample, reason}`. `status` is `passed`, `failed` or `cannot_test` (a test that found the job busy or was cancelled is not stored); `failed_sample` holds up to five relative paths and `reason` says why a version could not be tested. Absent until a job's first test; a value that does not read as this shape is treated as absent. Written only by a test, never by saving the job form or recording a run |
 | `hold_released` | object | Present after the owner released a pruning hold: `{stamp, files, level, since, time}`, the version let go and its file count, the source's file count then, and the newest version at that moment. Versions older than `since` no longer count as the larger backup to compare with |
 
 The file is replaced atomically on every save, and the previous good copy is kept as
@@ -450,7 +469,7 @@ as "nothing skipped, nothing changed, nothing held".
 
 ```
 utility-tool/
-├── main.py               app entry point; window shell, sidebar, tab wiring, headless --run-backup-job / --precheck-job / --release-hold paths
+├── main.py               app entry point; window shell, sidebar, tab wiring, headless --run-backup-job / --precheck-job / --release-hold / --test-restore paths
 ├── requirements.txt      pinned dependencies (PySide6, pytest)
 ├── LICENSE                MIT
 ├── assets/
@@ -476,6 +495,7 @@ utility-tool/
 │   ├── verify.py           full and quick checks of a finished copy
 │   ├── preflight.py        pre-run checks (source, target, same drive, space)
 │   ├── precheck.py         read-only check of every file the target cannot hold
+│   ├── restore_test.py     test restore: restore a random sample to a temp folder, re-read it, compare with the manifest
 │   ├── runner.py           run_job and changes-since
 │   ├── runlog.py           per-job run log, one JSON line per run, newest 200 kept
 │   ├── scheduler.py        Windows Task Scheduler and macOS launchd registration
@@ -509,6 +529,7 @@ utility-tool/
     ├── test_release_hold.py
     ├── test_restore_candidates.py
     ├── test_restore_check.py
+    ├── test_restore_test.py
     ├── test_retry_skipped.py
     ├── test_review_gate_batch2.py
     ├── test_runlog.py
@@ -542,7 +563,7 @@ utility-tool/
 pytest tests/
 ```
 
-Covers mainly the Qt-free layer (`utils/backup_utils.py` and the modules it re-exports, `utils/precheck.py`, `utils/runlog.py`, `utils/locks.py`, `utils/activity.py`,
+Covers mainly the Qt-free layer (`utils/backup_utils.py` and the modules it re-exports, `utils/precheck.py`, `utils/restore_test.py`, `utils/runlog.py`, `utils/locks.py`, `utils/activity.py`,
 `utils/fs_utils.py`, `utils/migrate.py` and the design tokens in `styles/tokens.py`), using real `tmp_path` files;
 the scheduler, free space and volume identity are injected rather than touched. Over 700 tests,
 all passing; the run takes about four minutes, since several tests wait a second for a distinct version stamp and some start real processes. A few tests drive parts of the Backup screen offscreen (its pre-check, release and interrupted-run paths), but most of the Qt-driven `tabs/` layer (including the Backup screen's

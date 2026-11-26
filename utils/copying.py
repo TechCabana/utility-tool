@@ -13,7 +13,7 @@ import os
 import shutil
 import stat
 import time
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from utils.fs_utils import (_is_link_like, is_legacy_profile_link, long_path,
                             plain_error, relative_to, remove_file)
@@ -408,7 +408,8 @@ def copy_tree(source: str, destination: str,
               on_copied: Optional[Callable[[str, int, float, str], None]] = None,
               stats: Optional[Dict[str, int]] = None,
               retry_skipped: bool = False,
-              recopy_changed: bool = False
+              recopy_changed: bool = False,
+              only: Optional[Set[str]] = None
               ) -> Tuple[int, int, List[str]]:
     """Copy `source` into `destination`, reporting `(done, total)` per file.
 
@@ -478,8 +479,22 @@ def copy_tree(source: str, destination: str,
     is skipped without the retry pass trying it again. The count, the manifest
     line, the progress step and the byte total are made once per file, after
     its last copy, never per attempt.
+
+    With `only` (the test restore, card 0Bv7mvB3: a SAMPLE of a version), just
+    the files whose relative path (forward slashes, the manifest's form) is in
+    the set are copied, through the same `copy_one`, and only the folders on
+    the way to them are entered. The whole-tree completeness rule below does
+    not apply: the expected count is `len(only)`, and a named file the source
+    does not hold is simply not copied -- the caller, which knows what it
+    asked for, reports it. A source that can no longer be listed still raises
+    SourceUnavailable.
     """
-    total = tree_totals(source)[0]
+    total = len(only) if only is not None else tree_totals(source)[0]
+    # Every folder that holds a wanted file, so the walk enters only those.
+    wanted_dirs: Set[str] = set()
+    for wanted in only or ():
+        parts = wanted.split("/")[:-1]
+        wanted_dirs.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
     state = {"done": 0, "bytes": 0, "recopied": 0}
     errors: List[str] = []
     # (source file, its destination, its index in `errors`) per skipped file.
@@ -603,11 +618,15 @@ def copy_tree(source: str, destination: str,
             is_file = False
             try:
                 if _is_link_like(entry):
-                    note_link(entry, src)
+                    if only is None:
+                        note_link(entry, src)
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    copy_dir(src, dst)
+                    if only is None or relative_to(src, source).replace("\\", "/") in wanted_dirs:
+                        copy_dir(src, dst)
                 else:
+                    if only is not None and relative_to(src, source).replace("\\", "/") not in only:
+                        continue
                     is_file = True
                     copy_one(src, dst)
             except OSError as exc:
@@ -650,7 +669,7 @@ def copy_tree(source: str, destination: str,
     # A copy holding NOTHING is never a backup, whatever the floor says: a
     # two-file source with both files locked is under SHORTFALL_MIN_FILES,
     # and promoting its empty copy as "verified" pruned the last real one.
-    if not state["done"] or (missing >= SHORTFALL_MIN_FILES
-                             and missing > SHORTFALL_TOLERANCE * total):
+    if only is None and (not state["done"] or (missing >= SHORTFALL_MIN_FILES
+                                               and missing > SHORTFALL_TOLERANCE * total)):
         raise SourceUnavailable(source, state["done"], total, "source_incomplete")
     return state["done"], state["bytes"], errors

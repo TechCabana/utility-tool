@@ -496,7 +496,11 @@ def test_a_headless_real_run_logs_trigger_scheduled(tmp_path, make_job):
 
     assert proc.returncode == 0, proc.stderr
     path = appdata / "Safekeep" / "logs" / (job["id"] + ".jsonl")
-    (entry,) = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    # A saved job's first successful backup is followed by its test restore (card
+    # 0Bv7mvB3), which logs a line of its own after the run's; this test is
+    # about the run's line.
+    (entry,) = [line for line in lines if not line["outcome"].startswith("restore_test")]
     assert entry["trigger"] == "scheduled" and entry["outcome"] == "ok"
     assert entry["job"] == job["id"] and entry["files"] == 11
     assert not (appdata / "Safekeep" / "logs" / "app.jsonl").exists()

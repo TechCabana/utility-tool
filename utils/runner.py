@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional
 
-from utils import jobs_store, locks, precheck, runlog, verify
+from utils import jobs_store, locks, precheck, restore_test, runlog, verify
 from utils.copying import (BackupAborted, SourceUnavailable, TargetWriteFailed,
                            _writing, copy_tree, walk_tree)
 from utils.fs_utils import long_path, plain_error, remove_file
@@ -199,6 +199,14 @@ def run_job(job: Dict,
                           trigger, start)
         raise
     runlog.append_run(job, result, trigger, start)
+    # The automatic test restore (card 0Bv7mvB3) ran inside the lock, but its
+    # own log line is written here: after the run's line, and with the run lock
+    # released, as the run log's locking rule asks. Popped, so the caller's
+    # result carries only the plain `restore_test` summary.
+    pending = result.pop("restore_test_log", None)
+    if pending is not None:
+        runlog.append_run(job, {"restore_test_line": pending["line"]}, "auto",
+                          pending["start"], pending["end"])
     return result
 
 
@@ -552,7 +560,49 @@ def _run_job(job: Dict,
             if began:
                 _abandon_run(job, exc)
             raise
-    return _with_sweep(result, sweep)
+    return _with_sweep(_with_restore_test(job, result, should_abort), sweep)
+
+
+def _add_sentence(message: str, sentence: str) -> str:
+    """`message` with `sentence` after it, a full stop between if it has none."""
+    return message + ("" if message.endswith((".", "!")) else ".") + " " + sentence
+
+
+def _with_restore_test(job: Dict, result: Dict,
+                       should_abort: Optional[Callable[[], bool]]) -> Dict:
+    """After a successful backup, run the automatic test restore if one is due
+    (`restore_test.automatic`: the job's first successful backup, then again
+    until a test has passed once), and report it on `result`. The caller holds
+    the job's run lock.
+
+    **It can never fail or change the backup.** Only an ok result is looked at;
+    `ok` and every other key stay as they were. Anything the test raises
+    becomes one sentence in the message (the exception's text, not a
+    traceback). A cancel (`should_abort`) stops the test: nothing is stored,
+    logged or said. The message gains ONE sentence, and only when the test
+    passed ("Test restore passed: 12 files restored and checked.") or found a
+    problem ("Test restore FOUND A PROBLEM: a.txt did not match."); a test that
+    could not be run says nothing here (it is stored and logged). The summary is
+    `result["restore_test"]` and its log line waits in `result["restore_test_log"]`
+    for `run_job` to write.
+    """
+    if not result.get("ok") or not isinstance(result.get("version"), str):
+        return result
+    began = datetime.now()
+    try:
+        test = restore_test.automatic(job, result["version"], should_abort)
+    except Exception as exc:  # a test restore must never fail a good backup
+        result["message"] = _add_sentence(
+            result.get("message", ""), f"Test restore could not be run: {type(exc).__name__}: {exc}.")
+        return result
+    if test is None or test["status"] == "cancelled":
+        return result
+    result["restore_test"] = test
+    if test["status"] in runlog.RESTORE_OUTCOMES:
+        result["restore_test_log"] = {"line": test, "start": began, "end": datetime.now()}
+    if test["status"] in ("passed", "failed"):
+        result["message"] = _add_sentence(result.get("message", ""), test["message"])
+    return result
 
 
 def _with_sweep(result: Dict, sweep: Optional[Dict]) -> Dict:

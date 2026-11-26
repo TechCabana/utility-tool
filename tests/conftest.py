@@ -21,7 +21,7 @@ _SESSION_APPDATA = tempfile.mkdtemp(prefix="safekeep-tests-")
 os.environ["APPDATA"] = _SESSION_APPDATA
 atexit.register(shutil.rmtree, _SESSION_APPDATA, ignore_errors=True)
 
-from utils import copying, jobs_store, runlog  # noqa: E402
+from utils import copying, jobs_store, restore_test, runlog  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +42,30 @@ def isolated_logs_dir(tmp_path_factory, monkeypatch):
     path = tmp_path_factory.mktemp("logs")
     monkeypatch.setattr(runlog, "_logs_dir", lambda: str(path))
     return path
+
+
+@pytest.fixture(autouse=True)
+def no_automatic_restore_test(request):
+    """Switch off the test restore that follows a saved job's first backup
+    (card 0Bv7mvB3) for every test file but the one that tests it.
+
+    Without this, every older test that saves a job and runs it would get one
+    extra run-log line, one extra sentence in the message and a stored
+    `last_restore_test` it knows nothing about. A module opts back in by setting
+    `AUTO_RESTORE_TEST = True` at module level (tests/test_restore_test.py).
+    """
+    if getattr(request.module, "AUTO_RESTORE_TEST", False):
+        yield
+        return
+    # Assigned and restored by hand, not through `monkeypatch`: some older tests
+    # call `monkeypatch.undo()` mid-test, which would switch the test restore
+    # back on in the middle of a run.
+    original = restore_test.automatic
+    restore_test.automatic = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        restore_test.automatic = original
 
 
 @pytest.fixture(autouse=True)

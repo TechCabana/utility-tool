@@ -40,6 +40,19 @@ its file count and its version stamp (0 and null when there is none). The
 release itself is logged as one line with `outcome` "hold_released", `files`
 the count the source had and `trigger` "manual" (the Backup screen) or "cli".
 
+A test restore (card 0Bv7mvB3, `utils/restore_test.py`) is logged as ONE line of
+its own, never inside a backup run's line, carrying `LINE_KEYS` plus
+`RESTORE_LINE_KEYS` (a backup run's line is byte-for-byte what it was before this
+card): `outcome` `restore_test_passed`,
+`restore_test_failed` or `restore_test_skipped` (it could not be tested: no
+manifest, damaged manifest, not verified), `trigger` "auto" (the one after a
+job's first successful backup) or "manual" (on demand), `version` the version
+tested. `restore_sampled`, `restore_checked` and `restore_failed` are counts
+and `restore_failed_paths` the first `RESTORE_FAILED_PATHS_MAX` failing
+relative paths (forward slashes, like `skipped_paths`). Never the temporary
+folder's path. A test that did not run
+(the job was busy, the person cancelled it) writes no line.
+
 A run that started and never recorded an outcome (the process was killed, the
 machine lost power, it crashed) is logged ONCE, when the next run, the headless
 start or the Backup screen first finds its start marker with no owner left
@@ -80,13 +93,23 @@ SKIPPED_PATHS_MAX = 50
 # stay well under a megabyte" true whatever an exception's text turns out to be.
 MESSAGE_MAX = 2000
 APP_LOG_NAME = "app"
+RESTORE_FAILED_PATHS_MAX = 5
+# A test restore's own outcomes. Named in the style of `ok_skipped` and
+# `hold_released`; they are decided by `build_line` from the result's
+# `restore_test_line`, never by `jobs_store.outcome_word`, whose ranking for
+# backup runs is unchanged.
+RESTORE_OUTCOMES = {"passed": "restore_test_passed", "failed": "restore_test_failed",
+                    "cannot_test": "restore_test_skipped"}
 OUTCOMES = ("ok", "ok_skipped", "ok_changed", "ok_links", "ok_pruning_held", "failed",
-            "cancelled", "busy", "hold_released", "interrupted")
+            "cancelled", "busy", "hold_released", "interrupted") + tuple(RESTORE_OUTCOMES.values())
 LINE_KEYS = ("v", "start", "end", "trigger", "job", "name", "outcome", "files",
              "bytes", "skipped", "skipped_paths", "skipped_more", "pruned",
              "version", "verify_mode", "cause", "message", "pruning_held",
              "offenders", "baseline_files", "baseline_stamp", "retried", "recopied",
              "changed", "links")
+# The extra keys of a test restore's line, after `LINE_KEYS`.
+RESTORE_LINE_KEYS = ("restore_sampled", "restore_checked", "restore_failed",
+                     "restore_failed_paths")
 LOCK_TIMEOUT = 2.0
 
 
@@ -149,24 +172,29 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
     if links and isinstance(sentence, str) and sentence:
         message = message.replace(" " + sentence, "")
     pruned = result.get("pruned")
+    test = result.get("restore_test_line")
+    test = test if isinstance(test, dict) else {}
+    word = RESTORE_OUTCOMES.get(test.get("status"))
+    if word:
+        message = str(test.get("message", ""))
     mode = _text(result.get("verify_mode"))
     if mode is None and job:
         mode = jobs_store.job_verify_mode(job)
-    return {
+    line = {
         "v": RUNLOG_VERSION,
         "start": start.isoformat(timespec="seconds"),
         "end": end.isoformat(timespec="seconds"),
         "trigger": trigger,
         "job": _text(job.get("id")),
         "name": _text(job.get("name")),
-        "outcome": _outcome(result),
+        "outcome": word or _outcome(result),
         "files": _count(result.get("files")),
         "bytes": _count(result.get("bytes")),
         "skipped": skipped,
         "skipped_paths": paths,
         "skipped_more": skipped - len(paths),
         "pruned": len(pruned) if isinstance(pruned, (list, tuple)) else _count(pruned),
-        "version": _text(result.get("version")),
+        "version": _text(test.get("version") if word else result.get("version")),
         "verify_mode": mode,
         "cause": _text(result.get("cause")),
         "message": message[:MESSAGE_MAX],
@@ -187,6 +215,15 @@ def build_line(job: Optional[Dict], result: Dict, trigger: str,
         "changed": changed,
         "links": links,
     }
+    if word:
+        names = test.get("failed_sample")
+        line.update(
+            restore_sampled=_count(test.get("sampled")),
+            restore_checked=_count(test.get("checked")),
+            restore_failed=_count(test.get("failed")),
+            restore_failed_paths=[name for name in names if isinstance(name, str)
+                                  ][:RESTORE_FAILED_PATHS_MAX] if isinstance(names, list) else [])
+    return line
 
 
 def _is_line(text: str) -> bool:

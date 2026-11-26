@@ -694,7 +694,8 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
 RESTORE_NAMED = 5
 
 
-def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None
+def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None,
+                          sizes_out: Optional[Dict[str, int]] = None
                           ) -> Tuple[Optional[Dict[str, bytes]], Optional[str]]:
     """`({relative path: sha256 digest}, None)` for version `stamp`, or
     `(None, reason)` when its manifest cannot be trusted.
@@ -715,6 +716,12 @@ def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None
     `ro_out`, if given, receives the path of every file line marked
     `"ro": true` (the source file was read-only). It is only meaningful when
     the manifest is trusted (the second value is None).
+
+    `sizes_out`, if given, receives `{path: size}` for every file line whose
+    `size` is a whole number >= 0 (card 0Bv7mvB3: the test restore compares
+    size too). A line without a usable size is simply absent from it, so the
+    caller can tell; it never makes the manifest "damaged" here, because
+    restore only needs the hashes.
     """
     path = manifest_path(job, stamp)
     if not os.path.exists(long_path(path)):
@@ -738,6 +745,10 @@ def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None
                 hashes[rel] = digest
                 if ro_out is not None and entry.get("ro") is True:
                     ro_out.add(rel)
+                size = entry.get("size")
+                if (sizes_out is not None and isinstance(size, int)
+                        and not isinstance(size, bool) and size >= 0):
+                    sizes_out[rel] = size
     except (OSError, ValueError):   # unreadable, bad JSON, bad UTF-8, bad hex
         return None, "manifest damaged"
     if len(hashes) != summary.get("files"):
@@ -789,8 +800,15 @@ def _restore_check_sentence(check: Dict) -> str:
 
 def restore_version(job: Dict, version: Optional[str], destination: str,
                     on_progress: Optional[Callable[[int, int], None]] = None,
-                    should_abort: Optional[Callable[[], bool]] = None) -> Dict:
+                    should_abort: Optional[Callable[[], bool]] = None,
+                    only: Optional[set] = None) -> Dict:
     """Copy one stored version into a NEW folder under `destination`.
+
+    `only` (card 0Bv7mvB3, the test restore) restores just those files, named
+    by their manifest paths, through this same walk, comparison and mode
+    handling: `copy_tree(only=...)` copies only them, and what the manifest
+    lists beyond them is not reported as missing. The default, None, is the
+    whole version exactly as before.
 
     `version=None` means the default: `restore_candidates(job)["preferred"]`,
     the newest verified version. A caller that wants a different one (the
@@ -881,6 +899,8 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     read_only_paths: set = set()
     expected, unchecked_reason = _read_manifest_hashes(
         job, version, read_only_paths if protected else None)
+    if only is not None and expected is not None:
+        expected = {rel: digest for rel, digest in expected.items() if rel in only}
     fix_modes = protected and expected is not None
     check: Dict = {"checked": 0, "mismatched": [], "not_in_manifest": [],
                    "missing_from_version": [], "unchecked_reason": unchecked_reason,
@@ -924,7 +944,8 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     try:
         files, restored_bytes, errors = copy_tree(
             source, folder, on_progress=on_progress, should_abort=should_abort,
-            on_copied=compare if expected is not None else count_read_only, stats=stats)
+            on_copied=compare if expected is not None else count_read_only, stats=stats,
+            only=only)
     except BackupAborted:
         # Only the files restored before the stop were compared; nothing here
         # claims the rest were. Never `verified`.
