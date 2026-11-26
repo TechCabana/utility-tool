@@ -33,6 +33,17 @@ def isolated_jobs_file(tmp_path, monkeypatch):
     yield
 
 
+def _is_junction(path):
+    """`os.path.isjunction` (Python 3.12+), or the same test by reparse tag
+    (0xA0000003, the mount-point tag) on older Pythons; False off Windows."""
+    if hasattr(os.path, "isjunction"):
+        return os.path.isjunction(path)
+    try:
+        return os.lstat(path).st_reparse_tag == 0xA0000003
+    except (AttributeError, OSError):
+        return False
+
+
 def _snapshot(folder):
     """`{relative path: size}` of every file under `folder`, never entering a link."""
     found = {}
@@ -41,7 +52,7 @@ def _snapshot(folder):
     for current, dirs, files in os.walk(folder):
         dirs[:] = [d for d in dirs
                    if not (os.path.islink(os.path.join(current, d))
-                           or os.path.isjunction(os.path.join(current, d)))]
+                           or _is_junction(os.path.join(current, d)))]
         for name in files:
             path = os.path.join(current, name)
             found[os.path.relpath(path, folder)] = os.path.getsize(path)

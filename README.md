@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/github/license/TechCabana/utility-tool?style=flat&color=blue)](LICENSE)
 [![Language](https://img.shields.io/github/languages/top/TechCabana/utility-tool?style=flat)](https://github.com/TechCabana/utility-tool)
-[![Status](https://img.shields.io/badge/status-maintenance-D29922?style=flat)](#)
+[![tests](https://github.com/TechCabana/utility-tool/actions/workflows/tests.yml/badge.svg)](https://github.com/TechCabana/utility-tool/actions/workflows/tests.yml)
 [![Last commit](https://img.shields.io/github/last-commit/TechCabana/utility-tool?style=flat)](https://github.com/TechCabana/utility-tool/commits/main)
 
 [Overview](#overview) ·
@@ -305,7 +305,7 @@ step to finish and records the backup as made.
 | Storage | JSON file in the OS app-data directory | No database needed for a handful of backup jobs |
 | Packaging | PyInstaller `--onefile` | Measured against Nuitka onefile on this app: 47 MB / 2.9s cold start vs. 80 MB / 3.1s and a more fragile toolchain (see the decision table below) |
 | Hosting | None (local desktop app) | Nothing to deploy or serve |
-| Automation | None | No CI configured; see [Testing](#testing) |
+| Automation | GitHub Actions | Runs the test suite on Windows and macOS for every push to `main` and every pull request; see [Testing](#testing) |
 | Testing | pytest, `utils/` only | See [Testing](#testing); the Qt-driven `tabs/` layer stays manually verified |
 
 ### How the pieces fit
@@ -573,6 +573,15 @@ all passing; the run takes about four minutes, since several tests wait a second
 worker thread and UI) has no automated coverage and stays manually
 verified, per the [Verify](#4-verify) and [If it does not work](#if-it-does-not-work) steps
 above.
+
+**Continuous integration.** `.github/workflows/tests.yml` runs `python -m pytest tests/ -q` on
+`windows-latest` and `macos-latest`, each on Python 3.10 and 3.12, for every push to `main` and
+every pull request. Python 3.9 is not in the matrix: the pinned `pytest==9.1.1` needs 3.10 or
+newer, and `PySide6==6.7.2` needs older than 3.13. A macOS job is a real check, not an advisory one: a red macOS job means a
+real macOS problem (the macOS scheduling and drive-identity code has had no real Mac to run on
+until now). A macOS failure that is understood but not yet fixed is marked on the single test
+with `@pytest.mark.xfail(sys.platform == "darwin", reason="...", strict=False)`, so the reason
+stays in the code; it is never hidden by allowing a whole job to fail.
 
 ---
 

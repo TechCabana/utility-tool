@@ -1,0 +1,67 @@
+# Runs the pytest suite on Windows and macOS for every push to main and every
+# pull request. The README status badge points at this file by name, so do not
+# rename it without updating the badge.
+#
+# The macOS jobs are REAL checks: no continue-on-error, no blanket xfail. A red
+# macOS job means a real macOS problem (the launchd, volume_id and app_dir
+# paths were written without ever running on a Mac). A known, understood
+# macOS-only failure is marked on the single test, never on the job:
+#   @pytest.mark.xfail(sys.platform == "darwin", reason="<why>", strict=False)
+#
+# Python versions: 3.10 and 3.12. The README says 3.9+, but pytest==9.1.1 in
+# requirements.txt needs Python >= 3.10 and PySide6==6.7.2 needs < 3.13, so the
+# supported range with the pinned requirements is 3.10 to 3.12. 3.12 is the
+# newest the PySide6 pin installs on; 3.10 is the oldest the pytest pin installs on.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref. A newer push to a pull request cancels the older run; a push
+# to main is never cancelled, so every commit on main keeps its own result.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    # The suite takes about four minutes locally (several tests wait a second
+    # for a distinct version stamp and some start real processes); 30 leaves
+    # room for slower hosted runners without letting a hang run for six hours.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        python-version: ["3.10", "3.12"]
+    env:
+      # Several tests set this themselves; setting it here covers any that do not.
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install the pinned requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -q

@@ -353,10 +353,15 @@ def test_unregister_and_exists_target_the_legacy_task_only_when_asked(monkeypatc
         "UtilityTool_Backup_abc", "UtilityTool_Backup_abc", "Safekeep_Backup_abc"]
 
 
-def test_job_command_invokes_the_headless_cli_flag():
+def test_job_command_invokes_the_headless_cli_flag(monkeypatch):
+    # The interpreter is pinned to a path with a space: job_command quotes a
+    # part only when it contains one, and a CI runner's interpreter path has none.
+    monkeypatch.setattr(scheduler.sys, "executable", "C:\\Program Files\\Python\\python.exe")
     command = backup_utils.job_command("abc123")
     assert "--run-backup-job abc123" in command
-    assert command.startswith('"')  # the interpreter path is quoted
+    assert command.startswith('"C:\\Program Files\\Python\\python.exe" ')  # quoted
+    monkeypatch.setattr(scheduler.sys, "executable", "C:\\Python\\python.exe")
+    assert backup_utils.job_command("abc123").startswith("C:\\Python\\python.exe ")  # not
 
 
 def test_schtasks_args_for_a_daily_job():
