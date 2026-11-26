@@ -8,7 +8,8 @@
 # Injection points, all on the OWNING modules: utils.jobs_store.JOBS_FILE (and
 # its datetime / os.rename for the clock and the failing rename) and
 # utils.scheduler._run (so no real schtasks ever runs; the stub also fails the
-# test if anything but a /query is attempted). The GUI tests drive a real
+# test if anything but a /query is attempted), with utils.scheduler.sys swapped
+# so the schtasks branch is the one taken on every OS. The GUI tests drive a real
 # BackupTab and a real ConfirmDialog (only exec() is replaced, to press a
 # button), offscreen, with no QSettings. Absence assertions on widgets use
 # isHidden() -- an explicit flag -- and each is paired with a case where the same
@@ -16,6 +17,7 @@
 import os
 import re
 import sys
+import types
 from datetime import datetime
 
 import pytest
@@ -209,13 +211,25 @@ SCHTASKS_CSV = "\r\n".join([
 ])
 
 
-def stub_run(monkeypatch, result):
-    """Replace scheduler._run; return the list of argument lists it received."""
+def on_platform(monkeypatch, platform):
+    """Make utils.scheduler take its `platform` branch, whatever OS runs the test.
+
+    `list_scheduled_tasks` picks launchd or schtasks from `sys.platform`; without
+    this, a schtasks stub is never reached on macOS and the real (empty) launchd
+    listing answers instead. Only the owning module's `sys` is swapped, so Qt and
+    everything else still see the real platform."""
+    monkeypatch.setattr(scheduler, "sys", types.SimpleNamespace(platform=platform,
+                                                                executable=sys.executable))
+
+
+def stub_run(monkeypatch, result, platform="win32"):
+    """Replace scheduler._run on the given branch; return the argument lists it got."""
     calls = []
 
     def fake(args):
         calls.append(list(args))
         return result
+    on_platform(monkeypatch, platform)
     monkeypatch.setattr(scheduler, "_run", fake)
     return calls
 
@@ -254,9 +268,8 @@ def test_the_macos_listing_reads_launch_agents_by_prefix(tmp_path, monkeypatch):
                  "com.techcabana.utilitytool.backup.99ff00aa.plist",
                  "com.apple.something.plist", "com.techcabana.safekeep.backup.x.txt"):
         (agents / name).write_text("x")
-    monkeypatch.setattr(scheduler.sys, "platform", "darwin")
     monkeypatch.setattr(scheduler.os.path, "expanduser", lambda p: str(tmp_path))
-    stub_run(monkeypatch, (False, "the macOS branch must not call schtasks"))
+    stub_run(monkeypatch, (False, "the macOS branch must not call schtasks"), platform="darwin")
 
     names, error = scheduler.list_scheduled_tasks()
 
@@ -284,6 +297,7 @@ def scheduler_calls(monkeypatch):
         calls.append(list(args))
         assert args[:2] == ["schtasks", "/query"], f"the scheduler was modified: {args}"
         return True, SCHTASKS_CSV
+    on_platform(monkeypatch, "win32")
     monkeypatch.setattr(scheduler, "_run", fake)
     return calls
 
@@ -392,7 +406,7 @@ def test_cancelling_changes_nothing(tab, jobs_file):
 
 def test_a_scheduler_that_cannot_be_listed_is_said_so_and_does_not_stop_the_action(
         tab, jobs_file, monkeypatch):
-    monkeypatch.setattr(scheduler, "_run", lambda args: (False, "ERROR: Access is denied."))
+    stub_run(monkeypatch, (False, "ERROR: Access is denied."))
     jobs_file.write_bytes(b"damaged")
     tab.refresh_backup()
 
