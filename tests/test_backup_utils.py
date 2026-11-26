@@ -11,7 +11,9 @@
 # would leave one behind on the machine running the suite.
 import json
 import os
+import sys
 import time
+import types
 
 import pytest
 
@@ -353,10 +355,15 @@ def test_unregister_and_exists_target_the_legacy_task_only_when_asked(monkeypatc
         "UtilityTool_Backup_abc", "UtilityTool_Backup_abc", "Safekeep_Backup_abc"]
 
 
-def test_job_command_invokes_the_headless_cli_flag():
+def test_job_command_invokes_the_headless_cli_flag(monkeypatch):
+    # The interpreter is pinned to a path with a space: job_command quotes a
+    # part only when it contains one, and a CI runner's interpreter path has none.
+    monkeypatch.setattr(scheduler.sys, "executable", "C:\\Program Files\\Python\\python.exe")
     command = backup_utils.job_command("abc123")
     assert "--run-backup-job abc123" in command
-    assert command.startswith('"')  # the interpreter path is quoted
+    assert command.startswith('"C:\\Program Files\\Python\\python.exe" ')  # quoted
+    monkeypatch.setattr(scheduler.sys, "executable", "C:\\Python\\python.exe")
+    assert backup_utils.job_command("abc123").startswith("C:\\Python\\python.exe ")  # not
 
 
 def test_schtasks_args_for_a_daily_job():
@@ -381,6 +388,7 @@ def test_schtasks_args_is_none_for_a_manual_job():
     assert backup_utils.schtasks_args(job) is None
 
 
+@pytest.mark.skipif(os.name != "nt", reason="the schtasks branch of register_task runs on Windows only")
 def test_register_task_removes_any_task_for_a_job_switched_to_manual(monkeypatch):
     removed = []
     monkeypatch.setattr(scheduler, "unregister_task",
@@ -389,6 +397,34 @@ def test_register_task_removes_any_task_for_a_job_switched_to_manual(monkeypatch
     ok, message = backup_utils.register_task(job)
     assert ok is True
     assert removed == [job["id"]]
+    assert "Run Now" in message
+
+
+def test_register_task_on_macos_removes_the_launchd_agent_for_a_job_switched_to_manual(monkeypatch):
+    """The same promise as above on the launchd branch. `scheduler.sys` is swapped
+    for a stand-in that says darwin, so this runs (and can fail) on every OS, and the
+    launchd call that would reach `launchctl` is replaced by a recorder."""
+    removed = []
+    monkeypatch.setattr(scheduler, "sys", types.SimpleNamespace(platform="darwin",
+                                                                executable=sys.executable))
+    monkeypatch.setattr(scheduler, "_launchd_unregister",
+                        lambda job_id, legacy=False: removed.append(job_id) or (True, ""))
+    job = backup_utils.new_job("n", "s", "t", schedule="manual")
+    ok, message = backup_utils.register_task(job)
+    assert ok is True
+    assert removed == [job["id"]]
+    assert "Run Now" in message
+
+
+@pytest.mark.skipif(os.name == "nt" or sys.platform == "darwin",
+                    reason="the no-scheduler branch is for platforms other than Windows and macOS")
+def test_register_task_without_a_scheduler_reports_failure_and_removes_nothing(monkeypatch):
+    removed = []
+    monkeypatch.setattr(scheduler, "unregister_task",
+                        lambda job_id: removed.append(job_id) or (True, ""))
+    job = backup_utils.new_job("n", "s", "t", schedule="manual")
+    ok, message = backup_utils.register_task(job)
+    assert ok is False and removed == []
     assert "Run Now" in message
 
 

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from helpers import app_data_dir
 from utils import backup_utils, jobs_store, locks, preflight
 
 REPO = Path(__file__).resolve().parent.parent
@@ -392,7 +393,7 @@ def test_jobs_file_lock_is_released_even_when_the_save_fails(monkeypatch, isolat
 
 def test_cli_exits_4_when_the_job_is_already_running_and_records_nothing(tmp_path):
     appdata = tmp_path / "appdata"
-    data = appdata / "Safekeep"
+    data = app_data_dir(appdata)
     data.mkdir(parents=True)
     job = backup_utils.new_job("j", str(tmp_path / "nosuch-src"), str(tmp_path / "dst"),
                                schedule="manual")

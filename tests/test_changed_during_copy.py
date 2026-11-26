@@ -62,9 +62,16 @@ def job(tmp_path):
 
 # --- ways of changing a file --------------------------------------------------------
 
-def _bump_mtime(path, seconds=2):
-    """Move `path`'s modified time forward without touching its bytes."""
-    info = os.stat(long_path(path))
+def _bump_mtime(path, seconds=2, since=None):
+    """Set `path`'s modified time `seconds` past `since` (a stat taken BEFORE the
+    change; default: `path` as it is now), without touching its bytes.
+
+    From the earlier stat, never from the clock: a write or a create stamps the
+    time of the OS's clock tick (15.6 ms on a machine nothing has asked for a
+    finer timer, like a hosted CI runner), so "write, then now + 2 s" gave two
+    changes within one tick the SAME mtime and the second one was invisible
+    (windows-latest, Python 3.12, run 45840873240)."""
+    info = since or os.stat(long_path(path))
     os.utime(long_path(path), ns=(info.st_atime_ns, info.st_mtime_ns + seconds * 10 ** 9))
 
 
@@ -97,28 +104,50 @@ def change_mtime_one_tick(path):
 
 def change_content_same_size(path):
     """Same size, different bytes, later mtime: an in-place rewrite."""
+    info = os.stat(long_path(path))
     with open(long_path(path), "r+b") as handle:
         first = handle.read(1)
         handle.seek(0)
         handle.write(b"Z" if first != b"Z" else b"Y")
-    _bump_mtime(path)
+    _bump_mtime(path, since=info)
 
 
 def change_by_rename(path):
     """Replace the file by renaming a same-size, different-mtime file over it
     (an editor's save): the open-handle view and the path now name different files."""
     temp = path + ".swap"
+    info = os.stat(long_path(path))
     with open(long_path(path), "rb") as handle:
         data = handle.read()
     with open(long_path(temp), "wb") as handle:
         handle.write(data[::-1])
-    _bump_mtime(temp)
+    _bump_mtime(temp, since=info)
     os.replace(long_path(temp), long_path(path))
 
 
 CHANGES = {"size": change_size, "mtime": change_mtime_only, "tick": change_mtime_one_tick,
            "size_keep_mtime": change_size_keeping_mtime,
            "content": change_content_same_size, "rename": change_by_rename}
+
+
+def signature(path):
+    """`(size, mtime_ns)` by path, the way `_hash_copy` compares the source."""
+    info = os.stat(long_path(path))
+    return info.st_size, info.st_mtime_ns
+
+
+def changed_by(how, path, log):
+    """Apply `how` to `path` and check it really changed the signature.
+
+    A change that leaves `(size, mtime_ns)` as it was cannot be detected by
+    design, so a "not flagged" after it would blame the code for the test. Fail
+    here instead, saying so, and keep `(before, after)` in `log` for the
+    assertion messages below."""
+    before = signature(path)
+    how(path)
+    after = signature(path)
+    log.append((os.path.basename(path), how.__name__, before, after))
+    assert after != before, f"{how.__name__} did not change the signature: {log}"
 
 
 class Meddler:
@@ -131,6 +160,7 @@ class Meddler:
     def __init__(self, monkeypatch, plan, how=change_size, after=None):
         self.attempts = {}
         self.hooked = {}
+        self.log = []      # what each change did to the signature; shown on a failure
         real = copying._hash_copy
 
         def watched(src, dst):
@@ -142,7 +172,7 @@ class Meddler:
             name = os.path.basename(src)
             self.hooked[name] = self.hooked.get(name, 0) + 1
             if self.hooked[name] <= plan.get(name, 0):
-                how(src)
+                changed_by(how, src, self.log)
                 if after is not None:
                     after(name, self.hooked[name])
 
@@ -233,7 +263,7 @@ def test_a_file_that_changes_on_the_retry_too_is_named_as_changed_during_the_bac
     assert entry["sha256"] == sha_of(stored_bytes(job, result, VICTIM))   # the bytes that were read
     assert [e for e in manifest_files(result).values() if "changed" in e] == [entry]
     # Not a plain ok anywhere it is stored: the job carries the flag and its names ...
-    assert stored["last_result"] == "ok"                      # readers of last_result keep working
+    assert stored["last_result"] == "ok_changed"              # the real outcome word (card C5HuzNVK)
     assert stored["last_changed"] == 1 and stored["last_changed_sample"] == [VICTIM]
     # ... and the run log says ok_changed, with counts and no path.
     line = run_log(job)[-1]
@@ -259,9 +289,12 @@ def test_every_kind_of_change_is_detected(job, monkeypatch, how):
     meddler = Meddler(monkeypatch, {VICTIM: 99}, how=CHANGES[how])
     result = backup_utils.run_job(job)
 
-    assert result["ok"] and result["changed"] == 1, (how, result["message"])
+    assert result["ok"] and result["changed"] == 1, (how, result["message"], meddler.log)
     assert meddler.attempts[VICTIM] == 2
     assert manifest_files(result)[VICTIM]["changed"] is True
+    # Each attempt's change gave the file a signature it had not had before.
+    signatures = [entry[2] for entry in meddler.log] + [meddler.log[-1][3]]
+    assert len(set(signatures)) == len(signatures), meddler.log
 
 
 @pytest.mark.parametrize("how", sorted(CHANGES))
@@ -282,10 +315,11 @@ def test_a_stable_file_is_never_flagged_and_the_same_path_can_say_both(tmp_path,
     size, mtime, sha = clean                                   # still the three values it always was
     assert clean.changed is False and size == 5000 and sha == sha_of(b"x" * 5000)
 
+    log = []
     for how in CHANGES.values():                               # the very same code path, now changed
-        monkeypatch.setattr(copying, "_after_read", lambda p, how=how: how(p))
+        monkeypatch.setattr(copying, "_after_read", lambda p, how=how: changed_by(how, p, log))
         moved = copying._hash_copy(str(src), str(dst))
-        assert moved.changed is True
+        assert moved.changed is True, (how.__name__, tuple(moved), log)
         monkeypatch.undo()
 
     # A whole run over files nothing touches flags nothing and copies each file once.
@@ -448,7 +482,7 @@ def test_skipped_and_changed_in_one_run_are_both_stored_logged_and_said(job, mon
     assert result["ok"] and result["not_copied"] == 1 and result["changed"] == 1
     assert "could not be read and were skipped" in result["message"]
     assert "changed during backup" in result["message"]
-    assert stored["last_result"] == "ok"
+    assert stored["last_result"] == "ok_skipped"              # skipped outranks changed (card C5HuzNVK)
     assert stored["last_skipped"] == 1 and stored["last_changed"] == 1
     assert stored["last_skipped_sample"] == ["a01.txt"] and stored["last_changed_sample"] == [VICTIM]
     line = run_log(job)[-1]
@@ -474,7 +508,11 @@ def test_the_stored_sample_is_capped_at_five_relative_paths(tmp_path, monkeypatc
     for name in stored["last_changed_sample"]:
         assert not os.path.isabs(name) and ":" not in name and "\\" not in name
         assert name in TOP or name.startswith("sub/")
-    assert str(tmp_path) not in open(jobs_store.JOBS_FILE, encoding="utf-8").read()
+    # The sample field holds names only. (Not the whole jobs file: it also stores the
+    # job's own source and target, which sit under tmp_path -- and on Windows the file
+    # escapes every backslash, so a raw `str(tmp_path) in file text` never matched.)
+    assert not any(str(tmp_path) in name
+                   for name in stored["last_changed_sample"] + result["changed_sample"])
 
 
 def test_a_failed_run_stores_no_changed_files(job, monkeypatch):

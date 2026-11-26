@@ -12,6 +12,7 @@
 import errno
 import hashlib
 import os
+import types
 
 import pytest
 
@@ -364,8 +365,10 @@ def test_a_restore_whose_destination_fills_up_fails_and_removes_its_folder(
     assert os.listdir(out) == []  # the half-restored folder is gone
 
 
-def test_a_restore_into_an_earlier_restore_folder_leaves_it_and_says_so(
+def test_a_failed_restore_beside_an_earlier_restore_leaves_that_one_alone(
         tree, tmp_path, monkeypatch):
+    # Card 5AJTFrRx: the failed restore had a folder of its own (`-2`) and removes
+    # it; the earlier restore (and the user's notes in it) is never written to.
     job, _, _ = tree
     version = backup_utils.run_job(job)["version"]
     out = tmp_path / "out"
@@ -378,7 +381,8 @@ def test_a_restore_into_an_earlier_restore_folder_leaves_it_and_says_so(
     result = backup_utils.restore_version(job, version, str(out))
 
     assert result["ok"] is False and result["cause"] == "no_space"
-    assert "may now be incomplete" in result["message"]
+    assert "The incomplete restore folder was removed" in result["message"]
+    assert os.listdir(out) == [os.path.basename(folder)]        # only its own folder went
     assert (out / os.path.basename(folder) / "my notes.txt").read_text(
         encoding="utf-8") == "mine"
 
@@ -413,3 +417,59 @@ def test_a_missing_path_is_called_too_long_only_near_the_extended_limit():
     assert backup_utils.TargetWriteFailed(past_max_path, error).cause == "target_unavailable"
     assert backup_utils.TargetWriteFailed(near_limit, error).cause == "path_too_long"
     assert backup_utils.TargetWriteFailed("C:\\d\\f.bin", error).cause == "target_unavailable"
+
+
+def _os_error(code, winerror):
+    """An OSError as Windows raises it (`winerror` set) or as POSIX does (None)."""
+    error = OSError(code, "the OS says no")
+    if winerror is not None:
+        error.winerror = winerror
+    return error
+
+
+NEAR_LIMIT = "C:\\" + "\\".join(["d" * 100] * 324) + "\\f.bin"     # 32,7xx characters
+SHORT = "C:\\" + "d" * 300 + "\\f.bin"                              # past MAX_PATH only
+
+
+@pytest.mark.parametrize("code, winerror, short_cause", [
+    # The GitHub windows-latest runner answers a path past the limit like this.
+    pytest.param(errno.EINVAL, 123, "target_write_failed", id="ERROR_INVALID_NAME"),
+    pytest.param(errno.ENOENT, 3, "target_unavailable", id="ERROR_PATH_NOT_FOUND"),
+    pytest.param(errno.ENOENT, 206, "path_too_long", id="ERROR_FILENAME_EXCED_RANGE"),
+    pytest.param(errno.ENOENT, None, "target_unavailable", id="ENOENT"),
+    pytest.param(errno.EINVAL, None, "target_write_failed", id="EINVAL"),
+    pytest.param(errno.ENAMETOOLONG, None, "path_too_long", id="ENAMETOOLONG"),
+])
+def test_every_way_windows_refuses_a_path_at_its_limit_is_called_too_long(
+        monkeypatch, code, winerror, short_cause):
+    # Which error Windows gives for a path it cannot hold depends on the build:
+    # ENOENT on the dev machine, ERROR_INVALID_NAME on the CI runner, which the
+    # run then reported as an unexplained "could not write". The owning module's
+    # `os` says "nt" so the Windows rule runs (and can fail) on every OS.
+    monkeypatch.setattr(copying, "os", types.SimpleNamespace(name="nt", path=os.path))
+    assert 32_700 < len(NEAR_LIMIT) < 32_767
+    near = backup_utils.TargetWriteFailed(NEAR_LIMIT, _os_error(code, winerror))
+    assert near.cause == "path_too_long"
+    assert str(near).startswith("A file path is too long for the backup drive")
+    # The same error at a short path is still what it is.
+    assert backup_utils.TargetWriteFailed(SHORT, _os_error(code, winerror)).cause == short_cause
+
+
+@pytest.mark.parametrize("winerror", [21, 53, 64, 67, 5, 112])
+def test_a_deep_path_does_not_relabel_a_drive_that_went_away_or_said_something_else(
+        monkeypatch, winerror):
+    # Only the codes in LONG_PATH_ERRORS mean "too long" at the limit; a drive
+    # that is not ready or a network path that dropped is still that, at any
+    # depth, even when its errno looks like ENOENT.
+    monkeypatch.setattr(copying, "os", types.SimpleNamespace(name="nt", path=os.path))
+    error = _os_error(errno.ENOENT, winerror)
+    expected = backup_utils.TargetWriteFailed(SHORT, error).cause
+    assert expected != "path_too_long"
+    assert backup_utils.TargetWriteFailed(NEAR_LIMIT, error).cause == expected
+
+
+def test_a_path_at_the_limit_is_only_relabelled_on_windows(monkeypatch):
+    # POSIX names a too-long path itself (ENAMETOOLONG); EINVAL there is not length.
+    monkeypatch.setattr(copying, "os", types.SimpleNamespace(name="posix", path=os.path))
+    error = _os_error(errno.EINVAL, None)
+    assert backup_utils.TargetWriteFailed(NEAR_LIMIT, error).cause == "target_write_failed"

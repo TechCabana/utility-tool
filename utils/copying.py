@@ -13,7 +13,7 @@ import os
 import shutil
 import stat
 import time
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from utils.fs_utils import (_is_link_like, is_legacy_profile_link, long_path,
                             plain_error, relative_to, remove_file)
@@ -47,6 +47,18 @@ _ERRNO_CAUSES = {errno.ENOSPC: "no_space", errno.ENAMETOOLONG: "path_too_long",
                  errno.EFBIG: "file_too_large", errno.ENOENT: "target_unavailable",
                  getattr(errno, "ESTALE", -1): "target_unavailable",
                  errno.EACCES: "no_permission", errno.EPERM: "no_permission"}
+# How Windows answers a path it cannot hold at its ~32,767-character limit,
+# even in the extended-length form: which code depends on the build and the
+# call. Measured: ERROR_PATH_NOT_FOUND / ENOENT on Windows 11 (dev machine),
+# ERROR_INVALID_NAME (123, errno EINVAL) on the GitHub windows-latest runner.
+# Read as "too long" ONLY at a path of LONG_PATH_ERROR_FROM characters or more;
+# at a shorter path each keeps its own cause (a vanished drive stays
+# target_unavailable, a bad character stays target_write_failed). The winerror
+# decides when there is one, so a drive that went away (21, 53, 64, 67) is not
+# relabelled even at a deep path.
+LONG_PATH_ERRORS = {"winerror": frozenset({3, 123, 206}),
+                    "errno": frozenset({errno.ENOENT, errno.EINVAL, errno.ENAMETOOLONG})}
+LONG_PATH_ERROR_FROM = 32_000
 
 
 class TargetWriteFailed(Exception):
@@ -66,16 +78,18 @@ class TargetWriteFailed(Exception):
     def __init__(self, path: str, error: OSError):
         """Classify `error`, raised while writing destination `path`."""
         self.path, self.error = path, error
-        cause = (_WINERROR_CAUSES.get(getattr(error, "winerror", None))
+        winerror = getattr(error, "winerror", None)
+        cause = (_WINERROR_CAUSES.get(winerror)
                  or _ERRNO_CAUSES.get(error.errno) or "target_write_failed")
-        # ponytail: Windows reports a path it cannot hold as a plain ENOENT
-        # near 32,767 characters even in the extended-length form every engine
-        # call now uses (measured: a folder from ~32,762, a file at 32,767), so
-        # length decides there. Not at MAX_PATH any more: a 300-character path
-        # is writable, so ENOENT on one means the drive went away, and calling
-        # it "too long" listed innocent files as offenders. Mislabels a drive
-        # that vanished at a >=32,000 path; the run still fails either way.
-        if cause == "target_unavailable" and os.name == "nt" and len(path) >= 32_000:
+        # ponytail: near 32,767 characters Windows names no length error (see
+        # LONG_PATH_ERRORS), so length decides there. Not at MAX_PATH any more:
+        # a 300-character path is writable, so ENOENT on one means the drive
+        # went away, and calling it "too long" listed innocent files as
+        # offenders. Mislabels a drive that vanished with ERROR_PATH_NOT_FOUND
+        # at a >=32,000 path; the run still fails either way.
+        if os.name == "nt" and len(path) >= LONG_PATH_ERROR_FROM and (
+                winerror in LONG_PATH_ERRORS["winerror"] if winerror is not None
+                else error.errno in LONG_PATH_ERRORS["errno"]):
             cause = "path_too_long"
         self.cause = cause
         super().__init__(self.reason("backup drive"))
@@ -250,12 +264,13 @@ def _open_for_write(dst: str):
     """Open `dst` for writing, replacing a read-only or hidden file there.
 
     Windows refuses to truncate a file that is read-only, hidden or system
-    (PermissionError). A fresh `.partial` never holds one, but a restore into
-    a folder an earlier restore filled does: that restore carried those
-    attributes over from the source, so without this a second restore of any
-    folder holding a git repo or a desktop.ini failed outright. Clear them
-    and try once more -- `_hash_copy` puts the source's attributes back when
-    the copy finishes. Any other failure, or a second one, propagates.
+    (PermissionError). A fresh `.partial` never holds one, but a backup's
+    re-copy of a file that changed while it was read overwrites its own first
+    copy, which `copystat` made read-only. Clear the marks and try once more --
+    `_hash_copy` puts the source's attributes back when the copy finishes. Any
+    other failure, or a second one, propagates. A restore never gets here: its
+    folder is created fresh (`versions._claim_restore_folder`), so nothing is
+    in the way and nothing the user holds is replaced.
     """
     try:
         return open(dst, "wb")
@@ -408,7 +423,8 @@ def copy_tree(source: str, destination: str,
               on_copied: Optional[Callable[[str, int, float, str], None]] = None,
               stats: Optional[Dict[str, int]] = None,
               retry_skipped: bool = False,
-              recopy_changed: bool = False
+              recopy_changed: bool = False,
+              only: Optional[Set[str]] = None
               ) -> Tuple[int, int, List[str]]:
     """Copy `source` into `destination`, reporting `(done, total)` per file.
 
@@ -478,8 +494,22 @@ def copy_tree(source: str, destination: str,
     is skipped without the retry pass trying it again. The count, the manifest
     line, the progress step and the byte total are made once per file, after
     its last copy, never per attempt.
+
+    With `only` (the test restore, card 0Bv7mvB3: a SAMPLE of a version), just
+    the files whose relative path (forward slashes, the manifest's form) is in
+    the set are copied, through the same `copy_one`, and only the folders on
+    the way to them are entered. The whole-tree completeness rule below does
+    not apply: the expected count is `len(only)`, and a named file the source
+    does not hold is simply not copied -- the caller, which knows what it
+    asked for, reports it. A source that can no longer be listed still raises
+    SourceUnavailable.
     """
-    total = tree_totals(source)[0]
+    total = len(only) if only is not None else tree_totals(source)[0]
+    # Every folder that holds a wanted file, so the walk enters only those.
+    wanted_dirs: Set[str] = set()
+    for wanted in only or ():
+        parts = wanted.split("/")[:-1]
+        wanted_dirs.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
     state = {"done": 0, "bytes": 0, "recopied": 0}
     errors: List[str] = []
     # (source file, its destination, its index in `errors`) per skipped file.
@@ -603,11 +633,15 @@ def copy_tree(source: str, destination: str,
             is_file = False
             try:
                 if _is_link_like(entry):
-                    note_link(entry, src)
+                    if only is None:
+                        note_link(entry, src)
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    copy_dir(src, dst)
+                    if only is None or relative_to(src, source).replace("\\", "/") in wanted_dirs:
+                        copy_dir(src, dst)
                 else:
+                    if only is not None and relative_to(src, source).replace("\\", "/") not in only:
+                        continue
                     is_file = True
                     copy_one(src, dst)
             except OSError as exc:
@@ -650,7 +684,7 @@ def copy_tree(source: str, destination: str,
     # A copy holding NOTHING is never a backup, whatever the floor says: a
     # two-file source with both files locked is under SHORTFALL_MIN_FILES,
     # and promoting its empty copy as "verified" pruned the last real one.
-    if not state["done"] or (missing >= SHORTFALL_MIN_FILES
-                             and missing > SHORTFALL_TOLERANCE * total):
+    if only is None and (not state["done"] or (missing >= SHORTFALL_MIN_FILES
+                                               and missing > SHORTFALL_TOLERANCE * total)):
         raise SourceUnavailable(source, state["done"], total, "source_incomplete")
     return state["done"], state["bytes"], errors

@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from helpers import app_data_dir
 from utils import backup_utils, copying, jobs_store, locks, preflight, runner
 from utils.fs_utils import plain_path
 
@@ -78,11 +79,12 @@ def set_attributes(path, attributes: int) -> None:
 # Restore twice into the same folder
 # ---------------------------------------------------------------------------
 
-def test_a_second_restore_overwrites_read_only_and_hidden_files(tree, tmp_path):
+def test_a_second_restore_with_read_only_and_hidden_files_keeps_the_first_and_succeeds(tree, tmp_path):
     """Windows refuses to truncate a read-only file (every git repo has them)
     or a hidden one (desktop.ini). Through `_hash_copy` that refusal was a
     destination failure, so the whole second restore aborted with "No
-    permission to write to the destination drive"."""
+    permission to write to the destination drive". Since card 5AJTFrRx the
+    second restore does not write into the first folder at all."""
     job, source, _ = tree
     os.chmod(source / "file00.bin", 0o444)
     if os.name == "nt":
@@ -108,14 +110,36 @@ def test_a_second_restore_overwrites_read_only_and_hidden_files(tree, tmp_path):
 
     again = backup_utils.restore_version(job, version, str(out))
 
+    # Card 5AJTFrRx: the second restore no longer rewrites the first folder (the
+    # edits above survive); it lands in a folder of its own, with the source's
+    # attributes on its copies.
     assert again["ok"], again["message"]
+    assert again["path"] == first["path"] + "-2"
     assert again["files"] == FILES and again["errors"] == []
     assert tree_hashes(again["path"]) == tree_hashes(source)
-    # The rewritten copies carry the source's attributes again.
+    for name in ("file00.bin", "file01.bin"):
+        with open(os.path.join(first["path"], name), "rb") as handle:
+            assert handle.read() == b"edited since the first restore"
     assert not os.access(os.path.join(again["path"], "file00.bin"), os.W_OK)
     if os.name == "nt":
         attributes = os.stat(os.path.join(again["path"], "file01.bin")).st_file_attributes
         assert attributes & 0x6 == 0x6
+
+
+def test_a_copy_over_a_read_only_hidden_file_still_works_for_the_backup_side(tmp_path):
+    """`copying._open_for_write` no longer serves restore (a restore folder is
+    always new), but the backup's re-copy of a file that changed while it was
+    read does overwrite its own first copy, which `copystat` made read-only and
+    hidden. That path is still needed, so it is still covered."""
+    from utils import copying
+    src, dst = tmp_path / "src.bin", tmp_path / "dst.bin"
+    src.write_bytes(b"new bytes")
+    dst.write_bytes(b"old bytes")
+    os.chmod(dst, 0o444)
+    if os.name == "nt":
+        set_attributes(dst, 0x1 | 0x2 | 0x4)
+    copying._hash_copy(str(src), str(dst))
+    assert dst.read_bytes() == b"new bytes"
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +324,7 @@ def test_cli_reports_a_result_it_could_not_record_instead_of_a_traceback(tmp_pat
     JobsFileCorrupt, so the scheduled task died with a traceback and never
     printed the run's own outcome."""
     appdata = tmp_path / "appdata"
-    data = appdata / "Safekeep"
+    data = app_data_dir(appdata)
     data.mkdir(parents=True)
     job = backup_utils.new_job("j", str(tmp_path / "nosuch-src"), str(tmp_path / "dst"),
                                schedule="manual")

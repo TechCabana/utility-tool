@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from helpers import app_data_dir
 from utils import backup_utils, jobs_store, locks, preflight, runlog, runner, verify
 from utils.fs_utils import short_when
 
@@ -41,11 +42,11 @@ def shared_appdata(tmp_path, monkeypatch):
     """A fresh app-data root shared by this process and any child process.
 
     The child gets it as APPDATA (its jobs file, locks and logs land under
-    `<root>/Safekeep`); this process is pointed at the same three places, so
+    the app-data folder under `<root>`); this process is pointed at the same three places, so
     what the child leaves behind is what the assertions read.
     """
     root = tmp_path / "appdata"
-    data = root / "Safekeep"
+    data = app_data_dir(root)
     (data / "locks").mkdir(parents=True)
     monkeypatch.setattr(jobs_store, "JOBS_FILE", str(data / "backup_jobs.json"))
     monkeypatch.setattr(jobs_store, "_locks_dir", lambda: str(data / "locks"))
@@ -113,7 +114,10 @@ def kill_tree(pid):
     if IS_WINDOWS:
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
     else:
-        os.kill(pid, 9)
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass                                    # already gone (and reaped): the aim
 
 
 def wait_gone(pid, seconds=15.0):
@@ -121,6 +125,14 @@ def wait_gone(pid, seconds=15.0):
     end = time.monotonic() + seconds
     while locks.pid_alive(pid):
         assert time.monotonic() < end, f"process {pid} did not exit"
+        if not IS_WINDOWS:
+            # A killed CHILD stays a zombie until its parent reaps it, and a zombie
+            # still answers `kill(pid, 0)`: reap it here (a non-child, or one already
+            # reaped by `Popen.wait`, raises ChildProcessError: nothing to do).
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
         time.sleep(0.05)
 
 
@@ -352,7 +364,7 @@ def test_record_run_clears_the_marker_for_every_kind_of_outcome(tmp_path, monkey
     final = stored(job)
     assert "running" not in final
     assert final["last_result"].startswith({"ok": "ok", "failed": "failed",
-                                            "cancelled": "failed: Backup cancelled"}[how])
+                                            "cancelled": "cancelled"}[how])
 
 
 @pytest.mark.parametrize("error", [RuntimeError("boom"), KeyboardInterrupt()])

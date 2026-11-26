@@ -33,6 +33,17 @@ def isolated_jobs_file(tmp_path, monkeypatch):
     yield
 
 
+def _is_junction(path):
+    """`os.path.isjunction` (Python 3.12+), or the same test by reparse tag
+    (0xA0000003, the mount-point tag) on older Pythons; False off Windows."""
+    if hasattr(os.path, "isjunction"):
+        return os.path.isjunction(path)
+    try:
+        return os.lstat(path).st_reparse_tag == 0xA0000003
+    except (AttributeError, OSError):
+        return False
+
+
 def _snapshot(folder):
     """`{relative path: size}` of every file under `folder`, never entering a link."""
     found = {}
@@ -41,7 +52,7 @@ def _snapshot(folder):
     for current, dirs, files in os.walk(folder):
         dirs[:] = [d for d in dirs
                    if not (os.path.islink(os.path.join(current, d))
-                           or os.path.isjunction(os.path.join(current, d)))]
+                           or _is_junction(os.path.join(current, d)))]
         for name in files:
             path = os.path.join(current, name)
             found[os.path.relpath(path, folder)] = os.path.getsize(path)
@@ -85,7 +96,11 @@ class Linker:
         """Remove every link itself; return the targets that changed."""
         for link, is_dir in reversed(self.made):
             try:
-                (os.rmdir if is_dir else os.unlink)(link)
+                # A Windows folder link (junction or folder symlink) goes with rmdir; a
+                # POSIX symlink -- to a folder too -- is a file entry that only unlink
+                # removes (rmdir raises NotADirectoryError and left the link behind).
+                # Both act on the link itself, never on what it points at.
+                (os.rmdir if is_dir and os.name == "nt" else os.unlink)(link)
             except OSError:
                 pass
         return [t for t, before in self.guard.items() if _snapshot(t) != before]
@@ -183,7 +198,7 @@ def test_a_junction_is_named_as_not_followed_and_its_contents_stay_out_of_the_ve
         backup_utils.version_path(job, result["version"]), "Photos"))
     # A link is not a file: the file count the sanity rules use is unchanged.
     assert result["files"] == len(REAL) and result["errors"] == [] and result["not_copied"] == 0
-    assert stored["last_result"] == "ok"
+    assert stored["last_result"] == "ok_links"                    # the real outcome word (card C5HuzNVK)
     assert stored["last_links"] == 1 and stored["last_links_sample"] == ["Photos"]
 
 
@@ -674,7 +689,7 @@ def test_skipped_changed_and_shortcuts_in_one_run_are_all_stored_logged_and_said
 
     assert result["ok"] and result["not_copied"] == 1 and result["changed"] == 1
     assert result["links_skipped"] == 1                          # once, though the retry pass ran
-    assert stored["last_result"] == "ok"
+    assert stored["last_result"] == "ok_skipped"                 # the highest-ranked word (card C5HuzNVK)
     assert (stored["last_skipped"], stored["last_changed"], stored["last_links"]) == (1, 1, 1)
     line = run_log(job)[-1]
     assert (line["outcome"], line["skipped"], line["changed"], line["links"]) == ("ok_skipped", 1, 1, 1)

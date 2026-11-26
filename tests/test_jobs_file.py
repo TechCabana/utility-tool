@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from helpers import app_data_dir
 from utils import backup_utils, jobs_store
 
 REPO = Path(__file__).resolve().parent.parent
@@ -233,8 +234,8 @@ def _run_cli(appdata, *args):
 
 def test_cli_exits_3_with_an_error_on_a_corrupt_jobs_file(tmp_path):
     appdata = tmp_path / "appdata"
-    (appdata / "Safekeep").mkdir(parents=True)
-    jobs = appdata / "Safekeep" / "backup_jobs.json"
+    app_data_dir(appdata).mkdir(parents=True)
+    jobs = app_data_dir(appdata) / "backup_jobs.json"
     jobs.write_text('[{"id": "abc"', encoding="utf-8")
     before = jobs.read_bytes()
 
@@ -253,6 +254,6 @@ def test_cli_exits_3_with_an_error_on_a_corrupt_jobs_file(tmp_path):
 
 def test_cli_unknown_job_still_exits_2(tmp_path):
     appdata = tmp_path / "appdata"
-    (appdata / "Safekeep").mkdir(parents=True)
-    (appdata / "Safekeep" / "backup_jobs.json").write_text("[]", encoding="utf-8")
+    app_data_dir(appdata).mkdir(parents=True)
+    (app_data_dir(appdata) / "backup_jobs.json").write_text("[]", encoding="utf-8")
     assert _run_cli(appdata, "--run-backup-job", "nope").returncode == 2

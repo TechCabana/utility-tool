@@ -480,9 +480,20 @@ def test_a_path_too_long_failure_lists_every_file_at_least_that_long(tmp_path, m
     job = make_job(tmp_path, {})
     long_a, long_b = copy_path_name(job, 240, "a"), copy_path_name(job, 245, "b")
     short = copy_path_name(job, 200, "s")
-    for name in (long_a, long_b, short):
+    length = {long_a: 240, long_b: 245, short: 200}
+    for name in length:
         with open(_x(Path(job["source"]) / name), "wb") as handle:
             handle.write(b"x")
+    base = os.path.join(os.path.abspath(job["target"]), job["id"], "20000101-000000.partial")
+
+    # The contract, called directly so both refusal orders are always exercised:
+    # the refused path is the measured limit, so every file at least that long is
+    # listed (not only the refused one), and a shorter one is not.
+    def listed(name):
+        return sorted(precheck.offenders(job, "path_too_long", os.path.join(base, name))["paths"])
+    assert listed(long_a) == sorted([long_a, long_b])
+    assert listed(long_b) == [long_b]
+
     real = copying._hash_copy
     refused = []
 
@@ -496,12 +507,18 @@ def test_a_path_too_long_failure_lists_every_file_at_least_that_long(tmp_path, m
 
     result = backup_utils.run_job(job)
 
+    # Which long file the run meets first is the source folder's listing order
+    # (by name on NTFS, not on APFS -- the macOS runner met the 245 one first),
+    # so the expected list is derived from the path the drive actually refused.
     assert refused and result["ok"] is False and result["cause"] == "path_too_long"
-    assert sorted(result["offenders"]) == sorted([long_a, long_b])
-    assert long_a in result["message"] and long_b in result["message"]
+    first = os.path.basename(refused[0])
+    expected = sorted(name for name in length if length[name] >= length[first])
+    assert first in expected and short not in expected
+    assert sorted(result["offenders"]) == expected
+    assert all(name in result["message"] for name in expected)
     assert short not in result["message"]
     (line,) = runlog.read_runs(job["id"])
-    assert sorted(line["offenders"]) == sorted([long_a, long_b])
+    assert sorted(line["offenders"]) == expected
     assert line["cause"] == "path_too_long"
 
 

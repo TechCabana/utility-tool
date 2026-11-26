@@ -273,7 +273,7 @@ def test_abort_during_copy_removes_partial_and_temp_manifest(tree):
 
     result = backup_utils.run_job(job, should_abort=abort_after_first_file)
     # `swept` (the sweep's removals; empty here) is part of every result the sweep ran for
-    assert result == {"ok": False, "message": "Backup cancelled", "swept": []}
+    assert result == {"ok": False, "cancelled": True, "message": "Backup cancelled", "swept": []}
     assert os.listdir(backup_utils.job_root(job)) == []
 
 

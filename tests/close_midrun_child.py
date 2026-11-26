@@ -17,6 +17,7 @@
 #   phase  "copy"          the first file copy blocks for a moment, so the close lands mid-copy
 #          "verify"        the first re-hash blocks, so the close lands mid-verify
 #          "prune"         the version is already promoted; pruning blocks (no abort check there)
+#          "restore_test"  the version is promoted and pruned; the automatic test restore blocks
 import json
 import os
 import sys
@@ -80,6 +81,13 @@ if args["phase"] == "copy":
     copying._hash_copy = lambda src, dst: (_signal_started(), _real_copy(src, dst))[1]
 elif args["phase"] == "verify":
     verify._rehash = lambda path: (_signal_started(), _real_rehash(path))[1]
+elif args["phase"] == "restore_test":
+    # The automatic test restore after a first good backup (card 0Bv7mvB3): the
+    # version is promoted and pruned; the test's restore blocks, so the close lands
+    # inside the test.
+    from utils import restore_test  # noqa: E402
+    _real_restore = restore_test.restore_version
+    restore_test.restore_version = lambda *a, **k: (_signal_started(), _real_restore(*a, **k))[1]
 else:
     # After the version was promoted: the one step `run_job` does not check for an abort.
     _real_prune = runner.prune_versions

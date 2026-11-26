@@ -501,7 +501,11 @@ def test_cancelling_between_two_retries_stops_before_the_second(job, monkeypatch
 
     def cancel_after_first_retry(src, dst):
         out = real(src, dst)
-        if os.path.basename(src) == "a03.txt":    # first retry done: cancel before the next
+        # `real` raises for a first-pass open, so reaching here means a RETRY of one of
+        # the two files just succeeded: cancel before the other one's retry. Which of
+        # the two goes first is the order the folder was listed in (sorted on NTFS,
+        # arbitrary on POSIX), so the test must not name it.
+        if os.path.basename(src) in ("a03.txt", "a04.txt"):
             state["cancel"] = True
         return out
 
@@ -509,7 +513,8 @@ def test_cancelling_between_two_retries_stops_before_the_second(job, monkeypatch
     result = backup_utils.run_job(job, should_abort=lambda: state["cancel"])
 
     assert not result["ok"] and result["message"] == "Backup cancelled"
-    assert flaky.opens["a04.txt"] == 1                                # its retry never started
+    # One file was retried (opened twice), the other's retry never started (opened once).
+    assert sorted(flaky.opens.values()) == [1, 2], flaky.opens
 
 
 def test_a_file_that_vanished_between_the_passes_is_skipped_by_name_not_a_crash(job, monkeypatch):

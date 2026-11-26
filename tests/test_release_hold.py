@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import clear_ro, clear_ro_tree
+from helpers import app_data_dir, clear_ro, clear_ro_tree
 from utils import backup_utils, jobs_store, locks, migrate, runlog, runner, scheduler, versions
 
 REPO = Path(__file__).resolve().parent.parent
@@ -551,8 +551,9 @@ def test_the_usage_text_documents_the_new_flag_and_its_exit_codes():
 def test_one_real_subprocess_releases_the_hold_with_a_temp_appdata(scene, tmp_path):
     s = scene()
     appdata = tmp_path / "appdata"
-    (appdata / "Safekeep").mkdir(parents=True)
-    (appdata / "Safekeep" / "backup_jobs.json").write_text(
+    data = app_data_dir(appdata)
+    data.mkdir(parents=True)
+    (data / "backup_jobs.json").write_text(
         Path(jobs_store.JOBS_FILE).read_text(encoding="utf-8"), encoding="utf-8")
     env = dict(os.environ, APPDATA=str(appdata), HOME=str(appdata),
                USERPROFILE=str(appdata), QT_QPA_PLATFORM="offscreen")
@@ -567,11 +568,11 @@ def test_one_real_subprocess_releases_the_hold_with_a_temp_appdata(scene, tmp_pa
     first = cli("--release-hold", s.job["id"])
     assert first.returncode == 0, first.stderr
     assert first.stdout.startswith("[OK] Done: the earlier backup (10 files)")
-    stored = json.loads((appdata / "Safekeep" / "backup_jobs.json").read_text(encoding="utf-8"))
+    stored = json.loads((data / "backup_jobs.json").read_text(encoding="utf-8"))
     (job,) = [j for j in stored if j["id"] == s.job["id"]]
     assert job["last_pruning_held"] is False and job["hold_released"]["level"] == 6
     assert tree_listing(s.job["target"]) == before                      # nothing deleted
-    lines = (appdata / "Safekeep" / "logs" / f"{s.job['id']}.jsonl").read_text(
+    lines = (data / "logs" / f"{s.job['id']}.jsonl").read_text(
         encoding="utf-8").splitlines()
     assert json.loads(lines[-1])["outcome"] == "hold_released"
     assert json.loads(lines[-1])["trigger"] == "cli"

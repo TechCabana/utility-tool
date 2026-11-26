@@ -159,6 +159,133 @@ def _count(value) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
+# ---------------------------------------------------------------------------
+# The outcome word (card C5HuzNVK)
+# ---------------------------------------------------------------------------
+#
+# `last_result` carries the run's real outcome as ONE word: `ok`,
+# `ok_pruning_held`, `ok_skipped`, `ok_changed`, `ok_links`, `cancelled` (a run
+# the person stopped), or the text forms `failed: <message>` and `interrupted:
+# <message>`. The ranking below is the ONLY
+# place that decides it: the run log (`runlog._outcome`) and `record_run` both
+# call it, so the log line and the stored word cannot disagree.
+#
+# THE WORD IS THE HEADLINE, THE SIBLING FIELDS ARE THE DETAIL. A run can skip a
+# file, see another change and not follow a shortcut at once; the word names
+# the highest-ranked one only, and `last_skipped`, `last_changed`, `last_links`
+# and `last_pruning_held` still carry every count and name. The Backup tab builds
+# "OK, 1 skipped, 1 changed during backup, 2 shortcuts not followed" from those
+# siblings and never from the word, which is what keeps a job saved by an older
+# build (plain `ok` beside a skipped count) displaying exactly like a new one.
+
+
+def run_counts(result: Dict) -> Tuple[int, int, int]:
+    """`(skipped, changed, links)` for a `run_job` result: what a finished run
+    left behind. All zero for a failed run, which finished nothing. The one
+    place these three counts are derived (`record_run` and the run log share it).
+    """
+    if not result.get("ok"):
+        return 0, 0, 0
+    errors = result.get("errors") or []
+    return (max(len(errors), _count(result.get("not_copied"))),
+            _count(result.get("changed")), _count(result.get("links_skipped")))
+
+
+def ok_word(result: Dict) -> str:
+    """The word for a run that finished ok: the highest-ranked thing it left
+    behind. Ranking, first match wins: pruning held, skipped, changed, links,
+    then plain `ok`. Callers have checked `result["ok"]`. `pruning_held` is read
+    as the run log always read it (exactly True); `run_job` sets it only with a
+    positive `baseline_files`, which `record_run` also requires of the sibling
+    flag, so the word and `last_pruning_held` agree for every real run."""
+    skipped, changed, links = run_counts(result)
+    if result.get("pruning_held") is True:
+        return "ok_pruning_held"
+    if skipped:
+        return "ok_skipped"
+    if changed:
+        return "ok_changed"
+    return "ok_links" if links else "ok"
+
+
+CANCELLED_WORD = "cancelled"
+
+# What builds before card bricnEaC stored for a run the person stopped. Read as
+# `cancelled` (see `job_result`) so last week's Cancel does not stay a red
+# failure; the jobs file itself is never rewritten for it. EXACT, not "any
+# failed: text": the only other thing that can follow it is the engine's own
+# sentence appended to the message (swept leftovers, a recovered lock), which
+# always starts at a full stop.
+_LEGACY_CANCELLED = "failed: Backup cancelled"
+
+
+def run_cancelled(result: Dict) -> bool:
+    """True for a `run_job` result of a run the PERSON stopped.
+
+    The one test for it: the engine's `cancelled` marker (`runner.
+    _cancelled_result`) on a run that did not finish, never the message text,
+    so `outcome_word` (the run log) and `record_run` (the stored word) cannot
+    disagree. A restore's result also carries `cancelled` but never reaches
+    either of them.
+    """
+    return not result.get("ok") and result.get("cancelled") is True
+
+
+def outcome_word(result: Dict) -> str:
+    """Map a `run_job` result onto one outcome word (the run log's `outcome`).
+
+    `busy`, `interrupted` and `hold_released` are not runs that finished and
+    are decided first, in that order; then ok runs get `ok_word`; a run the
+    person stopped is `cancelled` (`run_cancelled`); anything else is `failed`.
+    `record_run` stores this word for an ok run and for a cancelled one; a
+    failed run keeps its `failed: <message>` text.
+    """
+    if result.get("busy"):
+        return "busy"
+    if result.get("interrupted") is True:
+        return "interrupted"
+    if result.get("hold_released") is True:
+        return "hold_released"
+    if result.get("ok"):
+        return ok_word(result)
+    return CANCELLED_WORD if run_cancelled(result) else "failed"
+
+
+def _read_result(value) -> str:
+    """A stored `last_result` as the word readers should see: "" for anything
+    that is not a string, `cancelled` for the legacy `failed: Backup cancelled`
+    (with or without the engine's trailing sentence), the value otherwise."""
+    if not isinstance(value, str):
+        return ""
+    if value == _LEGACY_CANCELLED or value.startswith(_LEGACY_CANCELLED + ". "):
+        return CANCELLED_WORD
+    return value
+
+
+def result_is_ok(value) -> bool:
+    """True when a stored `last_result` reads as success: any word that starts
+    with "ok" (`ok`, `ok_skipped`, ...). The one `startswith("ok")` readers
+    share. Anything that is not a string (a hand-edited 42 or null) is not
+    success, and never raises. `cancelled` is not success."""
+    return isinstance(value, str) and value.startswith("ok")
+
+
+def result_is_cancelled(value) -> bool:
+    """True when a stored `last_result` reads as a run the person stopped: the
+    word `cancelled`, or the legacy text older builds stored for it. Neither a
+    success nor a failure: a reader that counts failures (an overdue or
+    protected-state check, a failure notice) must leave it out of that count,
+    and one that counts successes must leave it out of that too."""
+    return _read_result(value) == CANCELLED_WORD
+
+
+def job_result(job: Dict) -> str:
+    """`job`'s stored `last_result` as a string; "" for a missing or non-string
+    value, so a reader can call string methods on it without a guard. The legacy
+    `failed: Backup cancelled` reads as `cancelled`, on every reader at once."""
+    return _read_result(job.get("last_result"))
+
+
 # The UTC time a backup finished, as recorded in its manifest trailer
 # (`finished_utc`) and on the job (`last_finished_utc`): fixed-width ISO-8601
 # with a literal "Z", e.g. 2026-10-25T01:45:12Z. Fixed width is what lets two
@@ -612,8 +739,9 @@ def save_job(job: Dict) -> None:
 
 
 # What the job form edits. Everything else on a stored job is written by runs,
-# pre-checks and releases (`record_run`, `record_precheck`, `set_running`,
-# `runner.release_hold`) and must not be rolled back by an edit.
+# pre-checks, test restores and releases (`record_run`, `record_precheck`,
+# `record_restore_test`, `set_running`, `runner.release_hold`) and must not be
+# rolled back by an edit.
 SETTINGS_KEYS = ("name", "source", "target", "schedule", "at", "retention",
                  "target_volume", "verify")
 
@@ -659,6 +787,86 @@ def record_precheck(job_id: str, summary: Dict) -> Optional[Dict]:
     return job
 
 
+# ---------------------------------------------------------------------------
+# The test-restore result (card 0Bv7mvB3)
+# ---------------------------------------------------------------------------
+#
+# `last_restore_test` = {time, version, status, sampled, checked, failed,
+# failed_sample, reason}: what the newest test restore of this job found. It is
+# written ONLY by `record_restore_test` (a fresh read under the jobs-file lock,
+# one field set), and is in neither `SETTINGS_KEYS` nor touched by `record_run`,
+# so neither a job-form save nor the run's own record can roll it back. A
+# "busy" or "cancelled" test says nothing about the version, so it is never
+# stored; the stored statuses are exactly `RESTORE_TEST_STATUSES`.
+
+RESTORE_TEST_STATUSES = ("passed", "failed", "cannot_test")
+_RESTORE_TEXT_MAX = 260
+
+
+def clean_restore_test(value) -> Optional[Dict]:
+    """`value` as a well-formed `last_restore_test`, or None when it is junk.
+
+    The one reader AND the one writer's filter, so what is stored can always be
+    read back and a hand-edited value cannot reach a caller. None for anything
+    that is not a dict or whose status is not one of `RESTORE_TEST_STATUSES`;
+    otherwise every field is coerced: counts to non-negative whole numbers,
+    `failed_sample` to at most `SKIPPED_SAMPLE_MAX` strings, texts capped, an
+    unparseable `time` or a `version` that is not a stamp to "". Never raises.
+    """
+    if not isinstance(value, dict) or value.get("status") not in RESTORE_TEST_STATUSES:
+        return None
+
+    def text(raw) -> str:
+        """A string capped at `_RESTORE_TEXT_MAX`, "" for anything else."""
+        return raw[:_RESTORE_TEXT_MAX] if isinstance(raw, str) else ""
+
+    moment, stamp = value.get("time"), value.get("version")
+    try:
+        datetime.fromisoformat(moment)
+    except (TypeError, ValueError):
+        moment = ""
+    sample = value.get("failed_sample")
+    return {
+        "time": text(moment),
+        "version": stamp if isinstance(stamp, str) and _STAMP_RE.fullmatch(stamp) else "",
+        "status": value["status"],
+        "sampled": _count(value.get("sampled")),
+        "checked": _count(value.get("checked")),
+        "failed": _count(value.get("failed")),
+        "failed_sample": [text(name) for name in sample
+                          if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
+        if isinstance(sample, list) else [],
+        "reason": text(value.get("reason")),
+    }
+
+
+def job_restore_test(job: Dict) -> Optional[Dict]:
+    """`job`'s stored test-restore result (`clean_restore_test`), or None when
+    it has none or the value is junk -- junk reads as absent, never raises."""
+    return clean_restore_test(job.get("last_restore_test"))
+
+
+def record_restore_test(job_id: str, summary: Dict) -> Optional[Dict]:
+    """Store `summary` as the job's `last_restore_test` and return the job.
+
+    Same re-read-under-the-lock as `record_precheck`: only this one field is
+    set, so a run or a release recorded meanwhile survives. None when there is
+    no such job or `summary` is not storable (junk, or a status such as "busy"
+    that is never stored); nothing is written then. Raises JobsFileCorrupt or
+    OSError like `save_job`.
+    """
+    cleaned = clean_restore_test(summary)
+    if cleaned is None:
+        return None
+    with _jobs_file_lock():
+        job = get_job(job_id)
+        if job is None:
+            return None
+        job["last_restore_test"] = cleaned
+        _save_job(job)
+    return job
+
+
 def record_run(job_id: str, result: Dict) -> Optional[Dict]:
     """Write a run's outcome back onto the stored job, and return it.
 
@@ -678,20 +886,33 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
             # from then on.
             job["target_volume"] = result["target_volume"]
         job["last_run"] = datetime.now().isoformat(timespec="seconds")
-        job["last_result"] = ("ok" if result.get("ok") else "failed") +             (f": {result.get('message', '')}" if not result.get("ok") else "")
+        # The real outcome, not a plain "ok" (card C5HuzNVK); see the block
+        # above `run_counts` for why the word is only the headline.
+        # A run the person stopped stores the plain word `cancelled` (card
+        # bricnEaC), with no message: the run log keeps the message. It leaves
+        # exactly what a failed run leaves: last_run and last_result change, the
+        # sibling counts below go to zero (it finished nothing), and the
+        # last-good fields (`last_finished_utc`, `last_files`, the pruning hold)
+        # stay as the previous good run set them, because only an ok run
+        # writes those.
+        if result.get("ok"):
+            job["last_result"] = ok_word(result)
+        elif run_cancelled(result):
+            job["last_result"] = CANCELLED_WORD
+        else:
+            job["last_result"] = f"failed: {result.get('message', '')}"
         # The run is over, whatever the outcome: the start marker goes in the
         # SAME atomic write as the result, never before it. Cleared first and
         # recorded after, a crash between the two would leave the previous
         # "ok" standing with no sign a run ever began -- the lie this marker
         # exists to prevent. See `job_running`.
         job.pop("running", None)
-        # A run that finished but left files behind is still "ok" (readers of
-        # last_result keep working); the count and a few names ride beside it
-        # so the screen can say so. The count is the one the run's own message
-        # uses, so the screen and the message agree.
+        # A run that finished but left files behind has its word in last_result
+        # (readers that test startswith("ok") keep working); the counts and a few
+        # names ride beside it so the screen can say all of it. The count is the
+        # one the run's own message uses, so the screen and the message agree.
         errors = result.get("errors") or []
-        skipped = (max(len(errors), result.get("not_copied", 0))
-                   if result.get("ok") else 0)
+        skipped, changed, links = run_counts(result)
         job["last_skipped"] = skipped
         # File names only: not the OS error text (it can carry a full path) and
         # not the folder path the run log keeps (`copy_tree` errors read
@@ -701,21 +922,18 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
             for error in errors[:SKIPPED_SAMPLE_MAX]
         ] if skipped else []
         # Card RnuRsA2V: files kept although they were still changing while
-        # copied. Same shape as the skipped pair, and a sibling of it: the job
-        # reads "ok" either way (existing readers keep working) and the screen
+        # copied. Same shape as the skipped pair, and a sibling of it: the screen
         # builds "OK, N changed during backup" from this count. Relative paths
         # (from the source root, forward slashes), never an absolute one, and
         # only the successful run's: a failed run kept nothing.
-        changed = _count(result.get("changed")) if result.get("ok") else 0
         job["last_changed"] = changed
         job["last_changed_sample"] = [
             name for name in (result.get("changed_sample") or [])
             if isinstance(name, str)][:SKIPPED_SAMPLE_MAX] if changed else []
         # Card tiha5I8F: shortcuts the run did not follow. Same shape again (the
-        # job reads "ok", the screen builds "OK, N shortcuts not followed"):
-        # relative paths only, never the target a link points at, and only a
-        # finished run's, since a failed run made no statement about the tree.
-        links = _count(result.get("links_skipped")) if result.get("ok") else 0
+        # screen builds "OK, N shortcuts not followed"): relative paths only,
+        # never the target a link points at, and only a finished run's, since a
+        # failed run made no statement about the tree.
         job["last_links"] = links
         job["last_links_sample"] = [
             name for name in (result.get("links_sample") or [])

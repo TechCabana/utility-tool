@@ -136,8 +136,11 @@ def test_a_source_that_vanishes_after_the_first_file_fails_the_run(job, tmp_path
     assert "only 1 of 40 file(s) were copied" in result["message"]
     assert "skipped" not in result["message"]
     # It stopped at the first sign of trouble instead of grinding through the
-    # 38 remaining files as 38 skips.
-    assert calls["n"] == 2
+    # 38 remaining files as 38 skips. Either the next entry is a file (its copy is
+    # attempted once and fails: 2 calls, the NTFS listing order) or a folder (its
+    # listing fails first: 1 call, what a POSIX listing can give); grinding on
+    # would be dozens.
+    assert calls["n"] in (1, 2), calls["n"]
 
 
 def test_a_vanished_source_prunes_nothing_when_retention_would(job, tmp_path):
@@ -370,7 +373,10 @@ def test_a_restore_whose_version_vanishes_fails_and_removes_its_folder(job, tmp_
     assert backup_utils.is_verified(job, stamps[1])
 
 
-def test_a_restore_into_an_existing_folder_leaves_it_when_the_version_vanishes(job, tmp_path):
+def test_a_restore_beside_an_earlier_restore_leaves_it_when_the_version_vanishes(job, tmp_path):
+    # Card 5AJTFrRx: the second restore has a folder of its own (`-2`), which is
+    # removed when it fails; the earlier restore and the user's notes are never
+    # touched.
     stamps, _ = two_good_versions(job)
     version = backup_utils.version_path(job, stamps[1])
     out = tmp_path / "out"
@@ -383,6 +389,7 @@ def test_a_restore_into_an_existing_folder_leaves_it_when_the_version_vanishes(j
         on_progress=when_copied(1, lambda: move(version, tmp_path / "away")))
 
     assert result["ok"] is False and result["cause"] == "source_unavailable"
-    assert "may now be incomplete" in result["message"]
+    assert "The incomplete restore folder was removed" in result["message"]
+    assert os.listdir(out) == [os.path.basename(folder)]        # only its own folder went
     assert (out / os.path.basename(folder) / "my notes.txt").read_text(
         encoding="utf-8") == "mine"

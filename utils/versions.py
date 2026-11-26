@@ -694,7 +694,8 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
 RESTORE_NAMED = 5
 
 
-def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None
+def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None,
+                          sizes_out: Optional[Dict[str, int]] = None
                           ) -> Tuple[Optional[Dict[str, bytes]], Optional[str]]:
     """`({relative path: sha256 digest}, None)` for version `stamp`, or
     `(None, reason)` when its manifest cannot be trusted.
@@ -715,6 +716,12 @@ def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None
     `ro_out`, if given, receives the path of every file line marked
     `"ro": true` (the source file was read-only). It is only meaningful when
     the manifest is trusted (the second value is None).
+
+    `sizes_out`, if given, receives `{path: size}` for every file line whose
+    `size` is a whole number >= 0 (card 0Bv7mvB3: the test restore compares
+    size too). A line without a usable size is simply absent from it, so the
+    caller can tell; it never makes the manifest "damaged" here, because
+    restore only needs the hashes.
     """
     path = manifest_path(job, stamp)
     if not os.path.exists(long_path(path)):
@@ -738,6 +745,10 @@ def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None
                 hashes[rel] = digest
                 if ro_out is not None and entry.get("ro") is True:
                     ro_out.add(rel)
+                size = entry.get("size")
+                if (sizes_out is not None and isinstance(size, int)
+                        and not isinstance(size, bool) and size >= 0):
+                    sizes_out[rel] = size
     except (OSError, ValueError):   # unreadable, bad JSON, bad UTF-8, bad hex
         return None, "manifest damaged"
     if len(hashes) != summary.get("files"):
@@ -787,10 +798,51 @@ def _restore_check_sentence(check: Dict) -> str:
     return " and checked each against the backup" if check["checked"] else ""
 
 
+# How many folder names a restore tries (`<name>`, `<name>-2` ... `<name>-1000`)
+# before it gives up. Module-level so a test can shrink it.
+RESTORE_FOLDER_ATTEMPTS = 1000
+
+
+def _claim_restore_folder(destination: str, base: str) -> Optional[str]:
+    """Create and return a restore folder under `destination` that did not exist.
+
+    Tries `base`, then `base-2`, `base-3` and so on, creating each with a plain
+    `os.mkdir`. The creation IS the test: it fails if the name is already taken
+    by a folder, a file or a link (a junction is never followed), so there is no
+    gap between "is it free?" and "make it" for another restore, or the user,
+    to slip into. The first mkdir that succeeds wins and the restore writes only
+    inside that folder, so an earlier restore (which the user may have edited)
+    is never written to. Returns None when every name up to
+    `RESTORE_FOLDER_ATTEMPTS` is taken. A missing `destination` is created,
+    as the copy always did. Raises TargetWriteFailed when the drive refuses.
+    """
+    try:
+        os.makedirs(long_path(destination), exist_ok=True)
+    except OSError as exc:
+        raise TargetWriteFailed(destination, exc) from exc
+    for number in range(1, RESTORE_FOLDER_ATTEMPTS + 1):
+        folder = os.path.join(destination, base if number == 1 else f"{base}-{number}")
+        try:
+            os.mkdir(long_path(folder))
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise TargetWriteFailed(folder, exc) from exc
+        return folder
+    return None
+
+
 def restore_version(job: Dict, version: Optional[str], destination: str,
                     on_progress: Optional[Callable[[int, int], None]] = None,
-                    should_abort: Optional[Callable[[], bool]] = None) -> Dict:
+                    should_abort: Optional[Callable[[], bool]] = None,
+                    only: Optional[set] = None) -> Dict:
     """Copy one stored version into a NEW folder under `destination`.
+
+    `only` (card 0Bv7mvB3, the test restore) restores just those files, named
+    by their manifest paths, through this same walk, comparison and mode
+    handling: `copy_tree(only=...)` copies only them, and what the manifest
+    lists beyond them is not reported as missing. The default, None, is the
+    whole version exactly as before.
 
     `version=None` means the default: `restore_candidates(job)["preferred"]`,
     the newest verified version. A caller that wants a different one (the
@@ -804,12 +856,20 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     what it is and can be moved over the source by hand once the user has
     looked at it.
 
+    **A restore never writes into a folder that already exists** (card
+    5AJTFrRx). The folder is created fresh by `_claim_restore_folder`: if
+    `<job name>-restored-<version>` is taken (an earlier restore of the same
+    version, which the user may have edited, or anything else of that name) the
+    restore goes into `...-2`, then `-3`. The folder actually written is
+    `result["path"]` and the message says when a number was needed. If every
+    name up to `RESTORE_FOLDER_ATTEMPTS` is taken it fails, writing nothing.
+
     If the destination cannot be written (full, too-long path, unplugged) the
-    result is `ok=False` with a `cause`, and a restore folder this call
+    result is `ok=False` with a `cause`, and the restore folder this call
     created is removed so a partial restore is never mistaken for a whole
-    one. A folder that already existed (an earlier restore of the same
-    version) is left alone, since it may hold the user's own changes, and
-    the message says it may be incomplete. Files in the version that cannot
+    one. A restore that is cancelled, or that fails with a plain OSError, leaves
+    its folder (card 102); the next restore then takes the next free name
+    rather than reusing it. Files in the version that cannot
     be read are skipped and reported in `errors`, as before -- unless the
     stored version itself vanishes mid-restore or most of it cannot be read
     (`copy_tree`'s completeness rule): that fails with cause
@@ -845,10 +905,9 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     writable in a protected version (its marking failed) is restored writable
     like any other. A version without `protected` (made by an earlier build) or
     with a manifest that cannot be trusted keeps the old rule: the copy keeps
-    whatever read-only bit the stored file has. A restore into a folder that
-    already holds a read-only file of the same name replaces it
-    (`copying._open_for_write`); one that cannot is a `no_permission` failure
-    naming the file.
+    whatever read-only bit the stored file has. The restore folder is empty
+    when the copy starts, so no file is ever replaced; `copying._open_for_write`
+    (which would replace a read-only one) is there for the backup side only.
 
     `ok` keeps its meaning (the files were copied); a mismatch is
     `ok=True, verified=False`, so callers that only look at `ok` behave as
@@ -865,8 +924,8 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
         return {"ok": False, "message": f"Backup version {version} not found"}
 
     safe_name = re.sub(r"[^\w.-]+", "_", job.get("name") or job["id"]).strip("_") or job["id"]
-    folder = os.path.join(destination, f"{safe_name}-restored-{version}")
-    existed = os.path.exists(long_path(folder))
+    base_name = f"{safe_name}-restored-{version}"
+    folder = None   # set once this restore has created its own folder
     stats: Dict[str, int] = {}
     # Card fEC32w6P. Which restored files should be read-only. The stored files
     # of a PROTECTED version (trailer `protected: true`) are read-only because
@@ -881,6 +940,8 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     read_only_paths: set = set()
     expected, unchecked_reason = _read_manifest_hashes(
         job, version, read_only_paths if protected else None)
+    if only is not None and expected is not None:
+        expected = {rel: digest for rel, digest in expected.items() if rel in only}
     fix_modes = protected and expected is not None
     check: Dict = {"checked": 0, "mismatched": [], "not_in_manifest": [],
                    "missing_from_version": [], "unchecked_reason": unchecked_reason,
@@ -922,9 +983,16 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
             check["read_only_kept"] = check.get("read_only_kept", 0) + 1
 
     try:
+        folder = _claim_restore_folder(destination, base_name)
+        if folder is None:
+            return {"ok": False, "message": (
+                "Restore failed: Could not find a free folder name for the restore "
+                f"in {destination} ({base_name} up to {base_name}-"
+                f"{RESTORE_FOLDER_ATTEMPTS} are all taken). Nothing was restored.")}
         files, restored_bytes, errors = copy_tree(
             source, folder, on_progress=on_progress, should_abort=should_abort,
-            on_copied=compare if expected is not None else count_read_only, stats=stats)
+            on_copied=compare if expected is not None else count_read_only, stats=stats,
+            only=only)
     except BackupAborted:
         # Only the files restored before the stop were compared; nothing here
         # claims the rest were. Never `verified`.
@@ -937,8 +1005,8 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
                             f"{_named(check['mismatched'])}")
         return dict(check, ok=False, message=message, cancelled=True)
     except (TargetWriteFailed, SourceUnavailable) as exc:
-        if existed:
-            after = f"{folder} already existed and may now be incomplete."
+        if folder is None:   # the drive refused the folder itself
+            after = "Nothing was restored."
         else:
             try:
                 _rmtree(folder)
@@ -987,5 +1055,8 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
         message += (f". {_files(check['read_only_kept'])} stayed read-only as they are "
                     "stored in the backup, since its checksum list cannot say which were "
                     "read-only originally (clear the read-only mark to edit)")
+    if os.path.basename(folder) != base_name:
+        message += (f". A folder with that name already existed, so this restore went "
+                    f"into {os.path.basename(folder)} and left the earlier one untouched")
     return dict(check, ok=True, message=message, path=folder, files=files,
                 bytes=restored_bytes, errors=errors)

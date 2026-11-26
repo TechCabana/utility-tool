@@ -14,14 +14,42 @@ import pytest
 # each test file redirects JOBS_FILE itself; a test that forgets one would write
 # the REAL %APPDATA%/Safekeep (jobs file, locks, and since card 52 a log line per
 # run). So the whole session's app-data root is a throwaway folder, set BEFORE
-# any repo module is imported (jobs_store reads it at import). Windows only:
-# elsewhere app_dir() is built from the home folder and the fixtures stay the
-# only guard.
+# any repo module is imported (jobs_store reads it at import). On Windows that
+# is APPDATA; on macOS and Linux `app_dir()` is built from the home folder
+# (`~/Library/Application Support/Safekeep`, `~/.config/Safekeep`), which APPDATA
+# does not move, so HOME (and XDG_CONFIG_HOME, which Qt reads on Linux) go to the
+# same throwaway folder. The launchd plist path (`~/Library/LaunchAgents`) is
+# under HOME too, so a test that registers a task cannot reach the real one.
 _SESSION_APPDATA = tempfile.mkdtemp(prefix="safekeep-tests-")
 os.environ["APPDATA"] = _SESSION_APPDATA
+if os.name != "nt":
+    os.environ["HOME"] = _SESSION_APPDATA
+    os.environ["XDG_CONFIG_HOME"] = os.path.join(_SESSION_APPDATA, ".config")
 atexit.register(shutil.rmtree, _SESSION_APPDATA, ignore_errors=True)
 
-from utils import copying, jobs_store, runlog  # noqa: E402
+
+def _inside(path: str, root: str) -> bool:
+    """Whether `path` is `root` or below it, links resolved and case folded."""
+    path = os.path.normcase(os.path.realpath(path))
+    root = os.path.normcase(os.path.realpath(root))
+    return path == root or path.startswith(root + os.sep)
+
+
+# A precondition, not an action: if the redirect above did not take (a platform
+# whose app-data folder is derived some other way), stop the whole session before
+# any test can write the real folder.
+from utils import fs_utils  # noqa: E402
+
+_resolved = fs_utils.app_dir_for(fs_utils.APP_NAME)
+assert _inside(_resolved, _SESSION_APPDATA), (
+    f"tests would use the real app-data folder {_resolved!r}, not a folder under "
+    f"{_SESSION_APPDATA!r}")
+if os.name != "nt":
+    assert _inside(os.path.expanduser("~"), _SESSION_APPDATA), os.path.expanduser("~")
+
+from utils import copying, jobs_store, restore_test, runlog  # noqa: E402
+
+assert _inside(jobs_store.JOBS_FILE, _SESSION_APPDATA), jobs_store.JOBS_FILE
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +70,30 @@ def isolated_logs_dir(tmp_path_factory, monkeypatch):
     path = tmp_path_factory.mktemp("logs")
     monkeypatch.setattr(runlog, "_logs_dir", lambda: str(path))
     return path
+
+
+@pytest.fixture(autouse=True)
+def no_automatic_restore_test(request):
+    """Switch off the test restore that follows a saved job's first backup
+    (card 0Bv7mvB3) for every test file but the one that tests it.
+
+    Without this, every older test that saves a job and runs it would get one
+    extra run-log line, one extra sentence in the message and a stored
+    `last_restore_test` it knows nothing about. A module opts back in by setting
+    `AUTO_RESTORE_TEST = True` at module level (tests/test_restore_test.py).
+    """
+    if getattr(request.module, "AUTO_RESTORE_TEST", False):
+        yield
+        return
+    # Assigned and restored by hand, not through `monkeypatch`: some older tests
+    # call `monkeypatch.undo()` mid-test, which would switch the test restore
+    # back on in the middle of a run.
+    original = restore_test.automatic
+    restore_test.automatic = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        restore_test.automatic = original
 
 
 @pytest.fixture(autouse=True)
