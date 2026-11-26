@@ -164,8 +164,9 @@ def _count(value) -> int:
 # ---------------------------------------------------------------------------
 #
 # `last_result` carries the run's real outcome as ONE word: `ok`,
-# `ok_pruning_held`, `ok_skipped`, `ok_changed`, `ok_links`, or the text forms
-# `failed: <message>` and `interrupted: <message>`. The ranking below is the ONLY
+# `ok_pruning_held`, `ok_skipped`, `ok_changed`, `ok_links`, `cancelled` (a run
+# the person stopped), or the text forms `failed: <message>` and `interrupted:
+# <message>`. The ranking below is the ONLY
 # place that decides it: the run log (`runlog._outcome`) and `record_run` both
 # call it, so the log line and the stored word cannot disagree.
 #
@@ -207,16 +208,37 @@ def ok_word(result: Dict) -> str:
     return "ok_links" if links else "ok"
 
 
+CANCELLED_WORD = "cancelled"
+
+# What builds before card bricnEaC stored for a run the person stopped. Read as
+# `cancelled` (see `job_result`) so last week's Cancel does not stay a red
+# failure; the jobs file itself is never rewritten for it. EXACT, not "any
+# failed: text": the only other thing that can follow it is the engine's own
+# sentence appended to the message (swept leftovers, a recovered lock), which
+# always starts at a full stop.
+_LEGACY_CANCELLED = "failed: Backup cancelled"
+
+
+def run_cancelled(result: Dict) -> bool:
+    """True for a `run_job` result of a run the PERSON stopped.
+
+    The one test for it: the engine's `cancelled` marker (`runner.
+    _cancelled_result`) on a run that did not finish, never the message text,
+    so `outcome_word` (the run log) and `record_run` (the stored word) cannot
+    disagree. A restore's result also carries `cancelled` but never reaches
+    either of them.
+    """
+    return not result.get("ok") and result.get("cancelled") is True
+
+
 def outcome_word(result: Dict) -> str:
     """Map a `run_job` result onto one outcome word (the run log's `outcome`).
 
     `busy`, `interrupted` and `hold_released` are not runs that finished and
-    are decided first, in that order; then ok runs get `ok_word`; a failed run
-    is `cancelled` when its message says the owner stopped it, else `failed`.
-    `record_run` stores only the ok words from here: a failed run keeps its
-    `failed: <message>` text (a stopped run is stored as `failed: Backup
-    cancelled` until card 111 changes that, and then this function already
-    returns the word it will store).
+    are decided first, in that order; then ok runs get `ok_word`; a run the
+    person stopped is `cancelled` (`run_cancelled`); anything else is `failed`.
+    `record_run` stores this word for an ok run and for a cancelled one; a
+    failed run keeps its `failed: <message>` text.
     """
     if result.get("busy"):
         return "busy"
@@ -226,24 +248,42 @@ def outcome_word(result: Dict) -> str:
         return "hold_released"
     if result.get("ok"):
         return ok_word(result)
-    if str(result.get("message", "")).startswith("Backup cancelled"):
-        return "cancelled"
-    return "failed"
+    return CANCELLED_WORD if run_cancelled(result) else "failed"
+
+
+def _read_result(value) -> str:
+    """A stored `last_result` as the word readers should see: "" for anything
+    that is not a string, `cancelled` for the legacy `failed: Backup cancelled`
+    (with or without the engine's trailing sentence), the value otherwise."""
+    if not isinstance(value, str):
+        return ""
+    if value == _LEGACY_CANCELLED or value.startswith(_LEGACY_CANCELLED + ". "):
+        return CANCELLED_WORD
+    return value
 
 
 def result_is_ok(value) -> bool:
     """True when a stored `last_result` reads as success: any word that starts
     with "ok" (`ok`, `ok_skipped`, ...). The one `startswith("ok")` readers
     share. Anything that is not a string (a hand-edited 42 or null) is not
-    success, and never raises."""
+    success, and never raises. `cancelled` is not success."""
     return isinstance(value, str) and value.startswith("ok")
+
+
+def result_is_cancelled(value) -> bool:
+    """True when a stored `last_result` reads as a run the person stopped: the
+    word `cancelled`, or the legacy text older builds stored for it. Neither a
+    success nor a failure: a reader that counts failures (an overdue or
+    protected-state check, a failure notice) must leave it out of that count,
+    and one that counts successes must leave it out of that too."""
+    return _read_result(value) == CANCELLED_WORD
 
 
 def job_result(job: Dict) -> str:
     """`job`'s stored `last_result` as a string; "" for a missing or non-string
-    value, so a reader can call string methods on it without a guard."""
-    value = job.get("last_result")
-    return value if isinstance(value, str) else ""
+    value, so a reader can call string methods on it without a guard. The legacy
+    `failed: Backup cancelled` reads as `cancelled`, on every reader at once."""
+    return _read_result(job.get("last_result"))
 
 
 # The UTC time a backup finished, as recorded in its manifest trailer
@@ -767,8 +807,19 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
         job["last_run"] = datetime.now().isoformat(timespec="seconds")
         # The real outcome, not a plain "ok" (card C5HuzNVK); see the block
         # above `run_counts` for why the word is only the headline.
-        job["last_result"] = (ok_word(result) if result.get("ok")
-                              else f"failed: {result.get('message', '')}")
+        # A run the person stopped stores the plain word `cancelled` (card
+        # bricnEaC), with no message: the run log keeps the message. It leaves
+        # exactly what a failed run leaves: last_run and last_result change, the
+        # sibling counts below go to zero (it finished nothing), and the
+        # last-good fields (`last_finished_utc`, `last_files`, the pruning hold)
+        # stay as the previous good run set them, because only an ok run
+        # writes those.
+        if result.get("ok"):
+            job["last_result"] = ok_word(result)
+        elif run_cancelled(result):
+            job["last_result"] = CANCELLED_WORD
+        else:
+            job["last_result"] = f"failed: {result.get('message', '')}"
         # The run is over, whatever the outcome: the start marker goes in the
         # SAME atomic write as the result, never before it. Cleared first and
         # recorded after, a crash between the two would leave the previous

@@ -267,7 +267,9 @@ never treated as a version, the job's Status reads "Interrupted: started ... and
 finished", and the next run starts again from the beginning. A backup drive that is unplugged
 mid-run is a failed run instead, reported with its cause, and the next run likewise starts
 over. Closing the app while a backup runs cancels it: the half-finished copy is removed and the
-job reads "Failed" (its result is "Backup cancelled"), not "Interrupted". A close that comes
+job reads "Cancelled" (stored as `cancelled`, the same word the run log uses; a neutral
+status, not the red "Failed"), not "Interrupted", and the earlier backup stays the newest
+verified one. A close that comes
 after the copy was checked and kept, while older versions are being removed, waits for that
 step to finish and records the backup as made.
 
@@ -425,13 +427,13 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `retention` | int | Versions to keep; older ones are deleted after a run |
 | `target_volume` | string | The target drive's volume id, recorded on save or first run; a run onto a different drive is refused |
 | `verify` | string | `full` (default: re-read every copied file), `quick` (all sizes, a sample of hashes) or `off`; a missing or unknown value runs as `full` |
-| `last_result` | string | The last run's real outcome: `ok`, `ok_skipped`, `ok_changed`, `ok_links` or `ok_pruning_held` (all successes; a run that left several things behind stores the highest-ranked one: pruning held, then skipped, changed, shortcuts), `failed: <message>`, or `interrupted: started <time> and never finished` (a run that began and was killed or crashed before it recorded a result; `last_run` is then when it began). The word is the headline; `last_skipped`, `last_changed`, `last_links` and `last_pruning_held` below carry every count and name. Jobs saved by older builds hold a plain `ok` beside those fields and display the same |
+| `last_result` | string | The last run's real outcome: `ok`, `ok_skipped`, `ok_changed`, `ok_links` or `ok_pruning_held` (all successes; a run that left several things behind stores the highest-ranked one: pruning held, then skipped, changed, shortcuts), `cancelled` (a run the person stopped, by closing the app mid-run or through the abort the Backup tab's worker raises: not a success and not a failure, and it writes no version; a job saved by an older build holds `failed: Backup cancelled` for the same thing and is displayed as Cancelled without its file being rewritten), `failed: <message>`, or `interrupted: started <time> and never finished` (a run that began and was killed or crashed before it recorded a result; `last_run` is then when it began). The word is the headline; `last_skipped`, `last_changed`, `last_links` and `last_pruning_held` below carry every count and name. Jobs saved by older builds hold a plain `ok` beside those fields and display the same |
 | `running` | object | Present only while a run is under way, or after one died: `{since, pid, start_time, stamp, token}`, written just before copying and removed when the run records its outcome. A marker whose process is gone is shown as "Interrupted" and recorded as `interrupted` in `last_result` and the run log. Do not edit it by hand |
-| `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
-| `last_changed`, `last_changed_sample` | int, list | Files the last run kept although they were still changing while they were copied (marked `"changed": true` in the checksum list), and up to five of their paths from the source root; 0 and empty after a clean or a failed run |
-| `last_links`, `last_links_sample` | int, list | Shortcuts (symbolic links and junctions) the last run did not follow, so what they point to is not in its version, and up to five of their paths from the source root (never the place they point to); 0 and empty after a run with none, or a failed run |
-| `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed run leaves all three unchanged |
-| `last_finished_utc` | string | When the last successful run finished, in UTC (`2026-10-25T01:45:12Z`), the same value as the end of its checksum list; absent until a job has a successful run made by a version that records it, and a failed run leaves it unchanged |
+| `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean, a failed or a cancelled run |
+| `last_changed`, `last_changed_sample` | int, list | Files the last run kept although they were still changing while they were copied (marked `"changed": true` in the checksum list), and up to five of their paths from the source root; 0 and empty after a clean, a failed or a cancelled run |
+| `last_links`, `last_links_sample` | int, list | Shortcuts (symbolic links and junctions) the last run did not follow, so what they point to is not in its version, and up to five of their paths from the source root (never the place they point to); 0 and empty after a run with none, a failed run or a cancelled one |
+| `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed or cancelled run leaves all three unchanged |
+| `last_finished_utc` | string | When the last successful run finished, in UTC (`2026-10-25T01:45:12Z`), the same value as the end of its checksum list; absent until a job has a successful run made by a version that records it, and a failed or cancelled run leaves it unchanged |
 | `last_precheck` | object | The last pre-check's summary: `{time, ok, aborted, fs, scanned, problems, blocking, counts, sample}` (counts by kind, up to five paths from the source root). Absent until a job is first checked |
 | `hold_released` | object | Present after the owner released a pruning hold: `{stamp, files, level, since, time}`, the version let go and its file count, the source's file count then, and the newest version at that moment. Versions older than `since` no longer count as the larger backup to compare with |
 
@@ -486,6 +488,7 @@ utility-tool/
     ├── helpers.py          clears or reads the read-only mark on files inside finished versions
     ├── test_backup_utils.py
     ├── test_activity.py
+    ├── test_cancelled_outcome.py
     ├── test_changed_during_copy.py
     ├── test_clock_change.py
     ├── test_close_midrun.py

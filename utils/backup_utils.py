@@ -40,7 +40,8 @@ from utils.jobs_store import (  # noqa: F401
     load_jobs, _locks_dir, new_job, quarantine_jobs_file, QuarantineRefused, _read_valid, record_precheck, record_run, remove_job,
     restore_jobs_from_backup, _save_job, save_job, save_job_settings, save_jobs, SCHEDULES,
     SETTINGS_KEYS, VERIFY_MODES, FINISHED_UTC_FORMAT, valid_finished_utc,
-    _write_atomic, job_result, ok_word, outcome_word, result_is_ok, run_counts,
+    _write_atomic, CANCELLED_WORD, job_result, ok_word, outcome_word, result_is_cancelled,
+    result_is_ok, run_cancelled, run_counts,
 )
 from utils.versions import (  # noqa: F401
     baseline_files, _discard, is_sanity_drop, is_verified, job_root, _last_line, latest_version,

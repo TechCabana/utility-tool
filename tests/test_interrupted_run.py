@@ -352,7 +352,7 @@ def test_record_run_clears_the_marker_for_every_kind_of_outcome(tmp_path, monkey
     final = stored(job)
     assert "running" not in final
     assert final["last_result"].startswith({"ok": "ok", "failed": "failed",
-                                            "cancelled": "failed: Backup cancelled"}[how])
+                                            "cancelled": "cancelled"}[how])
 
 
 @pytest.mark.parametrize("error", [RuntimeError("boom"), KeyboardInterrupt()])

@@ -484,6 +484,15 @@ RESTORE_ACTION_WIDTH = 110
 # larger backup aside (card 51): a failure never clears that hold.
 HELD_AFTER_FAILURE = "Older backups are being kept because the source shrank."
 
+# Card bricnEaC: Failed means something outside the person's control went wrong;
+# a run the person stopped (a Cancel, or closing the app mid-run) is Cancelled.
+# Shown in the neutral `Hint` style, the one "Never run" uses: not an error and
+# not a warning, and no new colour. The tooltip says what is true: the half copy
+# was discarded and no earlier backup was touched.
+CANCELLED_TEXT = "Cancelled"
+CANCELLED_DETAIL = ("You stopped this backup before it finished. Nothing was changed "
+                    "in your earlier backups. Run it again with the play button.")
+
 # The Status tooltip of a job whose last run started and never finished (card
 # PQPfznG1): the likely causes, in plain words, and that nothing is left to fix.
 INTERRUPTED_DETAIL = (
@@ -556,13 +565,17 @@ class JobRow(QtWidgets.QWidget):
             (self._hint(status), style),
             (self._data(self._last_run(job)), None),
         ]
+        status_cell = cells[2][0]
         for (widget, style_name), (_, stretch, minimum) in zip(cells, JOB_COLUMNS):
             if style_name:
                 widget.setObjectName(style_name)
             widget.setMinimumWidth(minimum)
             h.addWidget(widget, stretch)
+            # Cancelled is neutral (`Hint`), so it is picked out by its cell and
+            # its text, not by its style as the warning and error states are.
             detail = (self._warning_detail(job)
-                      if widget.objectName() in ("StatusWarn", "StatusError") else "")
+                      if widget.objectName() in ("StatusWarn", "StatusError")
+                      or (widget is status_cell and status == CANCELLED_TEXT) else "")
             if detail:
                 # An OK with a caveat (files left behind, pruning held), or a
                 # failure while older backups are kept aside: say what, on the
@@ -695,6 +708,13 @@ class JobRow(QtWidgets.QWidget):
                     "StatusError")
         if not job.get("last_run"):
             return "Never run", "Hint"
+        if backup_utils.result_is_cancelled(result):
+            # Neither a success nor a failure (card bricnEaC). It reports the
+            # LAST run, so it shows even when an earlier backup is good; nothing
+            # else about protection changes (the earlier version is still the
+            # newest verified one). A future status model (overdue, protected)
+            # must not count this as a failure or as a success.
+            return CANCELLED_TEXT, "Hint"
         if backup_utils.result_is_ok(result):
             # Silence is never success: a run that left files behind is not
             # plain OK, however green that would look. The counts come from the
@@ -726,6 +746,11 @@ class JobRow(QtWidgets.QWidget):
         if (backup_utils.job_interrupted(job)
                 or backup_utils.job_result(job).startswith(backup_utils.INTERRUPTED_PREFIX)):
             return INTERRUPTED_DETAIL + (
+                "\n\n" + HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else "")
+        if backup_utils.result_is_cancelled(job.get("last_result")):
+            # A stopped run says nothing about the source either: a hold an
+            # earlier run set survives it, as it survives a failure.
+            return CANCELLED_DETAIL + (
                 "\n\n" + HELD_AFTER_FAILURE if backup_utils.job_pruning_held(job) else "")
         if not backup_utils.result_is_ok(job.get("last_result")):
             # Failure stays the status; a hold an earlier run set survives it.
@@ -1805,6 +1830,12 @@ class BackupTab(QtWidgets.QWidget):
         except (backup_utils.JobsFileCorrupt, OSError) as exc:
             self._say(f"{message} The result could not be recorded: {exc}",
                       ok=False)
+            return
+        if backup_utils.run_cancelled(result):
+            # The person stopped it (card bricnEaC): calm, in the plain hint
+            # style. Not the red failure line, and no dialog; no remeasure
+            # either, since a stopped run changed nothing on the target.
+            self._say(f"{message.rstrip('.')}. Your earlier backups were not changed.")
             return
         # A run that left files behind reads as a warning, not as plain news.
         warn = bool(result.get("ok") and (result.get("errors")

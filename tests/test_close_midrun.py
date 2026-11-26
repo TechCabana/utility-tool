@@ -123,8 +123,10 @@ def reopen(job):
     from tabs import backup_tab
     tab = backup_tab.BackupTab()
     tab.refresh_backup()
+    # Cancelled (card bricnEaC) is neutral `Hint`, not a Status* style, so it is
+    # picked out by its text as well.
     label = [l for l in backup_tab.JobRow(stored(job)).findChildren(QtWidgets.QLabel)
-             if l.objectName().startswith("Status")]
+             if l.objectName().startswith("Status") or l.text() == "Cancelled"]
     assert len(label) == 1, [(l.objectName(), l.text()) for l in label]
     return label[0], stored(job)
 
@@ -147,6 +149,10 @@ def version_folders(job):
 def test_closing_the_app_mid_run_records_the_run_as_cancelled_not_interrupted(
         app_root, tmp_path, qt_app, close, phase):
     job = make_job(tmp_path)
+    good = backup_utils.run_job(job)                  # a real earlier backup the close must not touch
+    assert good["ok"], good["message"]
+    backup_utils.record_run(job["id"], good)
+    good_stamp, good_utc = good["version"], stored(job)["last_finished_utc"]
     report = run_app(app_root, tmp_path, job, close, phase)
 
     # On close: the worker was still running; shutdown stopped and joined it, the
@@ -159,28 +165,38 @@ def test_closing_the_app_mid_run_records_the_run_as_cancelled_not_interrupted(
 
     # What the process left: no marker, the cancelled run recorded, no half-copy,
     # no version, and no lock that could block the next run.
+    # Card bricnEaC: the person closed the app, so the run is stored as `cancelled`
+    # (it was `failed: Backup cancelled`). The run's message stays in the log.
     after = stored(job)
-    assert "running" not in after and after["last_result"] == "failed: Backup cancelled"
+    assert "running" not in after and after["last_result"] == "cancelled"
     assert runner.job_interrupted(after) is None
-    assert version_folders(job) == ([], [])
+    assert version_folders(job) == ([good_stamp], [])    # only the earlier good version
     assert os.listdir(jobs_store._locks_dir()) == []
-    # The run log agrees with the job: one line, "cancelled", and no later
-    # "interrupted" line for the same run.
-    assert [line["outcome"] for line in runlog.read_runs(job["id"])] == ["cancelled"]
+    # The run log agrees with the job: ONE "cancelled" line for the closed run (on
+    # top of the earlier good run's "ok"), and no "interrupted" or "failed" line.
+    assert [line["outcome"] for line in runlog.read_runs(job["id"])] == ["cancelled", "ok"]
+    assert runlog.read_runs(job["id"])[0]["message"] == "Backup cancelled"
+    # The earlier good backup is still the newest verified version and restore's default.
+    assert backup_utils.latest_version(job) == good_stamp
+    assert backup_utils.restore_candidates(job)["preferred"] == good_stamp
+    assert backup_utils.is_verified(job, good_stamp) and after["last_finished_utc"] == good_utc
 
-    # The restart: the job reads Failed (the cancelled run), never Interrupted.
+    # The restart: the job reads Cancelled (neutral, not the error style), never
+    # Failed and never Interrupted.
     label, settled = reopen(job)
-    assert (label.objectName(), label.text()) == ("StatusError", "Failed")
+    assert (label.objectName(), label.text()) == ("Hint", "Cancelled")
     assert "never finished" not in label.toolTip()
-    assert settled["last_result"] == "failed: Backup cancelled" and "running" not in settled
-    assert [line["outcome"] for line in runlog.read_runs(job["id"])] == ["cancelled"]
+    assert label.toolTip().startswith("You stopped this backup before it finished.")
+    assert label.accessibleDescription() == label.toolTip()
+    assert settled["last_result"] == "cancelled" and "running" not in settled
+    assert [line["outcome"] for line in runlog.read_runs(job["id"])] == ["cancelled", "ok"]
 
     # ...and a new manual run starts at once (the dead owner's lock is already gone).
     result = backup_utils.run_job(stored(job))
     assert result["ok"] is True and not result.get("busy"), result
     backup_utils.record_run(job["id"], result)
     assert runner.job_interrupted(stored(job)) is None and stored(job)["last_result"] == "ok"
-    assert len(version_folders(job)[0]) == 1
+    assert len(version_folders(job)[0]) == 2
 
 
 def test_closing_after_the_outcome_was_recorded_leaves_no_marker(app_root, tmp_path, qt_app):
@@ -251,10 +267,16 @@ def test_the_reader_tells_an_orphaned_marker_from_a_live_one(app_root, tmp_path,
     # Only the Interrupted state lists causes: an ordinary failed run (here the
     # very message a run cancelled by closing the app records) does not.
     failed = make_job(tmp_path / "third")
-    backup_utils.record_run(failed["id"], {"ok": False, "message": "Backup cancelled"})
+    backup_utils.record_run(failed["id"], {"ok": False, "message": "Backup failed: drive is full"})
     assert stored(failed)["last_result"].startswith("failed")
     label, _ = reopen(failed)
     assert label.text() == "Failed" and "crashed" not in label.toolTip()
+    # ...and a run the person stopped is Cancelled, which lists no causes either.
+    stopped = make_job(tmp_path / "fourth")
+    backup_utils.record_run(stopped["id"], {"ok": False, "cancelled": True,
+                                            "message": "Backup cancelled"})
+    label, _ = reopen(stopped)
+    assert label.text() == "Cancelled" and "crashed" not in label.toolTip()
 
 
 def test_the_tooltip_and_the_readme_do_not_list_closing_the_app_as_a_cause():
@@ -289,12 +311,13 @@ def test_shutdown_records_a_joined_backup_run_and_nothing_else(app_root, qt_app,
         started.set()
         while not should_abort():
             threading.Event().wait(0.01)
-        return {"ok": False, "message": "Backup cancelled"}
+        return {"ok": False, "cancelled": True, "message": "Backup cancelled"}
 
     tab._start_backup("working", work, seen.append, record_on_close=record_on_close)
     assert started.wait(10)
     tab.shutdown()
     assert tab.backup_thread is None and tab._backup_done is None
-    assert seen == ([{"ok": False, "message": "Backup cancelled"}] if record_on_close else [])
+    assert seen == ([{"ok": False, "cancelled": True, "message": "Backup cancelled"}]
+                    if record_on_close else [])
     tab.shutdown()                                   # a second call finds nothing to do
     assert len(seen) == (1 if record_on_close else 0)

@@ -166,8 +166,11 @@ RANKING = [
     ("failed keeps no leftovers",
      {"ok": False, "message": "boom", "errors": ["a: x"], "changed": 1, "links_skipped": 1,
       **HELD}, "failed: boom"),
-    # Card 111 will change how a stopped run is stored; until then it is a plain failure.
-    ("a stopped run is still stored as failed",
+    # Card bricnEaC: a run the person stopped stores the plain word; the text alone
+    # is not the marker, so a failure that merely says so stays a failure.
+    ("a stopped run is stored as cancelled",
+     {"ok": False, "cancelled": True, "message": "Backup cancelled"}, "cancelled"),
+    ("a failure that only says cancelled stays failed",
      {"ok": False, "message": "Backup cancelled"}, "failed: Backup cancelled"),
 ]
 
@@ -195,7 +198,8 @@ def test_the_outcome_function_keeps_the_words_the_run_log_has_always_had():
     assert f({"busy": True, "ok": True}) == "busy"
     assert f({"interrupted": True}) == "interrupted"
     assert f({"hold_released": True, "ok": True}) == "hold_released"
-    assert f({"ok": False, "message": "Backup cancelled by you"}) == "cancelled"
+    assert f({"ok": False, "cancelled": True, "message": "Backup cancelled"}) == "cancelled"
+    assert f({"ok": False, "message": "Backup cancelled"}) == "failed"     # card bricnEaC: the marker, not the text
     assert f({"ok": False, "message": "x"}) == "failed"
     assert f({"ok": True, "pruning_held": True}) == "ok_pruning_held"
     assert set(OK_WORDS) <= set(runlog.OUTCOMES)                           # the log can say every stored word
@@ -477,7 +481,8 @@ def test_the_run_log_line_is_byte_identical_to_the_pre_card_output(result, golde
     ({"ok": True, "busy": True}, "busy"),
     ({"ok": False, "interrupted": True}, "interrupted"),
     ({"ok": True, "hold_released": True}, "hold_released"),
-    ({"ok": False, "message": "Backup cancelled by the user"}, "cancelled"),
+    ({"ok": False, "cancelled": True, "message": "Backup cancelled by the user"}, "cancelled"),
+    ({"ok": False, "message": "Backup cancelled by the user"}, "failed"),         # card bricnEaC: the marker, not the text
     ({"ok": False, "message": "boom"}, "failed"),
     ({"ok": True, "pruning_held": True, "not_copied": 1}, "ok_pruning_held"),
     ({"ok": True, "not_copied": 1, "changed": 1, "links_skipped": 1}, "ok_skipped"),

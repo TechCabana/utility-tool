@@ -615,6 +615,19 @@ def links_sentence(folders: int, files: int, names, total: int) -> str:
             f"{'its' if one else 'their'} own backup.")
 
 
+def _cancelled_result() -> Dict:
+    """The result of a run the PERSON stopped (the abort flag the Backup tab's
+    worker raises: a Cancel, or the app closing mid-run).
+
+    `cancelled` is the one marker for it (card bricnEaC): `jobs_store.
+    outcome_word` and `record_run` read it, never the message text, so the run
+    log's `cancelled` and the stored `cancelled` come from the same fact. It is
+    set only on `BackupAborted`, i.e. a deliberate stop: a failure, a killed
+    process (`interrupted`) or a Ctrl+C in the headless runner never carries it.
+    """
+    return {"ok": False, "cancelled": True, "message": "Backup cancelled"}
+
+
 def _backup(job: Dict,
             on_progress: Optional[Callable[[int, int], None]],
             should_abort: Optional[Callable[[], bool]],
@@ -690,7 +703,7 @@ def _backup(job: Dict,
                 retry_skipped=True, recopy_changed=True)
     except BackupAborted:
         _discard(partial, manifest_tmp)
-        return {"ok": False, "message": "Backup cancelled"}
+        return _cancelled_result()
     except (TargetWriteFailed, SourceUnavailable) as exc:
         # Unlike a failed verification, nothing is kept for inspection: the
         # copy is incomplete by definition, and on a full drive it is the
@@ -742,9 +755,9 @@ def _backup(job: Dict,
                                                           files)
         except BackupAborted:
             _discard(partial, manifest_tmp)
-            return {"ok": False, "message": "Backup cancelled"}
+            return _cancelled_result()
         except OSError as exc:
-            problem = f"its manifest could not be read back ({plain_error(exc)})"
+            problem =f"its manifest could not be read back ({plain_error(exc)})"
         else:
             if bad:
                 more = ", ..." if bad > len(named) else ""
