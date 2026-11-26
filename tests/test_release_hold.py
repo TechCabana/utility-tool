@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from helpers import clear_ro, clear_ro_tree
 from utils import backup_utils, jobs_store, locks, migrate, runlog, runner, scheduler, versions
 
 REPO = Path(__file__).resolve().parent.parent
@@ -337,6 +338,8 @@ def test_a_damaged_jobs_file_raises_the_usual_error_and_writes_nothing(make_job)
 def test_a_job_with_no_versions_on_disk_still_clears_its_flag(scene):
     s = scene()
     for stamp in names(s.job):
+        clear_ro_tree(backup_utils.version_path(s.job, stamp))
+        clear_ro(backup_utils.manifest_path(s.job, stamp))
         shutil.rmtree(backup_utils.version_path(s.job, stamp))
         os.remove(backup_utils.manifest_path(s.job, stamp))
 

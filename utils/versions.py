@@ -9,14 +9,15 @@ import json
 import os
 import re
 import shutil
-import stat
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from utils.copying import BackupAborted, SourceUnavailable, TargetWriteFailed, copy_tree
-from utils.fs_utils import _is_link_like, long_path, plain_error
-from utils.jobs_store import DEFAULT_RETENTION, VERIFY_MODES, job_hold_released
+from utils.fs_utils import (_is_link_like, clear_read_only, is_read_only, long_path,
+                            plain_error, remark, remove_file, set_read_only)
+from utils.jobs_store import (DEFAULT_RETENTION, FINISHED_UTC_FORMAT, VERIFY_MODES,
+                              job_hold_released, valid_finished_utc)
 
 
 # A version directory is named for the moment the backup started. Matched by
@@ -40,7 +41,12 @@ def job_root(job: Dict) -> str:
 
 
 def version_names(job: Dict) -> List[str]:
-    """Existing version stamps for `job`, oldest first.
+    """Existing version stamps for `job`, sorted BY NAME.
+
+    This is the raw listing, not the chronological order: names are local
+    clock time, so across an autumn clock change name order can disagree with
+    the order the backups were made in. Anything that means "older/newer"
+    uses `ordered_versions`.
 
     Only names matching the timestamp format count. A `.partial` directory
     left by an interrupted run, or anything else in the target folder, is
@@ -56,8 +62,9 @@ def version_names(job: Dict) -> List[str]:
 
 
 def latest_version(job: Dict) -> Optional[str]:
-    """The newest version stamp of `job` (verified or not), or None."""
-    names = version_names(job)
+    """The newest version stamp of `job` (verified or not), or None. Newest
+    in `ordered_versions` order -- by recorded UTC finish time, not by name."""
+    names = ordered_versions(job)
     return names[-1] if names else None
 
 
@@ -86,9 +93,22 @@ def version_datetime(name: str) -> Optional[datetime]:
 #
 # Line 1 is a header, then one line per copied file, then -- only once the
 # job's verification mode has passed -- an end trailer
-# `{"type": "end", "files", "bytes", "verify": mode, "verified": bool}`.
+# `{"type": "end", "files", "bytes", "verify": mode, "verified": bool,
+# "finished_utc": "2026-10-25T01:45:12Z"}`.
 # "verified" is true for "full" and "quick" and false for "off". A trailer
-# written before modes existed has no "verify" key and reads as "full".
+# written before modes existed has no "verify" key and reads as "full". A
+# trailer written before card ved3wVOQ has no "finished_utc" and orders by
+# name (see "Ordering" below); readers ignore keys they do not know.
+# A file line carries `"changed": true` (card RnuRsA2V) only when the file was
+# still changing while its second copy was read: kept, flagged, hash of what
+# was read. Older manifests lack it; every reader ignores it.
+# A file line carries `"ro": true` (card fEC32w6P) only when the SOURCE file was
+# read-only. A finished version's files are marked read-only (see "Protecting a
+# finished version" below), so the stored copy's own bit can no longer say what
+# the source's was; this key does. The trailer carries `"protected": true` when
+# the run was made by a build that does both (records `ro`, marks the version):
+# restore reads `ro` only for such versions. Older manifests lack both keys and
+# readers ignore keys they do not know.
 # A version is verified iff its folder exists and its manifest ends in a
 # verified trailer. Legacy versions (made before manifests) have none and are
 # simply unverified, as is an "off" version.
@@ -132,20 +152,31 @@ def read_manifest_summary(job: Dict, stamp: str) -> Optional[Dict]:
     manifests all come back None -- "not verified", never an exception -- and
     so does a trailer whose mode is unknown or disagrees with its "verified"
     flag, since only a run of this code writes one and it never writes that.
+
+    "finished_utc" is present only when it is a well-formed UTC time; a junk
+    value is dropped (the version then orders by name), never trusted and
+    never an exception.
     """
     line = _last_line(manifest_path(job, stamp))
     if not line:
         return None
     try:
         trailer = json.loads(line.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):    # RecursionError: a 4 KB run of "["
         return None
     if not isinstance(trailer, dict) or trailer.get("type") != "end":
         return None
     mode = trailer.get("verify", "full")
     if mode not in VERIFY_MODES or trailer.get("verified") is not (mode != "off"):
         return None
-    return dict(trailer, verify=mode)
+    summary = dict(trailer, verify=mode)
+    finished = valid_finished_utc(summary.pop("finished_utc", None))
+    if finished:
+        summary["finished_utc"] = finished
+    # Only a real `true` counts; anything else is the same as absent.
+    if summary.pop("protected", None) is True:
+        summary["protected"] = True
+    return summary
 
 
 def verify_mode(job: Dict, stamp: str) -> Optional[str]:
@@ -157,15 +188,91 @@ def verify_mode(job: Dict, stamp: str) -> Optional[str]:
 
 def is_verified(job: Dict, stamp: str) -> bool:
     """True iff version `stamp` exists and its manifest ends verified -- a
-    "full" or "quick" run. An "off" version is complete but never verified."""
+    "full" or "quick" run. An "off" version is complete but never verified.
+
+    This is deliberately only "the manifest says so": it does NOT re-read the
+    stored files, so a file edited after the run (the read-only mark makes
+    that an accident to be refused, not a thing prevented) still reads as
+    verified. Catching that is the deep-verify card's job, not this one's."""
     summary = read_manifest_summary(job, stamp)
     return (os.path.isdir(long_path(version_path(job, stamp)))
             and summary is not None and summary["verified"] is True)
 
 
+# ---------------------------------------------------------------------------
+# Ordering (card ved3wVOQ)
+# ---------------------------------------------------------------------------
+# Version NAMES are local clock time and never change. In the hour the clocks
+# go back, a run made later can carry an EARLIER name, so "older/newer" is not
+# decided by name. It is decided by `finished_utc`, the UTC time recorded in
+# the manifest trailer when the run finalised it. Runs of one job never
+# overlap (the per-job lock), so finish order is run order.
+#
+# The rule, in one place (`_order_key`):
+#   * a version that carries a valid `finished_utc` orders by it;
+#   * a version without one (made before this change, or a damaged/missing
+#     trailer or a junk value) cannot be compared by UTC, so these order by
+#     NAME among themselves, and ALL of them come BEFORE every version that
+#     carries a UTC time -- a version with the field was necessarily made by a
+#     build newer than any version without it;
+#   * ties (same UTC second, or both without) break by name.
+# Known limit: a version whose trailer later becomes damaged loses its UTC
+# time and so sorts among the oldest; it is unverified at that point anyway.
+
+def utc_stamp(moment: datetime) -> str:
+    """`moment` as the `finished_utc` text. A naive `moment` is taken to be
+    UTC already; an aware one is converted to UTC."""
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc)
+    return moment.strftime(FINISHED_UTC_FORMAT)
+
+
+def _order_key(stamp: str, summary: Optional[Dict]) -> Tuple[int, str, str]:
+    """Sort key of version `stamp` whose trailer summary is `summary`.
+
+    `(1, finished_utc, stamp)` with a UTC time, `(0, "", stamp)` without.
+    UTC strings are fixed-width, so string order is time order.
+    """
+    finished = (summary or {}).get("finished_utc")
+    return (1, finished, stamp) if finished else (0, "", stamp)
+
+
+def _ordered(job: Dict) -> List[Tuple[str, Optional[Dict]]]:
+    """`(stamp, trailer summary or None)` for every version, oldest first.
+
+    Reads each manifest's last line once (a few hundred bytes) and returns the
+    summaries so a caller that needs "is it verified" or the file count does
+    not read them again. Never raises: an unreadable manifest is a None
+    summary and the version orders by name.
+    """
+    entries = [(name, read_manifest_summary(job, name)) for name in version_names(job)]
+    entries.sort(key=lambda entry: _order_key(*entry))
+    return entries
+
+
+def ordered_versions(job: Dict) -> List[str]:
+    """Version stamps of `job`, oldest first by recorded UTC finish time, with
+    the fallback rule above. THE chronological order: latest_version, restore,
+    prune, the sanity baseline and changes-since all use it."""
+    return [name for name, _ in _ordered(job)]
+
+
+def version_order_key(job: Dict, stamp: str) -> Tuple[int, str, str]:
+    """Where `stamp` sits in the order, for comparing a stamp that is not part
+    of a listing (the hold release's `since`) with the listed versions. A
+    version no longer on disk has no trailer to read, so it keys by name like
+    a version made before this change."""
+    return _order_key(stamp, read_manifest_summary(job, stamp))
+
+
+def _summary_verified(summary: Optional[Dict]) -> bool:
+    """True when a trailer summary says verified ("full" or "quick")."""
+    return summary is not None and summary["verified"] is True
+
+
 def verified_versions(job: Dict) -> List[str]:
-    """The verified subset of `version_names(job)`, oldest first."""
-    return [name for name in version_names(job) if is_verified(job, name)]
+    """The verified subset of `ordered_versions(job)`, oldest first."""
+    return [name for name, summary in _ordered(job) if _summary_verified(summary)]
 
 
 def version_when(stamp: Optional[str]) -> Optional[str]:
@@ -195,15 +302,16 @@ def restore_candidates(job: Dict) -> Dict:
     No versions: preferred and latest are None. Reads each manifest's tail
     only, so it is cheap enough to call when a button is pressed.
     """
-    names = version_names(job)
+    entries = _ordered(job)                      # oldest first, by recorded UTC time
+    names = [name for name, _ in entries]
     if not names:
         return {"preferred": None, "latest": None, "fallback": False,
                 "newer_unverified": []}
-    verified = [name for name in names if is_verified(job, name)]
+    verified = [name for name, summary in entries if _summary_verified(summary)]
     preferred = verified[-1] if verified else names[-1]
     return {"preferred": preferred, "latest": names[-1],
             "fallback": not verified,
-            "newer_unverified": [name for name in names if name > preferred]}
+            "newer_unverified": names[names.index(preferred) + 1:]}
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +336,8 @@ def sanity_baseline(job: Dict, exclude: Optional[str] = None) -> Tuple[int, Opti
     the copy was checked, so a job with verification "off" is guarded too.
     Legacy versions (no manifest), damaged or truncated trailers and a junk
     `files` value do not count. `exclude` is the stamp of the run being judged.
+    "Older" and "newest" are in `ordered_versions` order (recorded UTC finish
+    time), not name order.
 
     **The owner's release (card QnFM2GMZ).** When the job carries a valid
     `hold_released` acknowledgement (`jobs_store.job_hold_released`), versions
@@ -242,12 +352,14 @@ def sanity_baseline(job: Dict, exclude: Optional[str] = None) -> Tuple[int, Opti
     retention prunes it; it simply stops being the baseline.
     """
     release = job_hold_released(job)
-    since = release["since"] if release else ""
+    # `since` is a stamp; compare in the order the versions are listed in, by
+    # its own key (its recorded UTC time if it is still on disk).
+    since_key = version_order_key(job, release["since"]) if release else None
     best, stamp = 0, None
-    for name in version_names(job):             # oldest first, so >= keeps the newest tie
-        if name == exclude or name < since:     # stamps sort chronologically
+    for name, summary in _ordered(job):         # oldest first, so >= keeps the newest tie
+        if name == exclude or (since_key and _order_key(name, summary) < since_key):
             continue
-        files = (read_manifest_summary(job, name) or {}).get("files")
+        files = (summary or {}).get("files")
         if isinstance(files, int) and not isinstance(files, bool) and files > 0 and files >= best:
             best, stamp = files, name
     return best, stamp
@@ -301,6 +413,77 @@ def release_hold_question(files: int, baseline: int) -> str:
             f"{baseline}. Stop keeping the earlier one?")
 
 
+# ---------------------------------------------------------------------------
+# Protecting a finished version (card fEC32w6P, spec safety item 9)
+# ---------------------------------------------------------------------------
+# A version is an ordinary folder the user is invited to open, so an accidental
+# save, a drag in Explorer or a careless script could change a backup with no
+# sign. Once a version is final, every FILE in it and its manifest get the
+# read-only mark; a write is then refused until someone clears the mark on
+# purpose. This is protection against accidents, NOT against a determined
+# writer (clearing the mark is one click): tamper detection is the deep-verify
+# and encrypted-manifest cards' job, and `is_verified` still means only "the
+# manifest ends in a verified trailer".
+#
+# WHEN: `run_job` calls this right after the manifest and the folder are
+# promoted (`os.replace` of both) and BEFORE the prune, i.e. after everything
+# that writes into the version has finished (the copy, card 55's re-copy, card
+# 54's retry, verification all ran against the `.partial`), and the manifest's
+# trailer is final. Nothing writes a version afterwards.
+#
+# WHAT: files and the manifest only. Directories are not marked: on Windows a
+# folder's read-only bit protects nothing inside it and has Explorer side
+# effects, and on POSIX dropping a directory's write bit would stop retention
+# deleting its files. Only the read-only bit changes (read-modify-write, see
+# `fs_utils.set_read_only`): hidden, system and archive bits are kept.
+#
+# FAILURE IS NOT FATAL: a share that ignores attributes or a permission error
+# leaves that file writable and counted in `failed`; the version is complete
+# and valid either way, and restore treats a still-writable file in a
+# protected version as an ordinary writable one (see `restore_version`).
+#
+# Versions made by earlier builds are not marked and are not migrated.
+
+def protect_version(job: Dict, stamp: str) -> Dict[str, int]:
+    """Mark version `stamp`'s files and its manifest read-only.
+
+    Returns `{"marked": n, "failed": n}`. Never raises for a filesystem
+    problem: one file that cannot be marked (or a folder that cannot be listed)
+    counts once in `failed` and the walk carries on. Links and junctions are
+    never followed or touched.
+    """
+    marked = failed = 0
+    stack = [version_path(job, stamp)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(long_path(current)) as entries:
+                listing = list(entries)
+        except OSError:
+            failed += 1
+            continue
+        for entry in listing:
+            path = os.path.join(current, entry.name)
+            try:
+                if _is_link_like(entry):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(path)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                set_read_only(path, True)
+                marked += 1
+            except OSError:
+                failed += 1
+    try:
+        set_read_only(manifest_path(job, stamp), True)
+        marked += 1
+    except OSError:
+        failed += 1
+    return {"marked": marked, "failed": failed}
+
+
 def prune_versions(job: Dict, protect: Iterable[str] = (),
                    newest: Optional[str] = None) -> List[str]:
     """Delete the oldest versions beyond the job's retention count.
@@ -321,19 +504,25 @@ def prune_versions(job: Dict, protect: Iterable[str] = (),
     `retention` ordinary versions plus the protected ones. An empty `protect`
     is the plain retention prune.
 
+    Oldest and newest are in `ordered_versions` order (recorded UTC finish
+    time; a version without one orders by name, before all that have one).
+
     `newest` is the version the calling run has just made: it is treated as
-    the newest whatever its name says. Names are local clock time, so in the
-    hour the clocks go back a later run can carry an EARLIER name; ordered by
-    name alone, a retention-1 job deleted the backup it had just made and
-    kept the older one.
+    the newest whatever its recorded time or name says. Names are local clock
+    time, so in the hour the clocks go back a later run can carry an EARLIER
+    name; ordered by name alone, a retention-1 job deleted the backup it had
+    just made and kept the older one (PR #17). The UTC order now gets that
+    right by itself; this stays as the belt to its braces, for a clock set
+    back by hand (UTC then goes backwards too) or an unreadable trailer.
     """
     keep = max(1, int(job.get("retention", DEFAULT_RETENTION)))
-    names = version_names(job)
+    entries = _ordered(job)
+    names = [name for name, _ in entries]
     if newest in names:
         names.remove(newest)
         names.append(newest)
-    protected = next((name for name in reversed(names)
-                      if is_verified(job, name)), None)
+    verified = {name for name, summary in entries if _summary_verified(summary)}
+    protected = next((name for name in reversed(names) if name in verified), None)
     protect = set(protect)
     candidates = [name for name in names if name not in protect]
     removed = []
@@ -342,8 +531,10 @@ def prune_versions(job: Dict, protect: Iterable[str] = (),
             continue
         # Manifest first: a version whose folder deletion fails halfway must
         # not keep claiming to be verified.
+        # `remove_file` because the manifest is read-only once the version is
+        # protected (card fEC32w6P); a failure here leaves the version whole.
         try:
-            os.remove(long_path(manifest_path(job, name)))
+            remove_file(manifest_path(job, name))
         except FileNotFoundError:
             pass  # a legacy version has none
         except OSError:
@@ -359,13 +550,22 @@ def prune_versions(job: Dict, protect: Iterable[str] = (),
 def _make_writable_and_retry(func, path, _error) -> None:
     """`shutil.rmtree` error hook: clear read-only, then retry once.
 
-    Windows refuses to delete a read-only file, and a backup keeps the
-    source's read-only bit, so without this one read-only file in the source
-    made every older version of the job undeletable and retention silently
-    stopped working. A second failure propagates to the caller.
+    Windows refuses to delete a read-only file. A backup keeps the source's
+    read-only bit, and since card fEC32w6P every finished version's files are
+    read-only, so without this retention could never delete a version. A
+    second failure propagates to the caller.
     """
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+    was_read_only = is_read_only(path) and os.path.isfile(long_path(path))
+    clear_read_only(path)
+    try:
+        func(path)
+    except OSError:
+        # The delete still failed (a file another program holds open): the
+        # file keeps its mark rather than being left writable in a version
+        # that stays on disk (card fEC32w6P).
+        if was_read_only:
+            remark(path)
+        raise
 
 
 def _rmtree(path: str) -> None:
@@ -388,7 +588,7 @@ def _discard(partial: str, manifest_tmp: str) -> None:
     except OSError:
         pass  # best effort: a leftover .partial is never listed as a version
     try:
-        os.remove(long_path(manifest_tmp))
+        remove_file(manifest_tmp)
     except OSError:
         pass
 
@@ -416,6 +616,9 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
     `<stamp>` entry exists are never touched. Links and junctions are never
     followed or removed. Age comes from the stamp in the name (strictly older
     than `now - max_age_days`), not from file times, so it is deterministic.
+    That is deliberately still the NAME, not `ordered_versions`' UTC order
+    (card ved3wVOQ): a leftover has no finished trailer, and an autumn clock
+    change moves a name by one hour against a seven-day cutoff.
 
     The newest `.partial` is always kept, with its manifests, so one failed
     attempt stays inspectable; it is reported as `kept_for_inspection` when it
@@ -473,8 +676,8 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
             else:
                 try:
                     os.unlink(long_path(path))
-                except PermissionError:  # read-only bit: clear it, retry once
-                    os.chmod(long_path(path), stat.S_IWRITE)
+                except PermissionError:  # read-only mark: clear it, retry once
+                    clear_read_only(path)
                     os.unlink(long_path(path))
         except OSError as exc:
             result["errors"].append(f"{name}: {plain_error(exc)}")
@@ -491,7 +694,8 @@ def sweep_stale(job: Dict, now: Optional[datetime] = None,
 RESTORE_NAMED = 5
 
 
-def _read_manifest_hashes(job: Dict, stamp: str) -> Tuple[Optional[Dict[str, bytes]], Optional[str]]:
+def _read_manifest_hashes(job: Dict, stamp: str, ro_out: Optional[set] = None
+                          ) -> Tuple[Optional[Dict[str, bytes]], Optional[str]]:
     """`({relative path: sha256 digest}, None)` for version `stamp`, or
     `(None, reason)` when its manifest cannot be trusted.
 
@@ -507,6 +711,10 @@ def _read_manifest_hashes(job: Dict, stamp: str) -> Tuple[Optional[Dict[str, byt
     hex, to keep a 100,000-file manifest to tens of megabytes. Paths are in
     the manifest's own form (relative, forward slashes, case kept), which is
     the form `copy_tree` reports them in.
+
+    `ro_out`, if given, receives the path of every file line marked
+    `"ro": true` (the source file was read-only). It is only meaningful when
+    the manifest is trusted (the second value is None).
     """
     path = manifest_path(job, stamp)
     if not os.path.exists(long_path(path)):
@@ -528,6 +736,8 @@ def _read_manifest_hashes(job: Dict, stamp: str) -> Tuple[Optional[Dict[str, byt
                 if not isinstance(rel, str) or len(digest) != 32 or rel in hashes:
                     return None, "manifest damaged"
                 hashes[rel] = digest
+                if ro_out is not None and entry.get("ro") is True:
+                    ro_out.add(rel)
     except (OSError, ValueError):   # unreadable, bad JSON, bad UTF-8, bad hex
         return None, "manifest damaged"
     if len(hashes) != summary.get("files"):
@@ -627,6 +837,19 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
       unreadable is not restored, so it is in `errors` (as before) and not
       counted against `verified`.
 
+    **Permissions (card fEC32w6P).** The stored files of a version marked by
+    `protect_version` are read-only, and `_hash_copy` carries that over, so for
+    such a version (trailer `protected: true`, manifest trusted) each restored
+    file is made writable unless its manifest line says `ro: true` (the SOURCE
+    file was read-only), and then made read-only. A file that is still
+    writable in a protected version (its marking failed) is restored writable
+    like any other. A version without `protected` (made by an earlier build) or
+    with a manifest that cannot be trusted keeps the old rule: the copy keeps
+    whatever read-only bit the stored file has. A restore into a folder that
+    already holds a read-only file of the same name replaces it
+    (`copying._open_for_write`); one that cannot is a `no_permission` failure
+    naming the file.
+
     `ok` keeps its meaning (the files were copied); a mismatch is
     `ok=True, verified=False`, so callers that only look at `ok` behave as
     before and callers that care read `verified`. A cancelled restore
@@ -645,17 +868,32 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
     folder = os.path.join(destination, f"{safe_name}-restored-{version}")
     existed = os.path.exists(long_path(folder))
     stats: Dict[str, int] = {}
-    expected, unchecked_reason = _read_manifest_hashes(job, version)
+    # Card fEC32w6P. Which restored files should be read-only. The stored files
+    # of a PROTECTED version (trailer `protected: true`) are read-only because
+    # of the protective mark, so their own bit says nothing about the source:
+    # a restored file is writable unless its manifest line says `ro: true`.
+    # A version made before the mark (no `protected`) keeps the old rule: the
+    # stored file's own bit IS the source's, and the copy carries it over. A
+    # manifest that cannot be trusted (`expected is None`) says nothing about
+    # `ro`, so the copy's attributes are left exactly as the copy made them.
+    summary = read_manifest_summary(job, version)
+    protected = bool(summary and summary.get("protected"))
+    read_only_paths: set = set()
+    expected, unchecked_reason = _read_manifest_hashes(
+        job, version, read_only_paths if protected else None)
+    fix_modes = protected and expected is not None
     check: Dict = {"checked": 0, "mismatched": [], "not_in_manifest": [],
                    "missing_from_version": [], "unchecked_reason": unchecked_reason,
                    "verified": False}
 
-    def compare(rel: str, _size: int, _mtime: float, sha: str) -> None:
-        """Compare one restored file's copy-time hash with its manifest entry.
+    def compare(rel: str, _size: int, _mtime: float, sha: str, **_flags) -> None:
+        """Compare one restored file's copy-time hash with its manifest entry,
+        and (protected version) give the restored file its source's mode.
 
         Pops the entry so what is left in `expected` at the end is what the
         restore did not produce. Never raises: `copy_tree` would delete the
-        file just copied if its callback failed.
+        file just copied if its callback failed. `_flags` swallows `ro=True`,
+        which `copy_tree` passes because the STORED file is read-only.
         """
         want = expected.pop(rel, None)
         if want is None:
@@ -664,11 +902,29 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
             check["checked"] += 1
         else:
             check["mismatched"].append(rel)
+        if fix_modes:
+            try:
+                set_read_only(os.path.join(folder, *rel.split("/")),
+                              rel in read_only_paths)
+            except OSError:
+                # Best effort: the file keeps the stored copy's read-only bit,
+                # which is the safe side; the restore itself is unaffected.
+                check["unrestored_modes"] = check.get("unrestored_modes", 0) + 1
+
+    def count_read_only(_rel: str, _size: int, _mtime: float, _sha: str,
+                        ro: bool = False, **_flags) -> None:
+        """No trusted manifest: count the restored files that kept the stored
+        copy's read-only mark (`ro=True` from `copy_tree`), so the message can
+        say why they cannot be edited. Since card fEC32w6P a protected
+        version's every file is read-only, and only its manifest says which
+        were read-only in the source. Never raises."""
+        if ro:
+            check["read_only_kept"] = check.get("read_only_kept", 0) + 1
 
     try:
         files, restored_bytes, errors = copy_tree(
             source, folder, on_progress=on_progress, should_abort=should_abort,
-            on_copied=compare if expected is not None else None, stats=stats)
+            on_copied=compare if expected is not None else count_read_only, stats=stats)
     except BackupAborted:
         # Only the files restored before the stop were compared; nothing here
         # claims the rest were. Never `verified`.
@@ -724,5 +980,12 @@ def restore_version(job: Dict, version: Optional[str], destination: str,
                     "could not be read from the backup and were skipped")
     if sentence and not sentence.startswith(" and "):
         message += sentence
+    if check.get("unrestored_modes"):
+        message += (f". {_files(check['unrestored_modes'])} could not be made "
+                    "writable and stayed read-only (clear the read-only mark to edit)")
+    if check.get("read_only_kept"):
+        message += (f". {_files(check['read_only_kept'])} stayed read-only as they are "
+                    "stored in the backup, since its checksum list cannot say which were "
+                    "read-only originally (clear the read-only mark to edit)")
     return dict(check, ok=True, message=message, path=folder, files=files,
                 bytes=restored_bytes, errors=errors)

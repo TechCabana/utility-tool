@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from helpers import clear_ro
 from utils import backup_utils, copying, jobs_store, runner, versions
 
 REPO = Path(__file__).resolve().parent.parent
@@ -259,6 +260,7 @@ def test_a_junk_files_value_in_a_trailer_is_ignored(make_job):
     run(job)
     stamp = backup_utils.version_names(job)[0]
     path = backup_utils.manifest_path(job, stamp)
+    clear_ro(path)      # a finished version's manifest is read-only (card fEC32w6P)
     lines = open(path, encoding="utf-8").read().splitlines()
     trailer = json.loads(lines[-1])
     trailer["files"] = "ten"
@@ -563,6 +565,7 @@ def test_an_off_version_with_a_damaged_trailer_is_not_a_baseline(make_job):
     run(job)
     stamp = backup_utils.version_names(job)[0]
     path = backup_utils.manifest_path(job, stamp)
+    clear_ro(path)
     with open(path, "rb") as handle:
         data = handle.read()
     with open(path, "wb") as handle:

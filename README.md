@@ -196,15 +196,33 @@ Windows the hidden, system, archive and read-only marks are kept too, so a hidde
 hidden after a restore. Two things are left out. Alternate data streams are not backed up: these
 are the extra data Windows can attach to a file, such as the "downloaded from the internet" mark
 (`Zone.Identifier`), so a restored file does not carry that mark. Symbolic links and junctions
-are skipped, not followed.
+(shortcuts to a folder or file somewhere else) are not followed, so what they point to is not in
+the backup, and they are named instead of dropped without a word: the job reads "OK, N
+shortcuts not followed" (with the skipped and changed counts first when there are any), its
+Status tooltip lists up to five of them, a run's message says, for example, "2 shortcut
+folders point somewhere else and were not followed: Archive, Photos. Add those locations as
+their own backup", and the headless run prints a `[WARN]` line to stderr (exit code
+unchanged). Windows' own profile junctions (`My Documents`, `Application Data` and the like,
+which Windows marks hidden and system and which point back into the same profile) are not
+counted; a junction you made yourself is counted even when it has one of those names.
 
-**Version names use local time.** A version is named for the computer's clock when its backup
-started, for example `20261025-013000`. When the clocks go back in autumn, one hour happens
-twice. If a job ran once in each pass of that hour, and the second run's clock time is the
-earlier one, Safekeep sorts the two the wrong way round and treats the older as the newer:
-Restore picks the older one by default, and a later run's clean-up removes the newer of the two
-first. A run never deletes the backup it has just made, whatever its name. It needs two backups
-of one job inside that single hour, so it is rare. It is a known limit, accepted for now.
+**Stored files are marked read-only.** Once a backup is finished its files and its checksum
+list are marked read-only (on macOS and Linux the write permission is dropped), so an accidental
+save or script is refused, which protects against accidents but not against someone who clears
+the mark on purpose, and a restored file is an ordinary writable file unless the original was
+read-only; backups made by earlier versions are not marked.
+
+**Version names use local time; their order does not.** A version is named for the computer's
+clock when its backup started, for example `20261025-013000`. When the clocks go back in
+autumn, one hour happens twice, so a backup made later can carry an earlier name than one made
+before it. Safekeep therefore does not order backups by name. Each backup's checksum list ends
+with the UTC time the backup finished, and Restore's default choice, the clean-up that keeps
+only the last few versions, the newest-verified-copy rule, the file-count comparison that holds
+back a clean-up and the "changes since" figure all use that time. The names and folders are
+unchanged. A backup made before this change has no recorded time, so those are ordered by name
+and counted as older than any backup that has one; the old mix-up can therefore still happen
+for two of those made inside the same repeated hour, and for a backup whose checksum list has
+since been damaged. A run never deletes the backup it has just made, whatever its name.
 
 **What the check proves.** While it copies, Safekeep records a SHA-256 checksum of each file,
 taken from the bytes it actually read from the source. Before a new version is kept, the job's
@@ -225,9 +243,16 @@ Safekeep read. It does not mean:
   program has locked, is tried once more at the end of the copy and then skipped. The job reads
   "OK, N skipped" instead of "OK", and its Status tooltip gives the count and up to five names.
   If more than 30% of the files (and at least three) could not be copied, the run fails instead.
-- **The source stood still.** Safekeep does not take a snapshot. A file that changes while it
-  is being copied is saved as Safekeep read it, and the check confirms the copy matches that
-  read, not that the file was in a consistent state at that moment.
+- **The source stood still.** Safekeep does not take a snapshot. After copying each file it
+  looks at the source again, and a file whose size or modified time is not what it was before
+  the copy changed underneath the read, so it is copied once more. If it changed again, that
+  second copy is kept and the file is marked in the checksum list; the job then reads "OK, N
+  changed during backup" (with the skipped count first when there is one, for example "OK, 1
+  skipped, 1 changed during backup") and its Status tooltip names up to five of the files.
+  The check still only confirms that the copy matches what was read, so a marked file may mix
+  old and new parts: close the program using it and back up again. A change that leaves both
+  the size and the modified time as they were is not seen, and a snapshot of the source
+  (Windows shadow copy) is planned, not built.
 - **The backup stays intact.** The check runs once, right after the copy, and its re-read can
   be answered from the computer's memory rather than the disk. Nothing re-checks stored versions
   later, so bit rot on the backup drive goes unnoticed until you restore; a scheduled deeper
@@ -240,7 +265,11 @@ Safekeep read. It does not mean:
 through a run, Safekeep does not pick the copy up where it stopped. The half-finished copy is
 never treated as a version, the job's Status reads "Interrupted: started ... and never
 finished", and the next run starts again from the beginning. A backup drive that is unplugged
-mid-run is a failed run instead, reported with its cause, and the next run likewise starts over.
+mid-run is a failed run instead, reported with its cause, and the next run likewise starts
+over. Closing the app while a backup runs cancels it: the half-finished copy is removed and the
+job reads "Failed" (its result is "Backup cancelled"), not "Interrupted". A close that comes
+after the copy was checked and kept, while older versions are being removed, waits for that
+step to finish and records the backup as made.
 
 ---
 
@@ -296,7 +325,12 @@ flowchart LR
 4. A run first checks it can succeed (pre-flight: source present and non-empty, target not
    inside the source, enough free space, the same target drive as before), then copies the
    source into `<target>/<job id>/<timestamp>.partial/`, hashing every file into a
-   `<timestamp>.manifest.jsonl` beside it. By default every copied file is re-read and checked
+   `<timestamp>.manifest.jsonl` beside it (one line per file with its path, size, modified time
+   and SHA-256, plus `"changed": true` for a file still changing on its second copy and
+   `"ro": true` when the source file was read-only; the last line records the file and byte
+   counts, the check mode and result, `finished_utc`, the UTC time versions are ordered by, and
+   `"protected": true`, meaning the version's files were marked read-only and restore takes each
+   file's read-only state from `ro`). By default every copied file is re-read and checked
    against the manifest before the folder is renamed to `<timestamp>/`; a mismatch fails the
    run and prunes nothing. Each job can instead use a quick check (every file's size, plus the
    hashes of a sample of at most 500 files) or no check at all; a version made with the check
@@ -311,7 +345,10 @@ flowchart LR
    nothing is promoted or pruned and earlier versions are left as they were. A file that cannot
    be read at first (often one another program has locked) gets one more try once the rest of
    the tree is copied; if it still cannot be read it is skipped and counted in the result, and
-   the job then reads "OK, N skipped" rather than plain OK. A run that copied more
+   the job then reads "OK, N skipped" rather than plain OK. A file that changed while it
+   was being copied is copied once more (that is its one extra attempt, in total); one that
+   is still changing is kept and counted separately, and the job reads "OK, N changed during
+   backup". A run that copied more
    than 30% fewer files than the largest version still kept (verified or not) succeeds and
    keeps that larger version aside ("pruning held") while the others are pruned as usual, so
    an emptied source cannot roll the last complete copy out of retention and a source that
@@ -369,6 +406,10 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
     "last_result": "ok",
     "last_skipped": 0,
     "last_skipped_sample": [],
+    "last_changed": 0,
+    "last_changed_sample": [],
+    "last_links": 0,
+    "last_links_sample": [],
     "last_pruning_held": false,
     "last_baseline_files": 0,
     "last_files": 1204
@@ -387,15 +428,18 @@ One JSON file (`backup_jobs.json`) holding a list of jobs, in the shape
 | `last_result` | string | `ok`, `failed: <message>`, or `interrupted: started <time> and never finished` (a run that began and was killed or crashed before it recorded a result; `last_run` is then when it began) |
 | `running` | object | Present only while a run is under way, or after one died: `{since, pid, start_time, stamp, token}`, written just before copying and removed when the run records its outcome. A marker whose process is gone is shown as "Interrupted" and recorded as `interrupted` in `last_result` and the run log. Do not edit it by hand |
 | `last_skipped`, `last_skipped_sample` | int, list | Files the last run could not read, and up to five of their names; 0 and empty after a clean or a failed run |
+| `last_changed`, `last_changed_sample` | int, list | Files the last run kept although they were still changing while they were copied (marked `"changed": true` in the checksum list), and up to five of their paths from the source root; 0 and empty after a clean or a failed run |
+| `last_links`, `last_links_sample` | int, list | Shortcuts (symbolic links and junctions) the last run did not follow, so what they point to is not in its version, and up to five of their paths from the source root (never the place they point to); 0 and empty after a run with none, or a failed run |
 | `last_pruning_held`, `last_baseline_files`, `last_files` | bool, int, int | Whether the last successful run kept a larger older version aside, that version's file count, and how many files it copied; a failed run leaves all three unchanged |
+| `last_finished_utc` | string | When the last successful run finished, in UTC (`2026-10-25T01:45:12Z`), the same value as the end of its checksum list; absent until a job has a successful run made by a version that records it, and a failed run leaves it unchanged |
 | `last_precheck` | object | The last pre-check's summary: `{time, ok, aborted, fs, scanned, problems, blocking, counts, sample}` (counts by kind, up to five paths from the source root). Absent until a job is first checked |
 | `hold_released` | object | Present after the owner released a pruning hold: `{stamp, files, level, since, time}`, the version let go and its file count, the source's file count then, and the newest version at that moment. Versions older than `since` no longer count as the larger backup to compare with |
 
 The file is replaced atomically on every save, and the previous good copy is kept as
 `backup_jobs.json.bak`. A damaged file is reported as damaged, never read as "no jobs"; the
 Backup screen offers to restore the `.bak`, and the headless `--run-backup-job` path exits 3.
-A jobs file written by an older version (without the last five fields) reads as "nothing
-skipped, nothing held".
+A jobs file written by an older version (without the skipped, changed and hold fields) reads
+as "nothing skipped, nothing changed, nothing held".
 
 </details>
 
@@ -438,21 +482,27 @@ utility-tool/
 │   ├── locks.py            cross-process lock files: one run per job, one writer of the jobs file
 │   └── migrate.py          one-time copy of data, tasks and settings from the UtilityTool name
 └── tests/                 pytest suite over utils/ and styles/ (Qt-free layer only, see Testing)
-    ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder
+    ├── conftest.py         keeps every test's jobs file, locks and run logs out of the real app-data folder; clears read-only marks under the temp folder when the session ends
+    ├── helpers.py          clears or reads the read-only mark on files inside finished versions
     ├── test_backup_utils.py
     ├── test_activity.py
+    ├── test_changed_during_copy.py
     ├── test_clock_change.py
+    ├── test_close_midrun.py
+    ├── close_midrun_child.py   not a test: the real app, closed mid-run, as a child process of test_close_midrun.py
     ├── test_edit_keeps_run_state.py
     ├── test_empty_job_list.py
     ├── test_fs_utils.py
     ├── test_interrupted_run.py
     ├── test_jobs_file.py
+    ├── test_links_not_followed.py
     ├── test_lock_start_time.py
     ├── test_locks.py
     ├── test_long_paths.py
     ├── test_migrate.py
     ├── test_precheck.py
     ├── test_preflight.py
+    ├── test_read_only_versions.py
     ├── test_release_hold.py
     ├── test_restore_candidates.py
     ├── test_restore_check.py
@@ -465,6 +515,7 @@ utility-tool/
     ├── test_sweep.py
     ├── test_target_failures.py
     ├── test_tokens.py
+    ├── test_utc_order.py
     ├── test_verify.py
     └── test_verify_modes.py
 ```

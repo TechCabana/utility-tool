@@ -12,6 +12,7 @@ Qt-free by design (CLAUDE.md §3/§8) -- plain paths in, plain values out.
 import datetime
 import errno
 import os
+import stat
 import sys
 
 APP_NAME = "Safekeep"
@@ -147,6 +148,93 @@ def plain_error(exc: OSError) -> OSError:
     return exc
 
 
+# ---------------------------------------------------------------------------
+# The read-only mark (card fEC32w6P)
+# ---------------------------------------------------------------------------
+# One place that turns a file's write protection on and off, so a finished
+# version can be marked and every delete path can undo it the same way.
+# `os.chmod` is already a read-modify-write of the attributes on Windows (it
+# toggles only FILE_ATTRIBUTE_READONLY and keeps hidden/system/archive), and on
+# POSIX these helpers touch only the write bits.
+
+_WRITE_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+
+
+def mode_with_write(mode: int, writable: bool) -> int:
+    """`mode` with write permission off (every write bit dropped) or on (the
+    owner's write bit added; nothing else changes). Pure, so the POSIX
+    arithmetic is testable on any platform."""
+    return mode | stat.S_IWUSR if writable else mode & ~_WRITE_BITS
+
+
+def set_read_only(path: str, read_only: bool) -> None:
+    """Make the file at `path` read-only (`read_only=True`) or writable again.
+
+    Windows: the read-only attribute, nothing else. POSIX: True drops every
+    write bit; False adds the OWNER's write bit back only (the group/other
+    bits a file had are not recoverable from the read-only form). Plain path in
+    (`long_path` is applied here). Raises OSError.
+    """
+    target = long_path(path)
+    os.chmod(target, mode_with_write(stat.S_IMODE(os.stat(target).st_mode), not read_only))
+
+
+def is_read_only(path: str) -> bool:
+    """True when `path` has no write permission at all (the read-only attribute
+    on Windows, no write bit elsewhere). False for anything that cannot be
+    looked at."""
+    try:
+        return not os.stat(long_path(path)).st_mode & _WRITE_BITS
+    except OSError:
+        return False
+
+
+def clear_read_only(path: str) -> None:
+    """Make `path` writable, whatever it is (file or folder). Raises OSError.
+
+    The one way every delete path undoes the mark: `remove_file`, the
+    `shutil.rmtree` hook and the sweep all come here.
+    """
+    target = long_path(path)
+    os.chmod(target, stat.S_IMODE(os.lstat(target).st_mode) | stat.S_IWUSR)
+
+
+def remark(path: str) -> None:
+    """Best-effort `set_read_only(path, True)`: for undoing a clear after the
+    delete it was for failed. Never raises."""
+    try:
+        set_read_only(path, True)
+    except OSError:
+        pass
+
+
+def remove_file(path: str) -> None:
+    """`os.remove`, but a read-only FILE is made writable and removed.
+
+    Windows refuses to delete a read-only file (PermissionError), and finished
+    versions and their manifests are now marked read-only. FileNotFoundError
+    and every other failure propagate unchanged; so does the original
+    PermissionError when clearing the mark does not help (a locked file).
+    """
+    target = long_path(path)
+    try:
+        os.remove(target)
+    except PermissionError as exc:
+        if os.path.islink(target) or not os.path.isfile(target):
+            raise
+        try:
+            clear_read_only(path)
+        except OSError:
+            raise exc from None
+        try:
+            os.remove(target)
+        except OSError:
+            # Still undeletable (locked): put the mark back, so a failed
+            # delete does not leave a protected file quietly writable.
+            remark(path)
+            raise
+
+
 def _is_link_like(entry: os.DirEntry) -> bool:
     """True for symlinks and, on Windows, junctions / mount points.
 
@@ -174,6 +262,76 @@ def _is_link_like(entry: os.DirEntry) -> bool:
     except OSError:
         return False  # unreadable; the caller counts it as skipped
     return bool(tag & _NAME_SURROGATE)
+
+
+# Folder links Windows itself puts in a user profile for programs written
+# before Vista ("My Documents" -> Documents, "Application Data" -> AppData\Roaming,
+# ...). They point back into the same profile, so they hold nothing a backup of
+# that profile is missing, and they deny listing by design. Lowercase: Windows
+# names are case-insensitive.
+LEGACY_PROFILE_LINKS = frozenset({
+    "my documents", "application data", "local settings", "cookies", "nethood",
+    "printhood", "recent", "sendto", "start menu", "templates", "my music",
+    "my pictures", "my videos", "history", "temporary internet files",
+})
+# FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM: Windows sets both on each of the
+# junctions above (checked on a Windows 11 profile: all read 0x2416); a junction
+# a user makes with `mklink /J` has neither.
+_HIDDEN_SYSTEM = 0x2 | 0x4
+
+
+def profile_root(path: str):
+    """The user-profile folder `path` is inside (or is): the nearest ancestor
+    whose parent is called `Users`, as `C:\\Users\\alice`; None if there is none.
+
+    Lexical only (never touches the filesystem), so it works on a path that is
+    not there, and tests can stand a fake profile up in a temp folder.
+    """
+    current = os.path.normpath(path)
+    while True:
+        parent, name = os.path.split(current)
+        if not name or parent == current:
+            return None
+        if os.path.basename(parent).lower() == "users":
+            return current
+        current = parent
+
+
+def is_legacy_profile_link(entry: os.DirEntry, path: str) -> bool:
+    """True for one of Windows' own compatibility junctions in a user profile,
+    which the "shortcuts not followed" report must not ask the user to act on.
+
+    ALL of: Windows; a junction (not a symlink) to a folder; marked hidden AND
+    system on the link itself, as Windows marks every one of these and `mklink`
+    marks none; named in `LEGACY_PROFILE_LINKS`; inside a user profile
+    (`profile_root`); and its target resolves inside that same profile. A
+    junction with one of these names that the user made (no marks: a
+    `Documents\\Templates` pointing at another folder of the same profile, whose
+    contents are then in no version) or that points anywhere else (another
+    drive, another user) is somebody's real shortcut and is still reported.
+
+    Not decided by listing the junction: these are access-denied by design, and
+    listing would FOLLOW the link, which the copy deliberately never does. The
+    target is read with `os.path.realpath` (reads the link, lists nothing). If
+    that cannot resolve it returns the link's own path, which is inside the
+    profile, so the name and place decide -- the legacy set is the evidence.
+    `path` is the entry's plain path.
+    """
+    if os.name != "nt" or entry.name.lower() not in LEGACY_PROFILE_LINKS:
+        return False
+    try:
+        if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+            return False
+        marks = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return False
+    if marks & _HIDDEN_SYSTEM != _HIDDEN_SYSTEM:
+        return False
+    profile = profile_root(os.path.dirname(path))
+    if profile is None:
+        return False
+    inside = os.path.normcase(os.path.realpath(profile)) + os.sep
+    return (os.path.normcase(os.path.realpath(path)) + os.sep).startswith(inside)
 
 
 def human_size(num_bytes: int) -> str:

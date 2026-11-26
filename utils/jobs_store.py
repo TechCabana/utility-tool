@@ -89,6 +89,10 @@ def new_job(name: str, source: str, target: str, schedule: str = "daily",
         "last_result": "",
         "last_skipped": 0,
         "last_skipped_sample": [],
+        "last_changed": 0,
+        "last_changed_sample": [],
+        "last_links": 0,
+        "last_links_sample": [],
         "last_pruning_held": False,
         "last_baseline_files": 0,
         "last_files": 0,
@@ -114,6 +118,38 @@ def job_skipped_sample(job: Dict) -> List[str]:
     return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
 
 
+def job_changed(job: Dict) -> int:
+    """How many files `job`'s last run kept although they changed while being
+    copied (card RnuRsA2V); 0 when the field is missing (an older jobs file) or
+    is not a positive whole number."""
+    value = job.get("last_changed")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def job_changed_sample(job: Dict) -> List[str]:
+    """The (at most `SKIPPED_SAMPLE_MAX`) relative paths stored with `last_changed`."""
+    sample = job.get("last_changed_sample")
+    if not isinstance(sample, list):
+        return []
+    return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
+
+
+def job_links(job: Dict) -> int:
+    """How many shortcuts (symlinks, junctions) `job`'s last run did not follow
+    (card tiha5I8F); 0 when the field is missing (an older jobs file) or is not a
+    positive whole number."""
+    value = job.get("last_links")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def job_links_sample(job: Dict) -> List[str]:
+    """The (at most `SKIPPED_SAMPLE_MAX`) relative paths stored with `last_links`."""
+    sample = job.get("last_links_sample")
+    if not isinstance(sample, list):
+        return []
+    return [name for name in sample if isinstance(name, str)][:SKIPPED_SAMPLE_MAX]
+
+
 # A version stamp (`versions.VERSION_FORMAT`); `[0-9]`, not `\d`: no Unicode digits.
 _STAMP_RE = re.compile(r"[0-9]{8}-[0-9]{6}")
 
@@ -121,6 +157,27 @@ _STAMP_RE = re.compile(r"[0-9]{8}-[0-9]{6}")
 def _count(value) -> int:
     """`value` if it is a positive whole number (not a bool), else 0."""
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+# The UTC time a backup finished, as recorded in its manifest trailer
+# (`finished_utc`) and on the job (`last_finished_utc`): fixed-width ISO-8601
+# with a literal "Z", e.g. 2026-10-25T01:45:12Z. Fixed width is what lets two
+# of them be compared as plain strings (card ved3wVOQ).
+FINISHED_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_FINISHED_UTC_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+
+def valid_finished_utc(value) -> Optional[str]:
+    """`value` if it is a well-formed `FINISHED_UTC_FORMAT` string naming a
+    real moment, else None. Junk (wrong type, wrong shape, month 13, a local
+    time with an offset, padding) is never trusted for ordering."""
+    if not isinstance(value, str) or not _FINISHED_UTC_RE.fullmatch(value):
+        return None
+    try:
+        datetime.strptime(value, FINISHED_UTC_FORMAT)
+    except ValueError:
+        return None
+    return value
 
 
 def job_pruning_held(job: Dict) -> bool:
@@ -643,6 +700,26 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
             str(error).split(": ", 1)[0].rsplit("/", 1)[-1]
             for error in errors[:SKIPPED_SAMPLE_MAX]
         ] if skipped else []
+        # Card RnuRsA2V: files kept although they were still changing while
+        # copied. Same shape as the skipped pair, and a sibling of it: the job
+        # reads "ok" either way (existing readers keep working) and the screen
+        # builds "OK, N changed during backup" from this count. Relative paths
+        # (from the source root, forward slashes), never an absolute one, and
+        # only the successful run's: a failed run kept nothing.
+        changed = _count(result.get("changed")) if result.get("ok") else 0
+        job["last_changed"] = changed
+        job["last_changed_sample"] = [
+            name for name in (result.get("changed_sample") or [])
+            if isinstance(name, str)][:SKIPPED_SAMPLE_MAX] if changed else []
+        # Card tiha5I8F: shortcuts the run did not follow. Same shape again (the
+        # job reads "ok", the screen builds "OK, N shortcuts not followed"):
+        # relative paths only, never the target a link points at, and only a
+        # finished run's, since a failed run made no statement about the tree.
+        links = _count(result.get("links_skipped")) if result.get("ok") else 0
+        job["last_links"] = links
+        job["last_links_sample"] = [
+            name for name in (result.get("links_sample") or [])
+            if isinstance(name, str)][:SKIPPED_SAMPLE_MAX] if links else []
         # Card 51: a run that kept its baseline aside says so on the job. Only a
         # successful run recomputes the three fields: a failed run (often the
         # very low-space failure a hold can lead to) says nothing about the
@@ -654,5 +731,12 @@ def record_run(job_id: str, result: Dict) -> Optional[Dict]:
             job["last_pruning_held"] = held
             job["last_baseline_files"] = _count(result.get("baseline_files")) if held else 0
             job["last_files"] = _count(result.get("files"))
+            # Card ved3wVOQ: when the backup finished, in UTC (the same value
+            # as its manifest trailer). Only a valid one is written, so a
+            # missing or junk value leaves any earlier one alone. It is not in
+            # SETTINGS_KEYS, so a job-form save can never roll it back.
+            finished = valid_finished_utc(result.get("finished_utc"))
+            if finished:
+                job["last_finished_utc"] = finished
         _save_job(job)
     return job

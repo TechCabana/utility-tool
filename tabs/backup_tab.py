@@ -45,9 +45,13 @@ class BackupWorker(QtCore.QObject):
         super().__init__()
         self.work = work
         self._abort = False
+        # The result, also kept here: `BackupTab.shutdown` reads it after joining
+        # the thread, when the queued `finished` can no longer be delivered.
+        self.result = None
 
     @QtCore.Slot()
     def run(self):
+        """Do the work, keep the result, then emit it."""
         try:
             result = self.work(self.progress.emit, lambda: self._abort,
                                self.phase.emit)
@@ -56,6 +60,7 @@ class BackupWorker(QtCore.QObject):
             # ok=False result, so reaching here means something genuinely
             # unforeseen. It still must not take the app down mid-batch.
             result = {"ok": False, "message": f"Unexpected failure: {exc}"}
+        self.result = result
         self.finished.emit(result)
 
     def abort(self):
@@ -694,9 +699,16 @@ class JobRow(QtWidgets.QWidget):
             # Silence is never success: a run that left files behind is not
             # plain OK, however green that would look.
             skipped = backup_utils.job_skipped(job)
+            changed = backup_utils.job_changed(job)
+            links = backup_utils.job_links(job)
             held = backup_utils.job_pruning_held(job)
-            if skipped or held:
+            if skipped or changed or links or held:
+                # One short clause per note, in the order of how much each
+                # matters; the tooltip is where the detail lives.
                 parts = (([f"{skipped} skipped"] if skipped else [])
+                         + ([f"{changed} changed during backup"] if changed else [])
+                         + ([f"{links} shortcut{'s' if links != 1 else ''} not followed"]
+                            if links else [])
                          + (["pruning held"] if held else []))
                 return "OK, " + ", ".join(parts), "StatusWarn"
             return "OK", "StatusOk"
@@ -718,6 +730,10 @@ class JobRow(QtWidgets.QWidget):
         parts = []
         if backup_utils.job_skipped(job):
             parts.append(JobRow._skipped_detail(job))
+        if backup_utils.job_changed(job):
+            parts.append(JobRow._changed_detail(job))
+        if backup_utils.job_links(job):
+            parts.append(JobRow._links_detail(job))
         if backup_utils.job_pruning_held(job):
             parts.append(backup_utils.pruning_held_sentence(
                 backup_utils.job_last_files(job), backup_utils.job_baseline_files(job)))
@@ -734,6 +750,34 @@ class JobRow(QtWidgets.QWidget):
             text += "\n" + "\n".join(names)
             if skipped > len(names):
                 text += f"\nand {skipped - len(names)} more"
+        return text
+
+    @staticmethod
+    def _changed_detail(job: dict) -> str:
+        """What "OK, N changed during backup" means, and up to five names."""
+        changed = backup_utils.job_changed(job)
+        names = backup_utils.job_changed_sample(job)
+        text = ("These files were being changed while they were backed up, so the "
+                "copy may mix old and new parts. Close the program using them "
+                "and back up again.")
+        if names:
+            text += "\n" + "\n".join(names)
+            if changed > len(names):
+                text += f"\nand {changed - len(names)} more"
+        return text
+
+    @staticmethod
+    def _links_detail(job: dict) -> str:
+        """What "OK, N shortcuts not followed" means, and up to five names."""
+        links = backup_utils.job_links(job)
+        names = backup_utils.job_links_sample(job)
+        text = ("These are shortcuts to somewhere else. Safekeep does not follow "
+                "shortcuts, so what they point to is not in this backup. Add those "
+                "locations as their own backup.")
+        if names:
+            text += "\n" + "\n".join(names)
+            if links > len(names):
+                text += f"\nand {links - len(names)} more"
         return text
 
     def _last_run(self, job: dict) -> str:
@@ -905,6 +949,7 @@ class BackupTab(QtWidgets.QWidget):
         self._can_restore_jobs = False   # a usable .bak copy exists
         self._backup_loaded = False
         self._backup_done = None      # the handler for the run in flight
+        self._record_on_close = False  # shutdown still records it (a backup run)
         self._remeasure = False       # a backup just ran; its drift is stale
         # Carries a run's result line across the remeasure that follows it,
         # so the remeasure's own outcome does not erase what just happened.
@@ -946,13 +991,26 @@ class BackupTab(QtWidgets.QWidget):
             self.refresh_changes()
 
     def shutdown(self):
-        """Abort and join the backup worker. Wired to QApplication.aboutToQuit."""
-        if self.backup_worker:
-            self.backup_worker.abort()
+        """Abort and join the backup worker. Wired to QApplication.aboutToQuit.
+
+        A backup run that was joined here still gets its outcome recorded. Its
+        `finished` signal is queued to this thread's event loop, which has
+        already ended, so `on_backup_finished` never runs: without this the
+        start marker stayed and the job read "Interrupted" next time, even
+        after a run that finished and verified (closing during the prune).
+        Only a backup run is recorded (`_record_on_close`); a restore or a
+        measurement has nothing to record and must not open a dialog now.
+        """
+        worker, record = self.backup_worker, self._record_on_close
+        if worker:
+            worker.abort()
         if self.backup_thread:
             self.backup_thread.quit()
             self.backup_thread.wait()
         self.backup_thread = self.backup_worker = None
+        handler, self._backup_done = self._backup_done, None
+        if record and handler is not None and worker is not None and worker.result is not None:
+            handler(worker.result)
 
     def _build_backup(self) -> QtWidgets.QWidget:
         """The Backup screen: one surface, Jobs then Restore as its sections.
@@ -1562,6 +1620,7 @@ class BackupTab(QtWidgets.QWidget):
                 job, progress, abort, phase),
             lambda result: self._finish_run(job, result),
             phases={"verifying": f"Verifying backup \"{job.get('name')}\"..."},
+            record_on_close=True,
         )
 
     def _choose_restore_version(self, job: dict):
@@ -1667,12 +1726,16 @@ class BackupTab(QtWidgets.QWidget):
         self._start_backup("Checking what has changed since each backup...",
                            work, self._finish_changes)
 
-    def _start_backup(self, status: str, work, done, phases=None):
+    def _start_backup(self, status: str, work, done, phases=None,
+                      record_on_close=False):
         """Run one backup-related call on a QThread, locking the screen.
 
         `phases` maps a phase name the work reports to the status line shown
         while it lasts; a phase not in it leaves the status line alone.
+        `record_on_close` (a backup run) lets `shutdown` hand the joined
+        worker's result to `done` when the app closes mid-run.
         """
+        self._record_on_close = record_on_close
         self._say(status)
         self.backup_bar.setRange(0, 0)  # indeterminate until a total arrives
         self.backup_bar.setValue(0)
@@ -1743,6 +1806,8 @@ class BackupTab(QtWidgets.QWidget):
         # A run that left files behind reads as a warning, not as plain news.
         warn = bool(result.get("ok") and (result.get("errors")
                                           or result.get("not_copied")
+                                          or result.get("changed")
+                                          or result.get("links_skipped")
                                           or result.get("pruning_held")))
         self._say(message, ok=result.get("ok", False), warn=warn)
         if result.get("ok"):

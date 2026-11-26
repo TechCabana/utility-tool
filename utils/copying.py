@@ -15,7 +15,8 @@ import stat
 import time
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from utils.fs_utils import _is_link_like, long_path, plain_error, relative_to
+from utils.fs_utils import (_is_link_like, is_legacy_profile_link, long_path,
+                            plain_error, relative_to, remove_file)
 
 
 class BackupAborted(Exception):
@@ -268,29 +269,79 @@ def _open_for_write(dst: str):
         return open(dst, "wb")
 
 
-def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
+class CopyResult(tuple):
+    """What `_hash_copy` returns: the `(bytes read, source mtime, sha256 hex)`
+    tuple it always was, plus `.changed` (card RnuRsA2V).
+
+    A tuple subclass rather than a fourth element so every caller and test
+    that unpacks three values keeps working; only the code that cares reads
+    the attribute, with `getattr(result, "changed", False)` so a plain tuple
+    (a test's stand-in for `_hash_copy`) simply reads as "not changed".
+    """
+
+    def __new__(cls, size: int, mtime: float, sha: str, changed: bool = False,
+                read_only: bool = False):
+        """The three values, whether the source changed under the read, and
+        whether the SOURCE file was read-only (card fEC32w6P: recorded in the
+        manifest, because the stored copy's own bit now means "protected")."""
+        self = super().__new__(cls, (size, mtime, sha))
+        self.changed = changed
+        self.read_only = read_only
+        return self
+
+
+def _signature(info: os.stat_result) -> Tuple[int, int]:
+    """`(size, mtime_ns)`: what "the file is the same" means. Nanoseconds, not
+    the float `st_mtime`, which cannot tell two NTFS timestamps 100 ns apart."""
+    return info.st_size, info.st_mtime_ns
+
+
+def _after_read(src: str) -> None:
+    """Called once the last chunk is read and the source handle is closed,
+    just before the post-copy look at the source. Does nothing; it exists so a
+    test can change the file at exactly the moment the check is for."""
+
+
+def _hash_copy(src: str, dst: str) -> CopyResult:
     """Copy `src` to `dst`, hashing the bytes as they pass through.
 
-    Returns `(bytes read, source mtime, sha256 hex)`. Metadata is then copied
-    with `copystat`, as `copy2` does, so the mtime the changes-since
-    comparison relies on is preserved. If anything fails once `dst` exists,
-    the half-written file is deleted before the error propagates, so it can
-    never sit in a version looking like a real copy.
+    Returns `(bytes read, source mtime, sha256 hex)` (a `CopyResult`). Metadata
+    is then copied with `copystat`, as `copy2` does, so the mtime the
+    changes-since comparison relies on is preserved. If anything fails once
+    `dst` exists, the half-written file is deleted before the error
+    propagates, so it can never sit in a version looking like a real copy.
 
     Errors are classified where they happen: failing to open or read `src`
     raises the OSError (the caller skips that file); failing to create,
     write, close or stamp `dst` raises TargetWriteFailed (the caller fails
     the whole copy). Both are plain paths; the OS calls use `long_path`.
+
+    **Changed while copied (card RnuRsA2V).** The bytes hashed here are what
+    the check later re-reads, so verification proves the copy matches what was
+    read, never that what was read was ONE state of the file. So the source's
+    `(size, mtime_ns)` is taken from the open handle before the first read and
+    compared with two later looks: the same handle once the last chunk is in
+    (the file as the reader saw it end) and the PATH after the copy (a file
+    replaced by rename is a different file; a handle can report stale values
+    on some filesystems). Either differing sets `.changed`. Two `fstat`/`stat`
+    calls per file. A source that cannot be looked at afterwards is an OSError
+    like any read failure: that file is skipped, as the first pass would.
     """
     digest = hashlib.sha256()
     size = 0
     read_error = None
+    changed = False
     lsrc = long_path(src)
-    with open(lsrc, "rb") as fsrc:
-        mtime = os.fstat(fsrc.fileno()).st_mtime
-        with _writing(dst):
-            ldst = long_path(dst)  # past Windows' limit: a target failure
-        try:
+    ldst = None  # set once the destination path is built; the cleanup below needs it
+    try:
+        with open(lsrc, "rb") as fsrc:
+            before = os.fstat(fsrc.fileno())
+            mtime = before.st_mtime
+            # No write bit at all = read-only. Windows reports the read-only
+            # attribute as mode 0o444, so this is the same test there.
+            read_only = not before.st_mode & 0o222
+            with _writing(dst):
+                ldst = long_path(dst)  # past Windows' limit: a target failure
             with _writing(dst):
                 with _open_for_write(ldst) as fdst:
                     while True:
@@ -306,20 +357,34 @@ def _hash_copy(src: str, dst: str) -> Tuple[int, float, str]:
                         size += len(chunk)
             if read_error is not None:
                 raise read_error
+            after_handle = os.fstat(fsrc.fileno())
+        # The source handle is closed from here, so a program (or a test) can
+        # replace the file now without being refused for the open handle.
+        _after_read(src)
+        try:
+            shutil.copystat(lsrc, ldst)
+        except OSError as exc:
+            if exc.filename == lsrc:
+                raise  # stat of the source failed: a skip, not the target's
+            raise TargetWriteFailed(dst, exc) from exc
+        _copy_windows_attributes(lsrc, ldst)
+        # Last, so the window the check covers runs to the end of the copy.
+        after_path = os.stat(lsrc)
+        changed = (_signature(before) != _signature(after_handle)
+                   or _signature(before) != _signature(after_path))
+    except BaseException:
+        # Only a destination that was opened for writing can be half-written;
+        # a failure to open the source or build the path leaves nothing of ours.
+        if ldst is not None:
             try:
-                shutil.copystat(lsrc, ldst)
-            except OSError as exc:
-                if exc.filename == lsrc:
-                    raise  # stat of the source failed: a skip, not the target's
-                raise TargetWriteFailed(dst, exc) from exc
-            _copy_windows_attributes(lsrc, ldst)
-        except BaseException:
-            try:
-                os.remove(ldst)
+                # remove_file, not os.remove: copystat may already have made
+                # the half-copy read-only (a read-only source), and Windows
+                # will not delete that.
+                remove_file(ldst)
             except OSError:
                 pass
-            raise
-    return size, mtime, digest.hexdigest()
+        raise
+    return CopyResult(size, mtime, digest.hexdigest(), changed, read_only)
 
 
 # One short pause before the retry pass, and only when a file was skipped.
@@ -342,7 +407,8 @@ def copy_tree(source: str, destination: str,
               should_abort: Optional[Callable[[], bool]] = None,
               on_copied: Optional[Callable[[str, int, float, str], None]] = None,
               stats: Optional[Dict[str, int]] = None,
-              retry_skipped: bool = False
+              retry_skipped: bool = False,
+              recopy_changed: bool = False
               ) -> Tuple[int, int, List[str]]:
     """Copy `source` into `destination`, reporting `(done, total)` per file.
 
@@ -360,11 +426,16 @@ def copy_tree(source: str, destination: str,
     into one list, so a target failure could not be told from a skip.
     Symlinks and junctions are skipped (`_is_link_like`, the one link
     predicate: copying a junction that points at an ancestor of the source
-    would recurse until the disk fills). Existing destination folders are
-    reused, as copytree's `dirs_exist_ok=True` did.
+    would recurse until the disk fills), but not silently (card tiha5I8F):
+    `stats["links"]` counts them, `stats["links_folders"]` says how many point
+    at a folder, and `stats["link_names"]` names them all (relative paths,
+    sorted). Windows' own access-denied profile junctions (`My Documents`...)
+    are left out of all three, see `fs_utils.is_legacy_profile_link`. Existing
+    destination folders are reused, as copytree's `dirs_exist_ok=True` did.
 
     Every file is copied by `_hash_copy`. With `on_copied`,
-    `on_copied(relative path, size, mtime, sha256)` is called once it has
+    `on_copied(relative path, size, mtime, sha256)` (plus `changed=True` and/or
+    `ro=True`, only when they apply, see `copy_one`) is called once it has
     landed -- `run_job` streams that into the version's manifest. If
     `on_copied` fails the file just copied is deleted, so the tree never holds
     a file its manifest does not list.
@@ -390,12 +461,34 @@ def copy_tree(source: str, destination: str,
     source or a cancellation ends the copy exactly as it would have on the
     first pass: only a source-read failure is ever skipped. `stats["retried"]`
     counts the files recovered.
+
+    With `recopy_changed` (a backup; not a restore, whose source is a stored
+    version that nothing is writing), a file whose size or mtime differs after
+    the copy from before it (`_hash_copy`'s `.changed`) was being written while
+    it was read, so the copy may mix two states. It is copied once more, into
+    the same destination, through the same `copy_one`. If that second copy is
+    stable the file is an ordinary copied file (`stats["recopied"]` counts it);
+    if it changed again the second copy is kept and the file is flagged: it
+    reaches `on_copied` with `changed=True` (only then: a callback that takes
+    four arguments never sees the keyword), and `stats["changed"]` and
+    `stats["changed_names"]` count and name it. **One extra attempt per file,
+    in total**: the unreadable-file retry above already is that attempt, so a
+    file recovered by it is flagged on a first look at a change instead of
+    being copied a third time, and a file whose re-copy then could not be read
+    is skipped without the retry pass trying it again. The count, the manifest
+    line, the progress step and the byte total are made once per file, after
+    its last copy, never per attempt.
     """
     total = tree_totals(source)[0]
-    state = {"done": 0, "bytes": 0}
+    state = {"done": 0, "bytes": 0, "recopied": 0}
     errors: List[str] = []
     # (source file, its destination, its index in `errors`) per skipped file.
     skipped_files: List[Tuple[str, str, int]] = []
+    changed_names: List[str] = []
+    # Links left unfollowed (card tiha5I8F): relative path -> "folder" | "file".
+    links: Dict[str, str] = {}
+    # Source files whose one extra attempt (a re-copy) is already used.
+    spent: set = set()
 
     def check_source_alive() -> None:
         """Stop the copy if the source root has gone away."""
@@ -403,21 +496,58 @@ def copy_tree(source: str, destination: str,
             raise SourceUnavailable(source, state["done"], total,
                                     "source_unavailable")
 
-    def copy_one(src: str, dst: str) -> None:
-        """Abort check, copy, count, report one file."""
+    def copy_one(src: str, dst: str, second_look: bool = True) -> None:
+        """Abort check, copy (and re-copy once if it changed), count, report
+        one file. `second_look=False` is the retry pass: that file already
+        had its extra attempt."""
         if should_abort is not None and should_abort():
             raise BackupAborted()
-        size, mtime, sha = _hash_copy(src, dst)
+        result = _hash_copy(src, dst)
+        flagged = False
+        if recopy_changed and getattr(result, "changed", False):
+            if second_look:
+                spent.add(src)
+                if should_abort is not None and should_abort():
+                    raise BackupAborted()
+                try:
+                    result = _hash_copy(src, dst)  # overwrites the first copy
+                except BaseException:
+                    # The first copy is on disk with no manifest line and no
+                    # count; a re-copy that fails must not leave it behind as a
+                    # stray file in the version (`_hash_copy` only cleans up
+                    # after a destination IT opened).
+                    try:
+                        remove_file(dst)
+                    except OSError:
+                        pass
+                    raise
+                flagged = bool(getattr(result, "changed", False))
+                state["recopied"] += not flagged
+            else:
+                flagged = True
+        size, mtime, sha = result
+        rel = relative_to(src, source).replace("\\", "/")
         if on_copied is not None:
+            # Keyword arguments only when they say something, so a callback
+            # that takes four arguments never sees them: `changed` (card
+            # RnuRsA2V) and `ro` (card fEC32w6P: the SOURCE file was
+            # read-only, which the manifest records because the stored copy's
+            # own bit now means "protected").
+            extra = {}
+            if flagged:
+                extra["changed"] = True
+            if getattr(result, "read_only", False):
+                extra["ro"] = True
             try:
-                on_copied(relative_to(src, source).replace("\\", "/"),
-                          size, mtime, sha)
+                on_copied(rel, size, mtime, sha, **extra)
             except BaseException:
                 try:
-                    os.remove(long_path(dst))
+                    remove_file(dst)
                 except OSError:
                     pass
                 raise
+        if flagged:
+            changed_names.append(rel)
         state["bytes"] += size
         state["done"] += 1
         if on_progress is not None:
@@ -442,6 +572,24 @@ def copy_tree(source: str, destination: str,
         rel = relative_to(src, source).replace("\\", "/")
         return f"{rel}: {plain_error(exc)}"
 
+    def note_link(entry: os.DirEntry, src: str) -> None:
+        """Record a symlink/junction the walk is declining to follow (card
+        tiha5I8F), unless it is one of Windows' own legacy profile junctions.
+
+        Called from the one walk the copy already makes, so a link is seen once
+        (a dict keyed on its relative path, so even a repeat could not count it
+        twice) and a link inside a folder that is never visited is never seen.
+        Looks at the link itself and, for kind, stats its target (`is_dir`);
+        nothing is listed or opened, so nothing is followed.
+        """
+        if is_legacy_profile_link(entry, src):
+            return
+        try:
+            kind = "folder" if entry.is_dir() else "file"
+        except OSError:
+            kind = "file"  # a dead link: nothing to say it points at a folder
+        links[relative_to(src, source).replace("\\", "/")] = kind
+
     def copy_dir(src_dir: str, dst_dir: str) -> None:
         """Copy one folder, depth first. OSError if `src_dir` is unreadable."""
         with os.scandir(long_path(src_dir)) as listing:
@@ -455,6 +603,7 @@ def copy_tree(source: str, destination: str,
             is_file = False
             try:
                 if _is_link_like(entry):
+                    note_link(entry, src)
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     copy_dir(src, dst)
@@ -475,8 +624,10 @@ def copy_tree(source: str, destination: str,
     if retry_skipped and skipped_files:
         _retry_pause()
         for src, dst, index in skipped_files:
+            if src in spent:
+                continue  # its extra attempt was the re-copy that failed to read
             try:
-                copy_one(src, dst)
+                copy_one(src, dst, second_look=False)
             except OSError as exc:
                 errors[index] = skip(src, dst, exc)
             else:
@@ -488,6 +639,14 @@ def copy_tree(source: str, destination: str,
     if stats is not None:
         stats["expected"], stats["not_copied"] = total, missing
         stats["retried"] = retried
+        stats["recopied"] = state["recopied"]
+        stats["changed"] = len(changed_names)
+        stats["changed_names"] = changed_names
+        # Sorted by name (case-folded, then exact) so the capped sample every
+        # surface shows is the same on every run, whatever order the OS listed.
+        stats["links"] = len(links)
+        stats["links_folders"] = sum(kind == "folder" for kind in links.values())
+        stats["link_names"] = sorted(links, key=lambda name: (name.casefold(), name))
     # A copy holding NOTHING is never a backup, whatever the floor says: a
     # two-file source with both files locked is under SHORTFALL_MIN_FILES,
     # and promoting its empty copy as "verified" pruned the last real one.

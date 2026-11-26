@@ -783,7 +783,7 @@ def capture_workers(tab, monkeypatch):
     """Record `_start_backup` calls instead of starting threads."""
     started = []
     monkeypatch.setattr(tab, "_start_backup",
-                        lambda status, work, done, phases=None: started.append(
+                        lambda status, work, done, phases=None, record_on_close=False: started.append(
                             (status, work, done)))
     return started
 

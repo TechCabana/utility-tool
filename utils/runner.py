@@ -12,20 +12,21 @@ name, so a test that patches that module's attribute reaches this code too:
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, Optional
 
 from utils import jobs_store, locks, precheck, runlog, verify
 from utils.copying import (BackupAborted, SourceUnavailable, TargetWriteFailed,
                            _writing, copy_tree, walk_tree)
-from utils.fs_utils import long_path, plain_error
+from utils.fs_utils import long_path, plain_error, remove_file
 from utils.jobs_store import job_verify_mode
 from utils.preflight import _preflight_and_sweep, target_volume
 from utils.verify import _quick_verify
 from utils.versions import (MANIFEST_VERSION, VERSION_FORMAT, _discard, is_sanity_drop,
                             is_verified, job_root, latest_version, manifest_path,
-                            prune_versions, pruning_held_sentence, restore_candidates,
-                            sanity_baseline, version_path,
+                            protect_version, prune_versions, pruning_held_sentence,
+                            restore_candidates,
+                            sanity_baseline, utc_stamp, version_path,
                             version_when)
 
 
@@ -42,6 +43,18 @@ MTIME_TOLERANCE = 2.0
 
 # How many one-second stamps `_claim_stamp` tries before giving up.
 CLAIM_ATTEMPTS = 3
+
+# The real `datetime`, captured before any test replaces `runner.datetime` to
+# fake the LOCAL clock (version names), so the UTC clock below is a separate
+# thing that can be faked separately -- the autumn clock change needs both.
+_REAL_DATETIME = datetime
+
+
+def _utc_now() -> datetime:
+    """The current time in UTC (timezone-aware). The run's `finished_utc`
+    comes from here; tests patch THIS to set UTC independently of the local
+    clock that names versions (`datetime.now()` in `_claim_stamp`)."""
+    return _REAL_DATETIME.now(timezone.utc)
 
 
 def _claim_stamp(root: str, job: Dict) -> Optional[str]:
@@ -103,11 +116,17 @@ def run_job(job: Dict,
        sample (`_quick_verify`); "off" skips this step. Any mismatch fails
        the run: nothing is promoted, nothing is pruned, and the `.partial`
        folder and `.tmp` manifest are KEPT so the failure can be inspected.
-    3. Append the end trailer (recording the mode, and `verified` false for
-       "off"), fsync, rename the manifest into place, and only then rename
+    3. Append the end trailer (recording the mode, `verified` false for "off",
+       and `finished_utc`, the UTC finish time versions are ordered by),
+       fsync, rename the manifest into place, and only then rename
        `.partial` to `<stamp>` -- so a version folder never exists without
        its finished manifest. An "off" version is promoted like any other.
-    4. Prune, which never removes the newest verified version, nor the
+       The trailer also says `protected: true` (see step 4).
+    4. Mark the promoted version's files and its manifest read-only
+       (`versions.protect_version`, card fEC32w6P): after every write into the
+       version is done, before the prune. A failure to mark is counted in
+       `protect_failed` (`protected` False) and never fails the run.
+    5. Prune, which never removes the newest verified version, nor the
        baseline the source sanity guard protects (see below).
 
     Source files that could not be read are reported in `errors` and left
@@ -562,6 +581,30 @@ def _with_stored_release(job: Dict) -> Dict:
     return dict(job, hold_released=release) if release else job
 
 
+def links_sentence(folders: int, files: int, names, total: int) -> str:
+    """The plain-words sentence for shortcuts a run did not follow, "" for none.
+
+    "2 shortcut folders point somewhere else and were not followed: Photos,
+    Archive. Add those locations as their own backup." `names` are the relative
+    paths to show (already capped); `total` is every link, so a longer list ends
+    "and N more". Folders and files are counted apart ("1 shortcut file and 2
+    shortcut folders"), singular verbs and "that location" for exactly one.
+    """
+    if total <= 0:
+        return ""
+    parts = []
+    if folders:
+        parts.append(f"{folders} shortcut folder{'s' if folders != 1 else ''}")
+    if files:
+        parts.append(f"{files} shortcut file{'s' if files != 1 else ''}")
+    one = total == 1
+    shown = ", ".join(names) + (f" and {total - len(names)} more" if total > len(names) else "")
+    return (f"{' and '.join(parts)} {'points' if one else 'point'} somewhere else and "
+            f"{'was' if one else 'were'} not followed: {shown}. "
+            f"Add {'that location' if one else 'those locations'} as "
+            f"{'its' if one else 'their'} own backup.")
+
+
 def _backup(job: Dict,
             on_progress: Optional[Callable[[int, int], None]],
             should_abort: Optional[Callable[[], bool]],
@@ -595,7 +638,7 @@ def _backup(job: Dict,
     _mark_running(job, stamp, began)
     if on_phase is not None:
         on_phase("copying")
-    stats: Dict[str, int] = {}
+    stats: Dict = {}
     try:
         # The manifest lives on the target, so failing to create or write it
         # is a target write failure like any other (a full drive refuses a
@@ -607,22 +650,34 @@ def _backup(job: Dict,
                 out.write(json.dumps({"type": "header", "version": MANIFEST_VERSION,
                                       "stamp": stamp, "source": source}) + "\n")
 
-            def record(rel: str, size: int, mtime: float, sha: str) -> None:
+            def record(rel: str, size: int, mtime: float, sha: str,
+                       changed: bool = False, ro: bool = False) -> None:
                 """Stream one file's manifest line straight to disk.
 
                 Raises TargetWriteFailed, not OSError: copy_tree would count
                 an OSError as one skipped file and carry on, leaving a copied
-                file the manifest omits.
+                file the manifest omits. `changed` (card RnuRsA2V) adds
+                `"changed": true` to the line of a file that was still being
+                written on its second copy too; the key is absent otherwise,
+                and every reader ignores keys it does not know. `ro` (card
+                fEC32w6P) adds `"ro": true` the same way when the SOURCE file
+                was read-only: finished versions are marked read-only, so the
+                stored copy's own bit can no longer say what the source's was.
                 """
+                line = {"type": "file", "path": rel, "size": size,
+                        "mtime": mtime, "sha256": sha}
+                if changed:
+                    line["changed"] = True
+                if ro:
+                    line["ro"] = True
                 with _writing(manifest_tmp):
-                    out.write(json.dumps({"type": "file", "path": rel, "size": size,
-                                          "mtime": mtime, "sha256": sha}) + "\n")
+                    out.write(json.dumps(line) + "\n")
                     out.flush()
 
             files, copied_bytes, errors = copy_tree(
                 source, partial, on_progress=on_progress,
                 should_abort=should_abort, on_copied=record, stats=stats,
-                retry_skipped=True)
+                retry_skipped=True, recopy_changed=True)
     except BackupAborted:
         _discard(partial, manifest_tmp)
         return {"ok": False, "message": "Backup cancelled"}
@@ -696,11 +751,17 @@ def _backup(job: Dict,
                 "verified": False, "verify_mode": mode, "partial": partial,
                 "manifest": manifest_tmp, "files": files, "errors": errors}
 
+    # Card ved3wVOQ: the UTC moment the run finalises the manifest. It is what
+    # orders this version against the others (`versions.ordered_versions`),
+    # because the version NAME is local time and repeats in an autumn hour.
+    finished_utc = utc_stamp(_utc_now())
     try:
         with open(long_path(manifest_tmp), "a", encoding="utf-8", newline="\n") as out:
             out.write(json.dumps({"type": "end", "files": files,
                                   "bytes": copied_bytes, "verify": mode,
-                                  "verified": mode != "off"}) + "\n")
+                                  "verified": mode != "off",
+                                  "finished_utc": finished_utc,
+                                  "protected": True}) + "\n")
             out.flush()
             os.fsync(out.fileno())
         os.replace(long_path(manifest_tmp), long_path(manifest))
@@ -708,10 +769,22 @@ def _backup(job: Dict,
     except OSError as exc:
         _discard(partial, manifest_tmp)
         try:
-            os.remove(long_path(manifest))
+            remove_file(manifest)
         except OSError:
             pass
         return {"ok": False, "message": f"Could not finalise the backup: {plain_error(exc)}"}
+
+    # Card fEC32w6P: the version is final (manifest and folder promoted, nothing
+    # writes into it any more), so mark its files and manifest read-only now,
+    # before the prune. Never fails the run: a file that cannot be marked is
+    # counted and said so, and the version stays valid. The trailer's
+    # `protected: true` above is written first, so it states which RULES the
+    # version follows (restore reads `ro` lines), not that every mark landed.
+    try:
+        marking = protect_version(job, stamp)
+    except Exception:  # protect_version should not raise; a bug in it must not fail a good backup
+        marking = {"marked": 0, "failed": files + 1}
+    protect_failed = marking["failed"]
 
     # Source sanity guard (card 51): a run that lost far more files than the
     # best retained version had still succeeds and its version is kept, and
@@ -745,18 +818,49 @@ def _backup(job: Dict,
     if errors:
         message += (f". {not_copied} file(s) could not be read and were "
                     "skipped, so they are not in this backup")
+    # Card RnuRsA2V: a file that changed under the read is copied once more.
+    # One that settled is an ordinary file; one that changed again is kept and
+    # named, because its copy may mix old and new parts of the file. Either
+    # way verification passed against the bytes that were read.
+    recopied = stats.get("recopied", 0)
+    changed = stats.get("changed", 0)
+    changed_sample = list(stats.get("changed_names", []))[:jobs_store.SKIPPED_SAMPLE_MAX]
+    if recopied:
+        message += (f". {recopied} file(s) changed while they were being copied "
+                    "and were copied again")
+    if changed:
+        message += (f". {changed} file(s) were still changing while they were "
+                    "copied, even on a second try, so each may mix old and new "
+                    "parts (changed during backup)")
+    if protect_failed:
+        message += (f". {protect_failed} file(s) could not be marked read-only, "
+                    "so they can be changed by accident (the backup itself is complete)")
     if held:
         message += ". " + pruning_held_sentence(files, baseline)
     if pruned:
         # A held run prunes too now, after a sentence that ends in its own ".".
         message += ("" if message.endswith(".") else ".") + f" Removed {len(pruned)} old version(s)"
+    # Card tiha5I8F: shortcuts (symlinks, junctions) are never followed, so what
+    # they point at is not in this backup. Said last, in plain words, with the
+    # sentence also returned on its own so the run log can leave the names out.
+    links = stats.get("links", 0)
+    links_folders = stats.get("links_folders", 0)
+    links_sample = list(stats.get("link_names", []))[:jobs_store.SKIPPED_SAMPLE_MAX]
+    sentence = links_sentence(links_folders, links - links_folders, links_sample, links)
+    if sentence:
+        message += ("" if message.endswith(".") else ".") + " " + sentence
     return {"ok": True, "message": message, "version": stamp, "files": files,
             "bytes": copied_bytes, "pruned": pruned, "errors": errors,
             "not_copied": not_copied, "retried": retried,
+            "recopied": recopied, "changed": changed,
+            "protected": not protect_failed, "protect_failed": protect_failed,
+            "changed_sample": changed_sample,
+            "links_skipped": links, "links_folders": links_folders,
+            "links_sample": links_sample, "links_sentence": sentence,
             "pruning_held": held, "baseline_files": baseline,
             "baseline_stamp": baseline_stamp if held else None,
             "verified": mode != "off", "verify_mode": mode, "manifest": manifest,
-            "target_volume": target_volume(target)}
+            "finished_utc": finished_utc, "target_volume": target_volume(target)}
 
 
 # ---------------------------------------------------------------------------

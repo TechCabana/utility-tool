@@ -13,6 +13,7 @@ import shutil
 import pytest
 
 from utils import backup_utils, jobs_store
+from helpers import clear_ro, clear_ro_tree
 from test_long_paths import _deep_file, _write, _x, windows_only
 
 CHECKED_EACH = "and checked each against the backup"
@@ -56,6 +57,7 @@ def stored(job, stamp, rel):
 
 def flip_byte(path, offset=0):
     """Change one byte of `path` in place, keeping its size."""
+    clear_ro(path)      # a finished version's files are read-only (card fEC32w6P)
     with open(_x(path), "r+b") as handle:
         handle.seek(offset)
         byte = handle.read(1)
@@ -71,6 +73,7 @@ def manifest_lines(job, stamp):
 
 def write_manifest(job, stamp, lines):
     """Replace the manifest with `lines`."""
+    clear_ro(backup_utils.manifest_path(job, stamp))
     with open(backup_utils.manifest_path(job, stamp), "w", encoding="utf-8", newline="\n") as handle:
         handle.write("\n".join(lines) + "\n")
 
@@ -113,6 +116,7 @@ def test_one_corrupted_byte_in_the_backup_is_reported_by_name(tmp_path):
 
 def test_a_version_without_a_manifest_restores_and_says_it_could_not_be_checked(tmp_path):
     job, stamp, source = make_backup(tmp_path)
+    clear_ro(backup_utils.manifest_path(job, stamp))
     os.remove(backup_utils.manifest_path(job, stamp))
 
     result = restore(job, stamp, tmp_path)
@@ -121,8 +125,13 @@ def test_a_version_without_a_manifest_restores_and_says_it_could_not_be_checked(
     assert result["unchecked_reason"] == "no manifest"
     assert result["verified"] is False and result["checked"] == 0
     assert result["mismatched"] == [] and result["missing_from_version"] == []
+    # The files of a finished version are read-only (card fEC32w6P) and nothing
+    # says which were read-only in the source, so that is said last.
     assert result["message"].endswith(
-        "This backup has no checksum list, so the files could not be checked")
+        "This backup has no checksum list, so the files could not be checked"
+        ". 5 files stayed read-only as they are stored in the backup, since its "
+        "checksum list cannot say which were read-only originally (clear the "
+        "read-only mark to edit)")
     assert CHECKED_EACH not in result["message"]
     assert open(os.path.join(result["path"], "a.txt"), "rb").read() == b"alpha"
 
@@ -169,6 +178,7 @@ def _duplicate_path(job, stamp):
 
 def _empty_manifest(job, stamp):
     """A zero-byte manifest."""
+    clear_ro(backup_utils.manifest_path(job, stamp))
     open(backup_utils.manifest_path(job, stamp), "w").close()
 
 
@@ -193,6 +203,7 @@ def test_a_damaged_manifest_is_could_not_be_checked_not_a_pass(tmp_path, damage)
 
 def test_a_manifest_entry_whose_file_is_gone_from_the_version_is_named(tmp_path):
     job, stamp, source = make_backup(tmp_path)
+    clear_ro(stored(job, stamp, "d.txt"))
     os.remove(stored(job, stamp, "d.txt"))
 
     result = restore(job, stamp, tmp_path)
@@ -320,6 +331,7 @@ def test_a_whole_unreadable_folder_is_not_also_missing(tmp_path, monkeypatch):
 
 def test_an_empty_version_still_fails_as_before(tmp_path):
     job, stamp, source = make_backup(tmp_path)
+    clear_ro_tree(backup_utils.version_path(job, stamp))
     shutil.rmtree(backup_utils.version_path(job, stamp))
     os.makedirs(backup_utils.version_path(job, stamp))
 
@@ -446,6 +458,7 @@ def test_the_tab_shows_a_mismatch_as_a_warning_naming_the_file(tab, tmp_path, mo
 def test_the_tab_shows_could_not_be_checked_as_plain_news(tab, tmp_path, monkeypatch):
     job, stamp, source = make_backup(tmp_path)
     (tmp_path / "out").mkdir()
+    clear_ro(backup_utils.manifest_path(job, stamp))
     os.remove(backup_utils.manifest_path(job, stamp))
 
     status = press_restore(tab, monkeypatch, job, stamp, tmp_path / "out")
