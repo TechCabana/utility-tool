@@ -355,7 +355,9 @@ flowchart LR
    Versions beyond the number kept are then pruned, but the newest verified version is never
    deleted. A restore copies the newest verified version into a new folder the user picks,
    and asks first when a newer version was never verified or when none is; it never writes
-   over the live source.
+   over the live source. A restore always creates a new folder named `<job>-restored-<version>`
+   and writes only inside it, so a second restore of the same version goes into a new folder
+   with a number added (`...-2`, `...-3`) and leaves the earlier one, and any edits in it, alone.
 5. A run that cannot finish honestly fails instead of saving a partial copy: if the backup
    drive fills up, disappears or refuses a write, or the source folder disappears, or at least
    three files and more than 30% of them cannot be read, or nothing at all could be copied,
@@ -529,6 +531,7 @@ utility-tool/
     ├── test_release_hold.py
     ├── test_restore_candidates.py
     ├── test_restore_check.py
+    ├── test_restore_new_folder.py
     ├── test_restore_test.py
     ├── test_retry_skipped.py
     ├── test_review_gate_batch2.py

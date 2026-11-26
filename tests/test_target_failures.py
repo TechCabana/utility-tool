@@ -364,8 +364,10 @@ def test_a_restore_whose_destination_fills_up_fails_and_removes_its_folder(
     assert os.listdir(out) == []  # the half-restored folder is gone
 
 
-def test_a_restore_into_an_earlier_restore_folder_leaves_it_and_says_so(
+def test_a_failed_restore_beside_an_earlier_restore_leaves_that_one_alone(
         tree, tmp_path, monkeypatch):
+    # Card 5AJTFrRx: the failed restore had a folder of its own (`-2`) and removes
+    # it; the earlier restore (and the user's notes in it) is never written to.
     job, _, _ = tree
     version = backup_utils.run_job(job)["version"]
     out = tmp_path / "out"
@@ -378,7 +380,8 @@ def test_a_restore_into_an_earlier_restore_folder_leaves_it_and_says_so(
     result = backup_utils.restore_version(job, version, str(out))
 
     assert result["ok"] is False and result["cause"] == "no_space"
-    assert "may now be incomplete" in result["message"]
+    assert "The incomplete restore folder was removed" in result["message"]
+    assert os.listdir(out) == [os.path.basename(folder)]        # only its own folder went
     assert (out / os.path.basename(folder) / "my notes.txt").read_text(
         encoding="utf-8") == "mine"
 

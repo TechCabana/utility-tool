@@ -427,28 +427,32 @@ def test_a_trusted_restore_says_nothing_about_read_only_files(tmp_path):
     assert "stayed read-only" not in out["message"]
 
 
-def test_a_second_restore_over_a_read_only_restored_file_overwrites_it(tmp_path):
+def test_a_second_restore_leaves_a_read_only_restored_file_alone_and_goes_to_a_new_folder(tmp_path):
+    # Card 5AJTFrRx: this used to overwrite the first restore's read-only file.
     job, _ = make_job(tmp_path, read_only=["a.txt"])
     stamp = run_ok(job)["version"]
     first = restore(job, stamp, tmp_path)
     assert is_read_only(restored(first, "a.txt"))
-    second = restore(job, stamp, tmp_path)                      # same folder, file is read-only
+    second = restore(job, stamp, tmp_path)                      # same destination, same version
     assert second["ok"] and second["verified"], second["message"]
-    assert is_read_only(restored(second, "a.txt"))
-    with open(_x(restored(second, "a.txt")), "rb") as handle:
-        assert handle.read() == b"alpha"
+    assert second["path"] == first["path"] + "-2"
+    assert is_read_only(restored(first, "a.txt")) and is_read_only(restored(second, "a.txt"))
+    for result in (first, second):
+        with open(_x(restored(result, "a.txt")), "rb") as handle:
+            assert handle.read() == b"alpha"
 
 
 @windows_only
-def test_a_restore_that_cannot_overwrite_names_the_file_and_does_not_crash(tmp_path):
+def test_a_file_held_open_in_an_earlier_restore_does_not_stop_a_second_restore(tmp_path):
+    # Card 5AJTFrRx: a restore no longer needs to replace anything in the earlier
+    # folder, so a file there that cannot be written (locked, read-only) is
+    # irrelevant. It used to fail with `no_permission` naming the file.
     job, _ = make_job(tmp_path, read_only=["a.txt"])
     stamp = run_ok(job)["version"]
     first = restore(job, stamp, tmp_path)
     with locked_exclusively(restored(first, "a.txt")):
         second = restore(job, stamp, tmp_path)
-    assert second["ok"] is False
-    assert second["cause"] == "no_permission"
-    assert "a.txt" in second["message"] and "already existed" in second["message"]
+    assert second["ok"] is True and second["path"] == first["path"] + "-2", second["message"]
 
 
 # ---------------------------------------------------------------------------

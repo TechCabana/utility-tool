@@ -250,12 +250,13 @@ def _open_for_write(dst: str):
     """Open `dst` for writing, replacing a read-only or hidden file there.
 
     Windows refuses to truncate a file that is read-only, hidden or system
-    (PermissionError). A fresh `.partial` never holds one, but a restore into
-    a folder an earlier restore filled does: that restore carried those
-    attributes over from the source, so without this a second restore of any
-    folder holding a git repo or a desktop.ini failed outright. Clear them
-    and try once more -- `_hash_copy` puts the source's attributes back when
-    the copy finishes. Any other failure, or a second one, propagates.
+    (PermissionError). A fresh `.partial` never holds one, but a backup's
+    re-copy of a file that changed while it was read overwrites its own first
+    copy, which `copystat` made read-only. Clear the marks and try once more --
+    `_hash_copy` puts the source's attributes back when the copy finishes. Any
+    other failure, or a second one, propagates. A restore never gets here: its
+    folder is created fresh (`versions._claim_restore_folder`), so nothing is
+    in the way and nothing the user holds is replaced.
     """
     try:
         return open(dst, "wb")

@@ -1689,7 +1689,10 @@ class BackupTab(QtWidgets.QWidget):
         overwrite would silently replace every edit made since the backup and
         there is no undo for it, and nothing in this feature asked for that.
         The restored folder is named for the job and the version so it is
-        obvious what it is once it lands.
+        obvious what it is once it lands. It is always a NEW folder (card
+        5AJTFrRx): a second restore of the same version gets a number added
+        (`-2`), and the status message names the folder actually written, so
+        "Nothing is overwritten on restore" is true without a dialog.
         """
         if self.backup_thread is not None:
             return
